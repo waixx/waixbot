@@ -20,6 +20,14 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
+# Попытка импорта DuckDuckGo для fallback-поиска
+try:
+    from duckduckgo_search import DDGS
+    DDGS_AVAILABLE = True
+except ImportError:
+    DDGS_AVAILABLE = False
+    print("⚠️ Библиотека duckduckgo-search не установлена. Fallback-поиск через DuckDuckGo недоступен.")
+
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -79,7 +87,7 @@ if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     sys.exit(1)
 
 print("\n" + "=" * 50)
-print("🚀 БОТ ЗАПУЩЕН (ИСПРАВЛЕННАЯ ВЕРСИЯ + БРО)")
+print("🚀 БОТ ЗАПУЩЕН (ФИНАЛЬНАЯ ВЕРСИЯ С DUCKDUCKGO)")
 print("=" * 50)
 print(f"  🤖 TELEGRAM_TOKEN: {'✅' if TELEGRAM_TOKEN else '❌'}")
 print(f"  🔑 DEEPSEEK_API_KEY: {'✅' if DEEPSEEK_API_KEY else '❌'}")
@@ -92,6 +100,7 @@ print(f"  💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообще
 print(f"  🕐 Поиск по дате и времени: ВКЛЮЧЕН")
 print(f"  💾 Сохранение черновиков (до отправки): ВКЛЮЧЕНО")
 print(f"  🔍 Команда 'бро' принудительно включает интернет-поиск")
+print(f"  🦆 Fallback-поиск через DuckDuckGo: {'✅ ДОСТУПЕН' if DDGS_AVAILABLE else '❌ НЕДОСТУПЕН'}")
 print("=" * 50 + "\n")
 
 os.makedirs("data", exist_ok=True)
@@ -630,6 +639,10 @@ def search_in_pyramid(user_id, query):
     
     return results[:15]
 
+# ============================================================
+# УЛУЧШЕННЫЙ АНАЛИЗАТОР СООБЩЕНИЙ (РАСШИРЕННЫЕ ТРИГГЕРЫ)
+# ============================================================
+
 async def analyze_message(user_id, user_message):
     q = user_message.lower().strip()
     
@@ -654,22 +667,29 @@ async def analyze_message(user_id, user_message):
         if trigger in q:
             return {"type": "memory_query", "action": "memory_search", "needs_search": False, "needs_memory": True}
     
-    # Явные просьбы об интернет-поиске
+    # ===== РАСШИРЕННЫЕ ТРИГГЕРЫ ДЛЯ ИНТЕРНЕТ-ПОИСКА =====
     internet_triggers = [
         'в интернете', 'найди в интернете', 'проверь в интернете',
         'актуализируй', 'актуализируйте', 'обнови', 'обновить',
         'свежие данные', 'свежую информацию', 'проверь актуальность',
-        'посмотри в интернете', 'поищи в интернете', 'найди в сети'
+        'посмотри в интернете', 'поищи в интернете', 'найди в сети',
+        'проверь', 'узнай', 'посмотри', 'найди', 'актуальная информация',
+        'какой сейчас', 'сколько сейчас', 'что сейчас',
+        'последние новости', 'на сегодня', 'на завтра', 'на вчера',
+        'текущий курс', 'текущая погода', 'свежий курс'
     ]
     for trigger in internet_triggers:
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
+    # =========================================================
     
     # Динамичные темы (требуют интернета)
-    dynamic_triggers = ['погод', 'температур', 'дожд', 'снег', 'ветер', 'градус',
-                        'курс', 'доллар', 'евро', 'юань', 'биткоин',
-                        'новост', 'событи', 'происшеств', 'авар', 'выбор', 'кризис', 'войн',
-                        'врем', 'час', 'минут', 'дата', 'сегодня', 'завтра', 'вчера', 'сейчас']
+    dynamic_triggers = [
+        'погод', 'температур', 'дожд', 'снег', 'ветер', 'градус',
+        'курс', 'доллар', 'евро', 'юань', 'биткоин',
+        'новост', 'событи', 'происшеств', 'авар', 'выбор', 'кризис', 'войн',
+        'врем', 'час', 'минут', 'дата', 'сегодня', 'завтра', 'вчера', 'сейчас', 'на этой неделе'
+    ]
     for trigger in dynamic_triggers:
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
@@ -682,6 +702,10 @@ async def analyze_message(user_id, user_message):
     
     return {"type": "static", "action": "memory", "needs_search": False, "needs_memory": True}
 
+# ============================================================
+# ПОИСКОВЫЕ ФУНКЦИИ (APISERPENT + FALLBACK DUCKDUCKGO)
+# ============================================================
+
 def search_apiserpent(query):
     if not APISERPENT_API_KEY:
         return []
@@ -690,7 +714,7 @@ def search_apiserpent(query):
             "https://apiserpent.com/api/search",
             params={"q": query, "engine": "google", "num": 5},
             headers={"X-API-Key": APISERPENT_API_KEY},
-            timeout=30
+            timeout=45  # увеличено с 30 до 45 секунд
         )
         if response.status_code != 200:
             return []
@@ -722,8 +746,40 @@ def search_apiserpent(query):
                 })
         return formatted
     except Exception as e:
-        print(f"❌ Ошибка поиска: {e}")
+        print(f"❌ Ошибка поиска APISerpent: {e}")
         return []
+
+def search_duckduckgo(query):
+    """Fallback-поиск через DuckDuckGo (бесплатно, без ключа)"""
+    if not DDGS_AVAILABLE:
+        return []
+    try:
+        with DDGS() as ddgs:
+            results = []
+            # Используем text() для получения результатов
+            for r in ddgs.text(query, max_results=3):
+                if isinstance(r, dict):
+                    results.append({
+                        "title": r.get("title", "Без названия")[:150],
+                        "snippet": r.get("body", "Нет описания")[:250],
+                        "link": r.get("href", "#")[:150]
+                    })
+            return results
+    except Exception as e:
+        print(f"⚠️ Ошибка DuckDuckGo поиска: {e}")
+        return []
+
+def search_combined(query):
+    """Сначала APISerpent, если пусто — DuckDuckGo"""
+    results = search_apiserpent(query)
+    if results:
+        return results
+    print("🔄 APISerpent не дал результатов, пробуем DuckDuckGo...")
+    return search_duckduckgo(query)
+
+# ============================================================
+# ЗАПРОС К DEEPSEEK
+# ============================================================
 
 async def ask_deepseek(messages, retries=3, max_tokens=None):
     session = await get_http_session()
@@ -774,6 +830,10 @@ async def ask_deepseek(messages, retries=3, max_tokens=None):
                 continue
             return None, f"unknown: {str(e)}"
     return None, "max_retries"
+
+# ============================================================
+# ГЕНЕРАЦИЯ ОТВЕТА (С УЛУЧШЕННЫМ СООБЩЕНИЕМ ПРИ ПУСТОМ ПОИСКЕ)
+# ============================================================
 
 async def generate_response(user_id, user_message, analysis_result, history, profile):
     action = analysis_result.get("action", "memory")
@@ -877,14 +937,16 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
             return answer, True, source
     
     if action == "internet":
-        results = search_apiserpent(user_message)
+        # Используем комбинированный поиск (APISerpent + DuckDuckGo)
+        results = search_combined(user_message)
         if not results:
+            # Если поиск вообще ничего не дал
             history.append({"role": "user", "content": user_message_with_date})
             messages = [system_msg] + history
             answer, err_code = await ask_deepseek(messages)
             if err_code:
                 return f"⚠️ {analyze_error(err_code)}", False, None
-            source = "🧠 из модели (интернет не помог)"
+            source = "🧠 из модели (интернет ничего не дал)"
             return answer, True, source
         
         search_text = f"🔍 Результаты поиска:\n\n"
@@ -917,6 +979,10 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
     source = "🧠 из модели"
     return answer, True, source
 
+# ============================================================
+# КОМАНДЫ БОТА
+# ============================================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_allowed(user_id):
@@ -940,7 +1006,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🕐 **Я запоминаю время каждого сообщения!**\n"
         "📂 **В каждом ответе я указываю источник:**\n"
         "   • 📂 из памяти — ответ из профиля или истории\n"
-        "   • 🌐 из интернета — найден через APISerpent\n"
+        "   • 🌐 из интернета — найден через APISerpent или DuckDuckGo\n"
         "   • 🧠 из модели — сгенерирован DeepSeek\n\n"
         "🔍 **Я сам ищу сообщения по дате и времени!**\n"
         "   • Просто спроси: «что я писал вчера?» или «покажи 14.07.2026»\n"
@@ -952,7 +1018,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/memory [текст]` — поиск в памяти\n"
         "• `/forget` — забыть всё\n"
         "• `/restore` — восстановить из бэкапа\n\n"
-        "🔍 **Принудительный поиск:** `бро погода`"
+        "🔍 **Принудительный поиск:** `бро погода`\n"
+        "🦆 **Если APISerpent не отвечает, я попробую поискать через DuckDuckGo.**"
     )
 
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1281,13 +1348,14 @@ if __name__ == "__main__":
     app.add_error_handler(error_handler)
     
     print("=" * 50)
-    print("✅ БОТ ЗАПУЩЕН (ИСПРАВЛЕННАЯ ВЕРСИЯ + БРО)")
+    print("✅ БОТ ЗАПУЩЕН (ФИНАЛЬНАЯ ВЕРСИЯ С DUCKDUCKGO)")
     print(f"📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
     print(f"💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН (TTL: {CACHE_TTL} сек, макс. {MAX_CACHE_ITEMS} записей)")
     print(f"💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
     print(f"🕐 Поиск по дате и времени: ВКЛЮЧЕН")
     print(f"💾 Сохранение черновиков (до отправки): ВКЛЮЧЕНО")
     print(f"🔍 Команда 'бро' принудительно включает интернет-поиск")
+    print(f"🦆 Fallback-поиск через DuckDuckGo: {'✅ ДОСТУПЕН' if DDGS_AVAILABLE else '❌ НЕДОСТУПЕН'}")
     print(f"👥 Разрешённых пользователей: {len(ALLOWED_USERS_LIST)}")
     print("=" * 50)
     
