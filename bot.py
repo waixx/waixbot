@@ -23,7 +23,7 @@ from telegram.ext import (
 load_dotenv()
 
 # ============================================================
-# 1. КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
+# 1. КОНФИГУРАЦИЯ
 # ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -35,7 +35,6 @@ try:
 except ValueError:
     ADMIN_USER_ID = 0
 
-# --- СПИСОК РАЗРЕШЁННЫХ ПОЛЬЗОВАТЕЛЕЙ ---
 ALLOWED_USERS_STR = os.getenv("ALLOWED_USERS", "")
 ALLOWED_USERS_LIST = []
 if ALLOWED_USERS_STR:
@@ -51,42 +50,12 @@ if ADMIN_USER_ID != 0 and ADMIN_USER_ID not in ALLOWED_USERS_LIST:
 # 2. ПИРАМИДАЛЬНАЯ ПАМЯТЬ (1 000 000+ СООБЩЕНИЙ)
 # ============================================================
 
-# УРОВЕНЬ 1: Быстрая память (всегда в промпте)
-LEVEL_1 = {
-    'max_history': 80,
-    'keep_recent': 20,
-    'compress_to': 20
-}
+LEVEL_1 = {'max_history': 80, 'keep_recent': 20, 'compress_to': 20}
+LEVEL_2 = {'max_items': 1000, 'compress_interval': 40, 'compress_to': 50}
+LEVEL_3 = {'max_items': 10000, 'compress_interval': 200, 'compress_to': 100}
+LEVEL_4 = {'max_items': 100000, 'compress_interval': 1000, 'compress_to': 200}
+LEVEL_5 = {'max_items': 1000000, 'compress_interval': 10000, 'compress_to': 500}
 
-# УРОВЕНЬ 2: Среднесрочная память (1000 сообщений)
-LEVEL_2 = {
-    'max_items': 1000,
-    'compress_interval': 40,
-    'compress_to': 50
-}
-
-# УРОВЕНЬ 3: Долгосрочная память (10000 сообщений)
-LEVEL_3 = {
-    'max_items': 10000,
-    'compress_interval': 200,
-    'compress_to': 100
-}
-
-# УРОВЕНЬ 4: Архивная память (100000 сообщений)
-LEVEL_4 = {
-    'max_items': 100000,
-    'compress_interval': 1000,
-    'compress_to': 200
-}
-
-# УРОВЕНЬ 5: Вечная память (1 000 000+ сообщений)
-LEVEL_5 = {
-    'max_items': 1000000,
-    'compress_interval': 10000,
-    'compress_to': 500
-}
-
-# --- АДАПТИВНЫЙ TTL ---
 DEFAULT_TTL = {
     'critical': 60,
     'instructional': 720,
@@ -104,35 +73,70 @@ CURRENT_DATE = NOW.strftime("%d.%m.%Y")
 CURRENT_TIME = NOW.strftime("%H:%M")
 CURRENT_YEAR = NOW.year
 
-# --- ПРОВЕРКА ОБЯЗАТЕЛЬНЫХ ПЕРЕМЕННЫХ ---
+# --- ПРОВЕРКА ---
 if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     print("❌ TELEGRAM_TOKEN или DEEPSEEK_API_KEY не заданы")
     sys.exit(1)
 
 print("\n" + "=" * 50)
-print("🚀 БОТ ЗАПУЩЕН (ПИРАМИДАЛЬНАЯ ПАМЯТЬ: 1 000 000+)")
+print("🚀 БОТ ЗАПУЩЕН (ПИРАМИДАЛЬНАЯ ПАМЯТЬ + ОПТИМИЗАЦИЯ)")
 print("=" * 50)
 print(f"  🤖 TELEGRAM_TOKEN: {'✅' if TELEGRAM_TOKEN else '❌'}")
 print(f"  🔑 DEEPSEEK_API_KEY: {'✅' if DEEPSEEK_API_KEY else '❌'}")
 print(f"  🔍 APISERPENT_API_KEY: {'✅' if APISERPENT_API_KEY else '❌'}")
 print(f"  👤 ADMIN_USER_ID: {ADMIN_USER_ID}")
 print(f"  👥 Разрешённых пользователей: {len(ALLOWED_USERS_LIST)}")
-print(f"  📊 Пирамидальная память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
-print(f"  📅 Текущая дата: {CURRENT_DATE} {CURRENT_TIME}")
+print(f"  📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
+print(f"  💾 Кэширование: ВКЛЮЧЕНО")
+print(f"  💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
 print("=" * 50 + "\n")
 
 # ============================================================
-# 3. ФАЙЛЫ ПАМЯТИ
+# 3. ФАЙЛЫ ПАМЯТИ И КЭШ
 # ============================================================
 
 os.makedirs("data", exist_ok=True)
+os.makedirs("data/backups", exist_ok=True)
+
 MEMORY_FILE = "data/memory.json"
 PROFILE_FILE = "data/user_profile.json"
+BACKUP_DIR = "data/backups"
+
+# --- КЭШ ПРОФИЛЕЙ В ПАМЯТИ ---
+PROFILE_CACHE = {}
+CACHE_TTL = 60  # 60 секунд
+BACKUP_COUNTER = {}  # Счётчик для бэкапов
+MESSAGE_COUNTER = {}  # Счётчик сообщений
+
+# ============================================================
+# 4. ФУНКЦИИ КЭШИРОВАНИЯ
+# ============================================================
+
+def get_profile_cached(user_id):
+    """Загружает профиль с кэшированием"""
+    now = datetime.now()
+    if user_id in PROFILE_CACHE:
+        profile, timestamp = PROFILE_CACHE[user_id]
+        if (now - timestamp).seconds < CACHE_TTL:
+            return profile.copy() if profile else {}
+    
+    profile = load_profile(user_id)
+    PROFILE_CACHE[user_id] = (profile.copy() if profile else {}, now)
+    return profile.copy() if profile else {}
+
+def invalidate_cache(user_id):
+    """Очищает кэш для пользователя"""
+    if user_id in PROFILE_CACHE:
+        del PROFILE_CACHE[user_id]
 
 def is_allowed(user_id):
     if not ALLOWED_USERS_LIST:
         return True
     return user_id in ALLOWED_USERS_LIST
+
+# ============================================================
+# 5. ЗАГРУЗКА/СОХРАНЕНИЕ ПРОФИЛЯ
+# ============================================================
 
 def load_profile(user_id):
     try:
@@ -144,29 +148,89 @@ def load_profile(user_id):
         print(f"⚠️ Ошибка загрузки профиля: {e}")
     return {}
 
-def save_profile(user_id, profile):
+def save_profile(user_id, profile, backup=True):
     try:
         data = {}
         if os.path.exists(PROFILE_FILE):
             with open(PROFILE_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+        
         profile["updated"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
         data[str(user_id)] = profile
+        
+        # Сохраняем основной файл
         with open(PROFILE_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        # Автоматический бэкап
+        if backup:
+            create_backup(user_id, "profile")
+        
+        invalidate_cache(user_id)
         return True
     except Exception as e:
         print(f"❌ Ошибка сохранения профиля: {e}")
         return False
 
 # ============================================================
-# 4. ПИРАМИДАЛЬНОЕ СЖАТИЕ
+# 6. АВТОМАТИЧЕСКИЕ БЭКАПЫ
+# ============================================================
+
+def create_backup(user_id, data_type):
+    """Создаёт бэкап данных"""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{BACKUP_DIR}/{data_type}_{user_id}_{timestamp}.json"
+        
+        if data_type == "profile":
+            profile = get_profile_cached(user_id)
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(profile, f, ensure_ascii=False, indent=2)
+        elif data_type == "memory":
+            history = load_memory(user_id)
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+        
+        # Удаляем старые бэкапы (оставляем последние 10)
+        backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith(f"{data_type}_{user_id}")])
+        if len(backups) > 10:
+            for old_file in backups[:-10]:
+                os.remove(os.path.join(BACKUP_DIR, old_file))
+        
+        return True
+    except Exception as e:
+        print(f"⚠️ Ошибка создания бэкапа: {e}")
+        return False
+
+def restore_backup(user_id, data_type):
+    """Восстанавливает последний бэкап"""
+    try:
+        backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith(f"{data_type}_{user_id}")])
+        if not backups:
+            return False
+        
+        latest = backups[-1]
+        with open(os.path.join(BACKUP_DIR, latest), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        if data_type == "profile":
+            save_profile(user_id, data, backup=False)
+        elif data_type == "memory":
+            save_memory(user_id, data, backup=False)
+        
+        return True
+    except Exception as e:
+        print(f"⚠️ Ошибка восстановления бэкапа: {e}")
+        return False
+
+# ============================================================
+# 7. СЖАТИЕ ДАННЫХ (ДЛЯ УРОВНЕЙ)
 # ============================================================
 
 def extract_key_points(text, max_len=30):
     if len(text) <= max_len:
         return text
-    stop_words = ['это', 'так', 'вот', 'ну', 'просто', 'очень', 'такой', 'какой-то']
+    stop_words = ['это', 'так', 'вот', 'ну', 'просто', 'очень']
     words = text.split()
     important = []
     for word in words:
@@ -195,7 +259,27 @@ def extract_keywords_ultra(text, max_len=12):
     result = ' '.join(important_words[:3])
     return result[:max_len] + "..."
 
-# --- УРОВЕНЬ 1: Сжатие истории (80 сообщений) ---
+def compress_ultra_old(items, target_count=50):
+    """Сжимает старые пункты level_5 в супер-пункты"""
+    if len(items) <= target_count:
+        return items
+    
+    # Берём первые 200 пунктов и сжимаем
+    old_items = items[:200]
+    compressed = []
+    
+    for i in range(0, len(old_items), 4):
+        batch = old_items[i:i+4]
+        # Берём ключевые слова из каждого и объединяем
+        combined = " | ".join([item[:20] for item in batch])
+        compressed.append(f"[архив] {combined}")
+    
+    return compressed + items[-target_count:]
+
+# ============================================================
+# 8. ФУНКЦИИ ПАМЯТИ
+# ============================================================
+
 def compress_history(history):
     if len(history) <= LEVEL_1['max_history']:
         return history
@@ -226,7 +310,7 @@ def load_memory(user_id):
         print(f"⚠️ Ошибка загрузки памяти: {e}")
     return []
 
-def save_memory(user_id, history):
+def save_memory(user_id, history, backup=True):
     try:
         data = {}
         if os.path.exists(MEMORY_FILE):
@@ -239,7 +323,7 @@ def save_memory(user_id, history):
             if old_messages:
                 update_level_2(user_id, old_messages)
                 
-                profile = load_profile(user_id)
+                profile = get_profile_cached(user_id)
                 if len(profile.get("level_2", [])) >= LEVEL_2['compress_to']:
                     update_level_3(user_id, old_messages)
                 if len(profile.get("level_3", [])) >= LEVEL_3['compress_to']:
@@ -250,12 +334,27 @@ def save_memory(user_id, history):
         data[str(user_id)] = compress_history(history)
         with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        if backup:
+            create_backup(user_id, "memory")
+        
+        # Инкрементируем счётчик для авто-бэкапа
+        global MESSAGE_COUNTER
+        MESSAGE_COUNTER[user_id] = MESSAGE_COUNTER.get(user_id, 0) + 1
+        if MESSAGE_COUNTER[user_id] % 10 == 0:
+            create_backup(user_id, "profile")
+        
+        return True
     except Exception as e:
         print(f"❌ Ошибка сохранения памяти: {e}")
+        return False
 
-# --- УРОВЕНЬ 2: 1000 сообщений → 50 пунктов ---
+# ============================================================
+# 9. ОБНОВЛЕНИЕ УРОВНЕЙ
+# ============================================================
+
 def update_level_2(user_id, messages):
-    profile = load_profile(user_id)
+    profile = get_profile_cached(user_id)
     if "level_2" not in profile:
         profile["level_2"] = []
     
@@ -276,11 +375,10 @@ def update_level_2(user_id, messages):
     if len(profile["level_2"]) > LEVEL_2['compress_to']:
         profile["level_2"] = profile["level_2"][-LEVEL_2['compress_to']:]
     
-    save_profile(user_id, profile)
+    save_profile(user_id, profile, backup=False)
 
-# --- УРОВЕНЬ 3: 10000 сообщений → 100 пунктов ---
 def update_level_3(user_id, messages):
-    profile = load_profile(user_id)
+    profile = get_profile_cached(user_id)
     if "level_3" not in profile:
         profile["level_3"] = []
     
@@ -301,11 +399,10 @@ def update_level_3(user_id, messages):
     if len(profile["level_3"]) > LEVEL_3['compress_to']:
         profile["level_3"] = profile["level_3"][-LEVEL_3['compress_to']:]
     
-    save_profile(user_id, profile)
+    save_profile(user_id, profile, backup=False)
 
-# --- УРОВЕНЬ 4: 100000 сообщений → 200 пунктов ---
 def update_level_4(user_id, messages):
-    profile = load_profile(user_id)
+    profile = get_profile_cached(user_id)
     if "level_4" not in profile:
         profile["level_4"] = []
     
@@ -326,11 +423,10 @@ def update_level_4(user_id, messages):
     if len(profile["level_4"]) > LEVEL_4['compress_to']:
         profile["level_4"] = profile["level_4"][-LEVEL_4['compress_to']:]
     
-    save_profile(user_id, profile)
+    save_profile(user_id, profile, backup=False)
 
-# --- УРОВЕНЬ 5: 1 000 000+ сообщений → 500 пунктов ---
 def update_level_5(user_id, messages):
-    profile = load_profile(user_id)
+    profile = get_profile_cached(user_id)
     if "level_5" not in profile:
         profile["level_5"] = []
     
@@ -348,22 +444,28 @@ def update_level_5(user_id, messages):
     for item in compressed:
         profile["level_5"].append(f"[{timestamp}] {item}")
     
+    # Дополнительное сжатие старых пунктов
+    if len(profile["level_5"]) > LEVEL_5['compress_to'] + 100:
+        # Сжимаем старые пункты
+        old_items = profile["level_5"][:200]
+        compressed_old = compress_ultra_old(old_items, 50)
+        profile["level_5"] = compressed_old + profile["level_5"][200:]
+    
     if len(profile["level_5"]) > LEVEL_5['compress_to']:
         profile["level_5"] = profile["level_5"][-LEVEL_5['compress_to']:]
     
-    save_profile(user_id, profile)
+    save_profile(user_id, profile, backup=False)
 
 # ============================================================
-# 5. ПОИСК ПО ВСЕЙ ПИРАМИДЕ ПАМЯТИ
+# 10. ПОИСК ПО ПИРАМИДЕ
 # ============================================================
 
 def search_in_pyramid(user_id, query):
-    """Поиск по всем уровням пирамиды памяти"""
-    profile = load_profile(user_id)
+    profile = get_profile_cached(user_id)
     results = []
     q = query.lower()
     
-    # Уровень 1: История
+    # Уровень 1
     history = load_memory(user_id)
     for msg in history[-20:]:
         content = msg.get("content", "")
@@ -371,22 +473,22 @@ def search_in_pyramid(user_id, query):
             role = "👤" if msg.get("role") == "user" else "🤖"
             results.append(f"{role} {extract_key_points(content, 80)}")
     
-    # Уровень 2: 1000 сообщений
+    # Уровень 2
     for item in profile.get("level_2", []):
         if q in item.lower():
             results.append(f"📚 {item}")
     
-    # Уровень 3: 10000 сообщений
+    # Уровень 3
     for item in profile.get("level_3", []):
         if q in item.lower():
             results.append(f"📖 {item}")
     
-    # Уровень 4: 100000 сообщений
+    # Уровень 4
     for item in profile.get("level_4", []):
         if q in item.lower():
             results.append(f"📕 {item}")
     
-    # Уровень 5: 1 000 000+ сообщений
+    # Уровень 5
     for item in profile.get("level_5", []):
         if q in item.lower():
             results.append(f"📗 {item}")
@@ -394,78 +496,47 @@ def search_in_pyramid(user_id, query):
     return results[:15]
 
 # ============================================================
-# 6. УМНЫЙ АНАЛИЗАТОР СООБЩЕНИЙ
+# 11. АНАЛИЗАТОР СООБЩЕНИЙ
 # ============================================================
 
 async def analyze_message(user_id, user_message):
-    """Анализирует сообщение и определяет тип"""
+    """Анализирует сообщение и определяет тип (с кэшем)"""
     q = user_message.lower().strip()
     
-    # Приветствия (мгновенный ответ)
-    simple_greetings = ['привет', 'здравствуй', 'здрасте', 'приветствую', 'салют', 'hello', 'hi', 'пока', 'до свидания']
-    if q in simple_greetings or q in [g + '!' for g in simple_greetings] or q in [g + '.' for g in simple_greetings]:
+    # Приветствия
+    simple_greetings = ['привет', 'здравствуй', 'здрасте', 'приветствую', 'салют', 'hello', 'hi']
+    if q in simple_greetings or q in [g + '!' for g in simple_greetings]:
         return {"type": "greeting", "action": "greeting", "needs_search": False, "needs_memory": False}
     
-    # Личные вопросы (из профиля)
-    personal_triggers = ['имя', 'город', 'работа', 'возраст', 'интерес', 'хобби', 'меня зовут', 'как меня зовут', 'где я живу']
+    # Личные вопросы
+    personal_triggers = ['имя', 'город', 'работа', 'возраст', 'интерес', 'хобби', 'меня зовут']
     for trigger in personal_triggers:
         if trigger in q:
             return {"type": "personal", "action": "memory", "needs_search": False, "needs_memory": True}
     
-    # Поиск в старой памяти
-    memory_triggers = ['помнишь', 'ты помнишь', 'напомни', 'что я говорил', 'что я писал', 'вспомни', 'что ты знаешь обо мне']
+    # Поиск в памяти
+    memory_triggers = ['помнишь', 'ты помнишь', 'напомни', 'что я говорил', 'что я писал', 'вспомни']
     for trigger in memory_triggers:
         if trigger in q:
             return {"type": "memory_query", "action": "memory_search", "needs_search": False, "needs_memory": True}
     
-    # Динамичные темы (интернет)
+    # Динамичные темы
     dynamic_triggers = ['погод', 'температур', 'дожд', 'снег', 'ветер', 'курс', 'доллар', 'евро', 'новост', 'событи']
     for trigger in dynamic_triggers:
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
     
-    # Инструкции (интернет)
-    instructional_triggers = ['как ', 'как сделать', 'как настроить', 'как установить', 'инструкция', 'руководство', 'как задеплоить']
+    # Инструкции
+    instructional_triggers = ['как ', 'как сделать', 'как настроить', 'как установить', 'инструкция', 'руководство']
     for trigger in instructional_triggers:
         if trigger in q:
             return {"type": "instructional", "action": "internet", "needs_search": True, "needs_memory": False}
     
-    # Если не определили → DeepSeek анализ
-    analysis_prompt = {
-        "role": "system",
-        "content": """Определи тип сообщения. Ответь ТОЛЬКО JSON.
-
-Типы: static, dynamic, personal, memory_query, greeting
-Действия: internet, memory, memory_search, greeting
-
-{"type": "...", "action": "..."}"""
-    }
-    
-    messages = [analysis_prompt, {"role": "user", "content": user_message}]
-    
-    try:
-        answer, error = await ask_deepseek(messages, retries=2, max_tokens=50)
-        if error:
-            return {"type": "static", "action": "memory", "needs_search": False, "needs_memory": True}
-        
-        json_match = re.search(r'\{.*\}', answer, re.DOTALL)
-        if json_match:
-            import json
-            result = json.loads(json_match.group())
-            action = result.get("action", "memory")
-            return {
-                "type": result.get("type", "static"),
-                "action": action,
-                "needs_search": action in ["internet"],
-                "needs_memory": action in ["memory", "memory_search"]
-            }
-    except Exception as e:
-        print(f"❌ Ошибка анализа: {e}")
-    
+    # По умолчанию
     return {"type": "static", "action": "memory", "needs_search": False, "needs_memory": True}
 
 # ============================================================
-# 7. ПОИСК В ИНТЕРНЕТЕ (APISERPENT)
+# 12. API ФУНКЦИИ
 # ============================================================
 
 def search_apiserpent(query):
@@ -501,10 +572,6 @@ def search_apiserpent(query):
         print(f"❌ Ошибка поиска: {e}")
         return []
 
-# ============================================================
-# 8. ЗАПРОС К DEEPSEEK API
-# ============================================================
-
 async def ask_deepseek(messages, retries=3, max_tokens=None):
     for attempt in range(retries):
         try:
@@ -529,38 +596,24 @@ async def ask_deepseek(messages, retries=3, max_tokens=None):
                     if resp.status == 429:
                         await asyncio.sleep(2 ** attempt)
                         continue
-                    if resp.status == 401:
-                        return None, "❌ Ошибка авторизации API. Проверьте DEEPSEEK_API_KEY."
-                    if resp.status == 500:
-                        return None, "⚠️ Внутренняя ошибка сервера DeepSeek. Попробуйте позже."
                     return None, f"❌ Ошибка API ({resp.status})"
-        except aiohttp.ClientConnectionError:
-            if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
-                continue
-            return None, "❌ Ошибка соединения с API DeepSeek."
-        except asyncio.TimeoutError:
-            if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
-                continue
-            return None, "❌ Превышен таймаут ожидания ответа от DeepSeek."
         except Exception as e:
             if attempt < retries - 1:
                 continue
-            return None, f"❌ Неизвестная ошибка: {str(e)}"
+            return None, f"❌ Ошибка: {str(e)}"
     return None, "❌ Превышено количество попыток."
 
 # ============================================================
-# 9. ГЕНЕРАЦИЯ ОТВЕТА
+# 13. ГЕНЕРАЦИЯ ОТВЕТА
 # ============================================================
 
 async def generate_response(user_id, user_message, analysis_result, history, profile):
     """Генерирует финальный ответ на основе анализа"""
     
-    # --- СБОР СИСТЕМНОГО ПРОМПТА ---
+    # Системный промпт
     system_parts = [f"Сегодня: {CURRENT_DATE} {CURRENT_TIME}"]
     
-    # Ядро профиля
+    # Профиль
     for key, value in profile.items():
         if key.startswith("last_check_") or key.startswith("update_history_"):
             continue
@@ -572,7 +625,7 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         else:
             system_parts.append(f"{key}: {str(value)[:50]}")
     
-    # Добавляем сжатые уровни (компактно)
+    # Уровни (компактно)
     if profile.get("level_2"):
         system_parts.append(f"📚 1000: {', '.join(profile['level_2'][-10:])}")
     if profile.get("level_3"):
@@ -583,31 +636,29 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         system_prompt = system_prompt[:800] + "..."
     
     system_msg = {"role": "system", "content": system_prompt}
-    
     action = analysis_result.get("action", "memory")
     
-    # --- ПРИВЕТСТВИЕ (мгновенно) ---
+    # Приветствие
     if action == "greeting":
         greetings = {
             'привет': '👋 Привет! Как дела?',
             'здравствуй': '👋 Здравствуйте! Чем могу помочь?',
             'пока': '👋 Пока! Было приятно пообщаться!',
-            'спасибо': 'Пожалуйста! Всегда рад помочь! 🤗',
-            'благодарю': 'Пожалуйста! Обращайся! 🤗'
+            'спасибо': 'Пожалуйста! Всегда рад помочь! 🤗'
         }
         for key, value in greetings.items():
             if key in user_message.lower():
                 return value, False
         return "👋 Привет! Чем могу помочь?", False
     
-    # --- ПОИСК В СТАРОЙ ПАМЯТИ ---
+    # Поиск в памяти
     if action == "memory_search":
         memory_results = search_in_pyramid(user_id, user_message)
         if memory_results:
             memory_text = "\n".join(memory_results[:10])
             prompt = {
                 "role": "system",
-                "content": f"Нашёл в истории:\n{memory_text}\n\nОтветь на вопрос пользователя на основе этой информации."
+                "content": f"Нашёл в истории:\n{memory_text}\n\nОтветь на вопрос."
             }
             history.append({"role": "user", "content": user_message})
             messages = [system_msg, prompt] + history
@@ -623,7 +674,7 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 return f"⚠️ {error}", False
             return answer, True
     
-    # --- ПОИСК В ИНТЕРНЕТЕ ---
+    # Поиск в интернете
     if action == "internet":
         results = search_apiserpent(user_message)
         if not results:
@@ -642,12 +693,11 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
             "role": "system",
             "content": f"""Сегодня: {CURRENT_DATE}.
 
-Вопрос пользователя: "{user_message}"
+Вопрос: "{user_message}"
 
 {search_text}
 
-ОТВЕЧАЙ ТОЛЬКО НА ОСНОВЕ НАЙДЕННЫХ ДАННЫХ.
-Указывай источники. Отвечай на русском языке."""
+ОТВЕЧАЙ ТОЛЬКО НА ОСНОВЕ НАЙДЕННЫХ ДАННЫХ."""
         }
         
         history.append({"role": "user", "content": user_message})
@@ -657,7 +707,7 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
             return f"⚠️ {error}", False
         return answer, True
     
-    # --- ОБЫЧНЫЙ ОТВЕТ (из памяти/базы) ---
+    # Обычный ответ
     history.append({"role": "user", "content": user_message})
     messages = [system_msg] + history
     answer, error = await ask_deepseek(messages)
@@ -666,7 +716,7 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
     return answer, True
 
 # ============================================================
-# 10. КОМАНДЫ БОТА
+# 14. КОМАНДЫ БОТА
 # ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -675,7 +725,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Доступ запрещён.")
         return
     
-    name = load_profile(user_id).get("name", "друг")
+    profile = get_profile_cached(user_id)
+    name = profile.get("name", "друг")
     await update.message.reply_text(
         f"👋 Привет, {name}!\n\n"
         f"📅 Сегодня: {CURRENT_DATE} {CURRENT_TIME}\n\n"
@@ -689,7 +740,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/profile` — что я помню\n"
         "• `/stats` — статистика\n"
         "• `/memory [текст]` — поиск в памяти\n"
-        "• `/forget` — забыть всё\n\n"
+        "• `/forget` — забыть всё\n"
+        "• `/restore` — восстановить из бэкапа\n\n"
         "🔍 **Принудительный поиск:** `бро погода`"
     )
 
@@ -699,14 +751,13 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Доступ запрещён.")
         return
     
-    profile = load_profile(user_id)
+    profile = get_profile_cached(user_id)
     if not profile:
-        await update.message.reply_text("📭 Я пока ничего не знаю о тебе. Расскажи что-нибудь!")
+        await update.message.reply_text("📭 Я пока ничего не знаю о тебе.")
         return
     
     lines = ["🧠 **Пирамидальная память:**\n"]
     
-    # Уровни памяти
     level_labels = {
         'level_2': '📚 1000 сообщений',
         'level_3': '📖 10000 сообщений',
@@ -721,11 +772,9 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = load_memory(user_id)
     lines.append(f"• 📝 80 последних: {len(history)} сообщений")
     
-    # Личная информация
     lines.append(f"\n👤 **Личная информация:**")
-    personal_keys = ['name', 'город', 'city', 'работа', 'job', 'возраст', 'age', 'интересы', 'interests']
-    found = False
-    for key in personal_keys:
+    personal_keys = ['name', 'город', 'city', 'работа', 'job', 'возраст', 'age']
+    found = False    for key in personal_keys:
         if key in profile:
             lines.append(f"• {key}: {profile[key]}")
             found = True
@@ -736,7 +785,6 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поиск по всей пирамиде памяти"""
     user_id = update.effective_user.id
     if not is_allowed(user_id):
         await update.message.reply_text("❌ Доступ запрещён.")
@@ -772,7 +820,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Доступ запрещён.")
         return
     
-    profile = load_profile(user_id)
+    profile = get_profile_cached(user_id)
     history = load_memory(user_id)
     
     level_labels = {
@@ -791,36 +839,49 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {label}: {len(value)} пунктов")
         total_punkts += len(value)
     
-    total_messages = total_punkts * 50  # Примерное количество
-    lines.append(f"\n📊 **Всего в памяти:** ~{total_messages:,} сообщений")
-    lines.append(f"🔄 **Обновлён:** {profile.get('updated', 'неизвестно')}")
+    # Бэкапы
+    backup_count = len([f for f in os.listdir(BACKUP_DIR) if f.startswith(f"profile_{user_id}")])
+    lines.append(f"\n💾 Бэкапов: {backup_count}")
+    
+    total_messages = total_punkts * 50
+    lines.append(f"📊 Всего в памяти: ~{total_messages:,} сообщений")
+    lines.append(f"🔄 Обновлён: {profile.get('updated', 'неизвестно')}")
     
     await update.message.reply_text("\n".join(lines))
 
 async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Полная очистка памяти о пользователе"""
     user_id = update.effective_user.id
     if not is_allowed(user_id):
         await update.message.reply_text("❌ Доступ запрещён.")
         return
     
-    # Очищаем все уровни памяти
     save_profile(user_id, {})
     save_memory(user_id, [])
-    await update.message.reply_text("🧹 **Я забыл всё, что знал о тебе!** Начинаем с чистого листа.")
+    invalidate_cache(user_id)
+    await update.message.reply_text("🧹 **Я забыл всё, что знал о тебе!**")
 
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Очистка истории диалогов (без профиля)"""
+async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_allowed(user_id):
         await update.message.reply_text("❌ Доступ запрещён.")
         return
     
-    save_memory(user_id, [])
-    await update.message.reply_text("🧹 **История диалогов очищена.** (Профиль сохранён)")
+    # Восстанавливаем профиль
+    profile_restored = restore_backup(user_id, "profile")
+    memory_restored = restore_backup(user_id, "memory")
+    
+    if profile_restored or memory_restored:
+        invalidate_cache(user_id)
+        await update.message.reply_text(
+            "✅ **Восстановлено из бэкапа!**\n"
+            f"{'📋 Профиль восстановлен' if profile_restored else ''}\n"
+            f"{'💬 История восстановлена' if memory_restored else ''}"
+        )
+    else:
+        await update.message.reply_text("❌ Нет бэкапов для восстановления.")
 
 # ============================================================
-# 11. ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ
+# 15. ГЛАВНЫЙ ОБРАБОТЧИК
 # ============================================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -832,19 +893,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_message = update.message.text
     
-    # --- ОБРАБОТКА "ЗАПОМНИ" ---
+    # Обработка "запомни"
     if user_message.lower().startswith("запомни "):
         text = user_message[8:].strip()
         if ":" in text:
             key, value = text.split(":", 1)
             key = key.strip()
             value = value.strip()
-            profile = load_profile(user_id)
+            profile = get_profile_cached(user_id)
             profile[key] = value
             save_profile(user_id, profile)
             await update.message.reply_text(f"✅ **Запомнил:** {key} = {value}")
         else:
-            profile = load_profile(user_id)
+            profile = get_profile_cached(user_id)
             if "факты" not in profile:
                 profile["факты"] = []
             profile["факты"].append(text)
@@ -852,18 +913,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ **Запомнил факт:** {text}")
         return
     
-    # --- УМНЫЙ АНАЛИЗ ---
+    # Анализ
     analysis_result = await analyze_message(user_id, user_message)
     print(f"📊 Анализ: {analysis_result}")
     
-    # --- ЗАГРУЗКА ДАННЫХ ---
+    # Загрузка данных
     history = load_memory(user_id)
-    profile = load_profile(user_id)
+    profile = get_profile_cached(user_id)
     
-    # --- ГЕНЕРАЦИЯ ОТВЕТА ---
+    # Генерация ответа
     answer, should_save = await generate_response(user_id, user_message, analysis_result, history, profile)
     
-    # --- СОХРАНЕНИЕ ---
+    # Сохранение
     if should_save:
         history.append({"role": "user", "content": user_message})
         history.append({"role": "assistant", "content": answer})
@@ -872,48 +933,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(answer)
 
 # ============================================================
-# 12. ОБРАБОТЧИК ОШИБОК
+# 16. ЗАПУСК
 # ============================================================
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         raise context.error
     except Exception as e:
-        print(f"⚠️ Глобальная ошибка: {e}")
+        print(f"⚠️ Ошибка: {e}")
         import traceback
         traceback.print_exc()
         if update and update.effective_message:
-            await update.effective_message.reply_text(
-                "⚠️ **Произошла ошибка.** Пожалуйста, попробуйте позже."
-            )
-
-# ============================================================
-# 13. ЗАПУСК БОТА
-# ============================================================
+            await update.effective_message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+    logging.basicConfig(level=logging.INFO)
     
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
-    # Регистрируем команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("forget", forget_command))
-    app.add_handler(CommandHandler("clear", clear_command))
+    app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     
     print("=" * 50)
-    print("✅ БОТ УСПЕШНО ЗАПУЩЕН!")
-    print(f"📊 Пирамидальная память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
+    print("✅ БОТ ЗАПУЩЕН С МАКСИМАЛЬНОЙ ОПТИМИЗАЦИЕЙ!")
+    print(f"📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
+    print(f"💾 Кэширование: ВКЛЮЧЕНО (TTL: {CACHE_TTL} сек)")
+    print(f"💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
     print(f"👥 Разрешённых пользователей: {len(ALLOWED_USERS_LIST)}")
-    print(f"📅 Текущая дата: {CURRENT_DATE} {CURRENT_TIME}")
     print("=" * 50)
     
     app.run_polling()
