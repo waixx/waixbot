@@ -177,6 +177,22 @@ def search_apiserpent(query):
         print(f"❌ Ошибка APISerpent: {str(e)}")
         return []
 
+# --- НАСТРОЙКА HTTP СЕССИИ (УЛУЧШЕНИЕ) ---
+def create_http_session():
+    """Создает настроенную HTTP сессию с таймаутами и поддержкой keep-alive"""
+    connector = aiohttp.TCPConnector(
+        limit=100,  # Максимальное количество одновременных соединений
+        limit_per_host=30,  # Максимум на один хост
+        keepalive_timeout=30,  # Время жизни соединения
+        enable_cleanup_closed=True  # Очистка закрытых соединений
+    )
+    timeout = aiohttp.ClientTimeout(
+        total=60,  # Общий таймаут (включая соединение и чтение)
+        connect=10,  # Таймаут на соединение
+        sock_read=30  # Таймаут на чтение данных
+    )
+    return connector, timeout
+
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
@@ -271,6 +287,52 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=f"✅ Выбрана модель: **{MODEL_DEFAULT}** (Flash)\n\n⚡ Быстрая и экономичная!"
         )
 
+# --- ФУНКЦИЯ ДЛЯ ЗАПРОСОВ К DEEPSEEK (УЛУЧШЕННАЯ) ---
+async def ask_deepseek(messages, model=MODEL_DEFAULT, max_retries=3):
+    """Отправляет запрос к DeepSeek API с повторными попытками"""
+    connector, timeout = create_http_session()
+    
+    for attempt in range(max_retries):
+        try:
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.post(
+                    f"{DEEPSEEK_API_BASE}/chat/completions",
+                    headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+                    json={"model": model, "messages": messages},
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data["choices"][0]["message"]["content"], None
+                    elif response.status == 429:
+                        # Too Many Requests - ждем и пробуем снова
+                        wait_time = min(2 ** attempt, 30)  # Экспоненциальная задержка
+                        print(f"⚠️ Превышен лимит запросов, ждем {wait_time} секунд...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    elif response.status == 401:
+                        return None, "❌ Ошибка авторизации API. Проверьте DEEPSEEK_API_KEY."
+                    elif response.status == 500:
+                        return None, "⚠️ Внутренняя ошибка сервера DeepSeek. Попробуйте позже."
+                    else:
+                        error_text = await response.text()
+                        return None, f"❌ Ошибка API ({response.status}): {error_text}"
+        except aiohttp.ClientConnectionError:
+            if attempt < max_retries - 1:
+                print(f"⚠️ Ошибка соединения, попытка {attempt + 1} из {max_retries}...")
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return None, "❌ Ошибка соединения с API DeepSeek. Проверьте интернет-соединение."
+        except asyncio.TimeoutError:
+            if attempt < max_retries - 1:
+                print(f"⚠️ Таймаут, попытка {attempt + 1} из {max_retries}...")
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return None, "❌ Превышен таймаут ожидания ответа от DeepSeek."
+        except Exception as e:
+            return None, f"❌ Неизвестная ошибка: {str(e)}"
+    
+    return None, "❌ Превышено количество попыток подключения к API."
+
 # --- ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает все текстовые сообщения"""
@@ -341,64 +403,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Подготавливаем сообщения для API (используем всю историю)
         messages_for_api = [system_prompt] + history
         
-        # Отправляем запрос к DeepSeek
-        async with aiohttp.ClientSession() as session:
-            json_data = {
-                "model": model,
-                "messages": messages_for_api
-            }
-            
-            async with session.post(
-                f"{DEEPSEEK_API_BASE}/chat/completions",
-                headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-                json=json_data,
-                timeout=30
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    answer = data["choices"][0]["message"]["content"]
-                    
-                    # Сохраняем ответ в историю
-                    history.append({"role": "assistant", "content": answer})
-                    save_memory(user_id, history)
-                    
-                    await update.message.reply_text(answer)
-                else:
-                    error_text = await response.text()
-                    print(f"❌ Ошибка DeepSeek: {error_text}")
-                    await update.message.reply_text(f"❌ Ошибка API: {error_text}")
+        # Отправляем запрос к DeepSeek с улучшенной обработкой
+        answer, error = await ask_deepseek(messages_for_api, model)
+        
+        if error:
+            await update.message.reply_text(error)
+            return
+        
+        # Сохраняем ответ в историю
+        history.append({"role": "assistant", "content": answer})
+        save_memory(user_id, history)
+        
+        await update.message.reply_text(answer)
         return
     
     # --- ОБЫЧНЫЙ ДИАЛОГ (без поиска) ---
     # Добавляем сообщение пользователя в историю
     history.append({"role": "user", "content": user_message})
     
-    # Отправляем запрос к DeepSeek
-    async with aiohttp.ClientSession() as session:
-        json_data = {
-            "model": model,
-            "messages": history
-        }
-        
-        async with session.post(
-            f"{DEEPSEEK_API_BASE}/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-            json=json_data,
-            timeout=30
-        ) as response:
-            if response.status == 200:
-                data = await response.json()
-                answer = data["choices"][0]["message"]["content"]
-                
-                # Сохраняем ответ в историю
-                history.append({"role": "assistant", "content": answer})
-                save_memory(user_id, history)
-                
-                await update.message.reply_text(answer)
-            else:
-                error_text = await response.text()
-                print(f"❌ Ошибка DeepSeek: {error_text}")
-                await update.message.reply_text(f"❌ Ошибка API: {error_text}")
+    # Отправляем запрос к DeepSeek с улучшенной обработкой
+    answer, error = await ask_deepseek(history, model)
+    
+    if error:
+        await update.message.reply_text(error)
+        return
+    
+    # Сохраняем ответ в историю
+    history.append({"role": "assistant", "content": answer})
+    save_memory(user_id, history)
+    
+    await update.message.reply_text(answer)
 
 # --- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ---
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
