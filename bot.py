@@ -136,12 +136,22 @@ def analyze_error(error_text):
         return "🔍 Ресурс не найден. Возможно, изменился адрес API."
     if "message is too long" in error_lower:
         return "📝 Сообщение слишком длинное. Я разбиваю его на части."
-    if "empty" in error_lower or "invalid_response" in error_lower:
-        return "📭 Получен пустой или некорректный ответ от сервера. Попробуйте переформулировать вопрос."
+    if "empty" in error_lower:
+        return "📭 Получен пустой ответ от сервера. Попробуйте переформулировать вопрос."
+    if "invalid_response" in error_lower:
+        return "⚠️ Некорректный ответ от сервера. Возможно, изменился формат API."
     if "max_retries" in error_lower:
         return "⚠️ Не удалось получить ответ после нескольких попыток. Проверьте соединение."
     if "bad request" in error_lower:
         return "⚠️ Некорректный запрос. Проверьте правильность ввода."
+    if "http_429" in error_lower:
+        return "📊 Слишком много запросов. Подождите немного."
+    if "http_401" in error_lower:
+        return "🔑 Ошибка авторизации API. Проверьте DEEPSEEK_API_KEY."
+    if "http_500" in error_lower:
+        return "⚠️ Внутренняя ошибка сервера DeepSeek. Попробуйте позже."
+    if "connection_error" in error_lower:
+        return "🌐 Ошибка соединения с сервером. Проверьте интернет."
     else:
         return f"⚠️ Неизвестная ошибка: {error_text[:150]}..."
 
@@ -780,13 +790,11 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
     
     # ===== ИНТЕРНЕТ-ПОИСК С ОТОБРАЖЕНИЕМ ЗАПРОСА =====
     if action == "internet":
-        # Показываем, что ищем
         print(f"🔍 Поисковый запрос: {user_message}")
         
         results = search_apiserpent(user_message)
         
         if not results:
-            # Если ничего не нашлось
             print(f"⚠️ APISerpent не дал результатов по запросу: {user_message}")
             
             # Отвечаем с пояснением и предложением уточнить запрос
@@ -815,7 +823,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
             if err_code:
                 return f"⚠️ {analyze_error(err_code)}", False, None
             
-            # Формируем понятное сообщение
             full_answer = (
                 f"🔍 **Я искал в интернете по запросу:**\n"
                 f"`{user_message}`\n\n"
@@ -852,7 +859,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         if err_code:
             return f"⚠️ {analyze_error(err_code)}", False, None
         
-        # Добавляем запрос в начало ответа
         final_answer = (
             f"🔍 **Я искал в интернете по запросу:**\n`{user_message}`\n\n"
             f"{answer}"
@@ -1166,6 +1172,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_peak_hour() and not answer.startswith("⚠️"):
             answer = f"⏰ Внимание: сейчас пиковые часы DeepSeek (9:00–12:00, 14:00–18:00). Стоимость API удвоена.\n\n{answer}"
         
+        # Сохраняем ДО отправки
         if should_save:
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             user_message_with_date = f"[Сегодня: {CURRENT_DATE} {CURRENT_TIME}]\n\n{user_message}"
@@ -1204,6 +1211,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_peak_hour() and not answer.startswith("⚠️"):
                 answer = f"⏰ Внимание: сейчас пиковые часы DeepSeek (9:00–12:00, 14:00–18:00). Стоимость API удвоена.\n\n{answer}"
             
+            # Сохраняем ДО отправки
+            if should_save:
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                user_message_with_date = f"[Сегодня: {CURRENT_DATE} {CURRENT_TIME}]\n\n{user_message}"
+                history.append({"role": "user", "content": user_message_with_date, "timestamp": now_str})
+                history.append({"role": "assistant", "content": answer, "timestamp": now_str})
+                save_memory(user_id, history)
+            
             await update.message.reply_text(answer)
             return
     
@@ -1221,6 +1236,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_peak_hour() and not answer.startswith("⚠️"):
         answer = f"⏰ Внимание: сейчас пиковые часы DeepSeek (9:00–12:00, 14:00–18:00). Стоимость API удвоена.\n\n{answer}"
     
+    # Сохраняем ДО отправки
     if should_save:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         user_message_with_date = f"[Сегодня: {CURRENT_DATE} {CURRENT_TIME}]\n\n{user_message}"
