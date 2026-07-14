@@ -105,8 +105,7 @@ BACKUP_DIR = "data/backups"
 # --- КЭШ ПРОФИЛЕЙ В ПАМЯТИ ---
 PROFILE_CACHE = {}
 CACHE_TTL = 60  # 60 секунд
-BACKUP_COUNTER = {}  # Счётчик для бэкапов
-MESSAGE_COUNTER = {}  # Счётчик сообщений
+MESSAGE_COUNTER = {}  # Счётчик сообщений для бэкапов
 
 # ============================================================
 # 4. ФУНКЦИИ КЭШИРОВАНИЯ
@@ -158,11 +157,9 @@ def save_profile(user_id, profile, backup=True):
         profile["updated"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
         data[str(user_id)] = profile
         
-        # Сохраняем основной файл
         with open(PROFILE_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         
-        # Автоматический бэкап
         if backup:
             create_backup(user_id, "profile")
         
@@ -224,7 +221,7 @@ def restore_backup(user_id, data_type):
         return False
 
 # ============================================================
-# 7. СЖАТИЕ ДАННЫХ (ДЛЯ УРОВНЕЙ)
+# 7. СЖАТИЕ ДАННЫХ
 # ============================================================
 
 def extract_key_points(text, max_len=30):
@@ -264,13 +261,11 @@ def compress_ultra_old(items, target_count=50):
     if len(items) <= target_count:
         return items
     
-    # Берём первые 200 пунктов и сжимаем
     old_items = items[:200]
     compressed = []
     
     for i in range(0, len(old_items), 4):
         batch = old_items[i:i+4]
-        # Берём ключевые слова из каждого и объединяем
         combined = " | ".join([item[:20] for item in batch])
         compressed.append(f"[архив] {combined}")
     
@@ -317,7 +312,6 @@ def save_memory(user_id, history, backup=True):
             with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         
-        # Каскадное сжатие
         if len(history) > LEVEL_1['max_history']:
             old_messages = history[:-LEVEL_1['keep_recent']]
             if old_messages:
@@ -338,7 +332,7 @@ def save_memory(user_id, history, backup=True):
         if backup:
             create_backup(user_id, "memory")
         
-        # Инкрементируем счётчик для авто-бэкапа
+        # Авто-бэкап профиля каждые 10 сообщений
         global MESSAGE_COUNTER
         MESSAGE_COUNTER[user_id] = MESSAGE_COUNTER.get(user_id, 0) + 1
         if MESSAGE_COUNTER[user_id] % 10 == 0:
@@ -444,9 +438,7 @@ def update_level_5(user_id, messages):
     for item in compressed:
         profile["level_5"].append(f"[{timestamp}] {item}")
     
-    # Дополнительное сжатие старых пунктов
     if len(profile["level_5"]) > LEVEL_5['compress_to'] + 100:
-        # Сжимаем старые пункты
         old_items = profile["level_5"][:200]
         compressed_old = compress_ultra_old(old_items, 50)
         profile["level_5"] = compressed_old + profile["level_5"][200:]
@@ -500,39 +492,32 @@ def search_in_pyramid(user_id, query):
 # ============================================================
 
 async def analyze_message(user_id, user_message):
-    """Анализирует сообщение и определяет тип (с кэшем)"""
     q = user_message.lower().strip()
     
-    # Приветствия
     simple_greetings = ['привет', 'здравствуй', 'здрасте', 'приветствую', 'салют', 'hello', 'hi']
     if q in simple_greetings or q in [g + '!' for g in simple_greetings]:
         return {"type": "greeting", "action": "greeting", "needs_search": False, "needs_memory": False}
     
-    # Личные вопросы
     personal_triggers = ['имя', 'город', 'работа', 'возраст', 'интерес', 'хобби', 'меня зовут']
     for trigger in personal_triggers:
         if trigger in q:
             return {"type": "personal", "action": "memory", "needs_search": False, "needs_memory": True}
     
-    # Поиск в памяти
     memory_triggers = ['помнишь', 'ты помнишь', 'напомни', 'что я говорил', 'что я писал', 'вспомни']
     for trigger in memory_triggers:
         if trigger in q:
             return {"type": "memory_query", "action": "memory_search", "needs_search": False, "needs_memory": True}
     
-    # Динамичные темы
     dynamic_triggers = ['погод', 'температур', 'дожд', 'снег', 'ветер', 'курс', 'доллар', 'евро', 'новост', 'событи']
     for trigger in dynamic_triggers:
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
     
-    # Инструкции
     instructional_triggers = ['как ', 'как сделать', 'как настроить', 'как установить', 'инструкция', 'руководство']
     for trigger in instructional_triggers:
         if trigger in q:
             return {"type": "instructional", "action": "internet", "needs_search": True, "needs_memory": False}
     
-    # По умолчанию
     return {"type": "static", "action": "memory", "needs_search": False, "needs_memory": True}
 
 # ============================================================
@@ -608,12 +593,8 @@ async def ask_deepseek(messages, retries=3, max_tokens=None):
 # ============================================================
 
 async def generate_response(user_id, user_message, analysis_result, history, profile):
-    """Генерирует финальный ответ на основе анализа"""
-    
-    # Системный промпт
     system_parts = [f"Сегодня: {CURRENT_DATE} {CURRENT_TIME}"]
     
-    # Профиль
     for key, value in profile.items():
         if key.startswith("last_check_") or key.startswith("update_history_"):
             continue
@@ -625,7 +606,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         else:
             system_parts.append(f"{key}: {str(value)[:50]}")
     
-    # Уровни (компактно)
     if profile.get("level_2"):
         system_parts.append(f"📚 1000: {', '.join(profile['level_2'][-10:])}")
     if profile.get("level_3"):
@@ -638,7 +618,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
     system_msg = {"role": "system", "content": system_prompt}
     action = analysis_result.get("action", "memory")
     
-    # Приветствие
     if action == "greeting":
         greetings = {
             'привет': '👋 Привет! Как дела?',
@@ -651,7 +630,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 return value, False
         return "👋 Привет! Чем могу помочь?", False
     
-    # Поиск в памяти
     if action == "memory_search":
         memory_results = search_in_pyramid(user_id, user_message)
         if memory_results:
@@ -674,7 +652,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 return f"⚠️ {error}", False
             return answer, True
     
-    # Поиск в интернете
     if action == "internet":
         results = search_apiserpent(user_message)
         if not results:
@@ -707,7 +684,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
             return f"⚠️ {error}", False
         return answer, True
     
-    # Обычный ответ
     history.append({"role": "user", "content": user_message})
     messages = [system_msg] + history
     answer, error = await ask_deepseek(messages)
@@ -774,7 +750,8 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     lines.append(f"\n👤 **Личная информация:**")
     personal_keys = ['name', 'город', 'city', 'работа', 'job', 'возраст', 'age']
-    found = False    for key in personal_keys:
+    found = False
+    for key in personal_keys:
         if key in profile:
             lines.append(f"• {key}: {profile[key]}")
             found = True
@@ -839,7 +816,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {label}: {len(value)} пунктов")
         total_punkts += len(value)
     
-    # Бэкапы
     backup_count = len([f for f in os.listdir(BACKUP_DIR) if f.startswith(f"profile_{user_id}")])
     lines.append(f"\n💾 Бэкапов: {backup_count}")
     
@@ -866,7 +842,6 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Доступ запрещён.")
         return
     
-    # Восстанавливаем профиль
     profile_restored = restore_backup(user_id, "profile")
     memory_restored = restore_backup(user_id, "memory")
     
@@ -893,7 +868,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_message = update.message.text
     
-    # Обработка "запомни"
     if user_message.lower().startswith("запомни "):
         text = user_message[8:].strip()
         if ":" in text:
@@ -913,18 +887,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ **Запомнил факт:** {text}")
         return
     
-    # Анализ
     analysis_result = await analyze_message(user_id, user_message)
     print(f"📊 Анализ: {analysis_result}")
     
-    # Загрузка данных
     history = load_memory(user_id)
     profile = get_profile_cached(user_id)
     
-    # Генерация ответа
     answer, should_save = await generate_response(user_id, user_message, analysis_result, history, profile)
     
-    # Сохранение
     if should_save:
         history.append({"role": "user", "content": user_message})
         history.append({"role": "assistant", "content": answer})
