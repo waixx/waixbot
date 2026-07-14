@@ -778,9 +778,18 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         answer = f"📅 Сегодня: {CURRENT_DATE} ({weekday})\n🕐 Текущее время: {CURRENT_TIME}"
         return answer, False, "📂 локально"
     
+    # ===== ИНТЕРНЕТ-ПОИСК С ОТОБРАЖЕНИЕМ ЗАПРОСА =====
     if action == "internet":
+        # Показываем, что ищем
+        print(f"🔍 Поисковый запрос: {user_message}")
+        
         results = search_apiserpent(user_message)
+        
         if not results:
+            # Если ничего не нашлось
+            print(f"⚠️ APISerpent не дал результатов по запросу: {user_message}")
+            
+            # Отвечаем с пояснением и предложением уточнить запрос
             system_parts = []
             for key, value in profile.items():
                 if key.startswith("last_check_") or key.startswith("update_history_"):
@@ -805,10 +814,23 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
             answer, err_code = await ask_deepseek(messages)
             if err_code:
                 return f"⚠️ {analyze_error(err_code)}", False, None
-            source = "🧠 из модели (интернет ничего не дал)"
-            return answer, True, source
+            
+            # Формируем понятное сообщение
+            full_answer = (
+                f"🔍 **Я искал в интернете по запросу:**\n"
+                f"`{user_message}`\n\n"
+                f"❌ **Ничего не найдено.**\n\n"
+                f"💡 **Возможно, вы имели в виду:**\n"
+                f"— Уточните запрос (например, 'бро погода в Москве')\n"
+                f"— Или напишите 'бро {user_message} ещё раз' с другими словами\n\n"
+                f"🧠 **А пока я отвечаю из своих знаний:**\n{answer}"
+            )
+            source = "🧠 из модели (поиск ничего не дал)"
+            return full_answer, True, source
         
-        search_text = f"🔍 Результаты поиска:\n\n"
+        # Если результаты есть – показываем запрос и результаты
+        search_text = f"🔍 **Я искал в интернете по запросу:**\n`{user_message}`\n\n"
+        search_text += f"📊 **Найдено {len(results[:5])} результатов:**\n\n"
         for i, r in enumerate(results[:5], 1):
             search_text += f"{i}. **{r['title']}**\n   {r['snippet'][:200]}\n   🔗 {r['link']}\n\n"
         
@@ -829,8 +851,14 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         answer, err_code = await ask_deepseek(messages)
         if err_code:
             return f"⚠️ {analyze_error(err_code)}", False, None
+        
+        # Добавляем запрос в начало ответа
+        final_answer = (
+            f"🔍 **Я искал в интернете по запросу:**\n`{user_message}`\n\n"
+            f"{answer}"
+        )
         source = "🌐 из интернета"
-        return answer, True, source
+        return final_answer, True, source
     
     date_match = re.search(r'\b(сегодня|вчера|завтра|\d{2}\.\d{2}(\.\d{4})?|\d{4}-\d{2}-\d{2})\b', user_message, re.IGNORECASE)
     if date_match:
