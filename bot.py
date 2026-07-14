@@ -394,39 +394,7 @@ def load_memory(user_id):
     return compress_history(raw_history)
 
 def save_memory(user_id, history, backup=True):
-    old_data = atomic_read(MEMORY_FILE, default={})
-    old_history = old_data.get(str(user_id), [])
-    
-    old_timestamps = {}
-    for msg in old_history:
-        if "timestamp" in msg:
-            key = f"{msg.get('role', '')}:{msg.get('content', '')}"
-            old_timestamps[key] = msg["timestamp"]
-    
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    for msg in history:
-        if "timestamp" not in msg:
-            key = f"{msg.get('role', '')}:{msg.get('content', '')}"
-            if key in old_timestamps:
-                msg["timestamp"] = old_timestamps[key]
-            else:
-                msg["timestamp"] = now_str
-
     data = atomic_read(MEMORY_FILE, default={})
-    
-    if len(history) > LEVEL_1['max_history']:
-        old_messages = history[:-LEVEL_1['keep_recent']]
-        if old_messages:
-            update_level_2(user_id, old_messages)
-            profile = get_profile_cached(user_id)
-            if len(profile.get("level_2", [])) >= LEVEL_2['compress_to']:
-                update_level_3(user_id, old_messages)
-            if len(profile.get("level_3", [])) >= LEVEL_3['compress_to']:
-                update_level_4(user_id, old_messages)
-            if len(profile.get("level_4", [])) >= LEVEL_4['compress_to']:
-                update_level_5(user_id, old_messages)
-    
     data[str(user_id)] = compress_history(history)
     if not atomic_write(MEMORY_FILE, data):
         return False
@@ -630,15 +598,9 @@ def search_in_pyramid(user_id, query):
             results.append(f"📗 {item}")
     
     return results[:15]
-
-# ============================================================
-# АНАЛИЗАТОР СООБЩЕНИЙ (С ЛОКАЛЬНЫМИ ДАТОЙ/ВРЕМЕНЕМ)
-# ============================================================
-
-async def analyze_message(user_id, user_message):
+    async def analyze_message(user_id, user_message):
     q = user_message.lower().strip()
     
-    # Быстрые ответы
     short_confirm = ['да', 'нет', 'ок', 'хорошо', 'понял', 'поняла', 'ага', 'угу', 'так', 'ясно', 'ладно', 'окей']
     if q.strip() in short_confirm or q.strip() in [c + '.' for c in short_confirm] or q.strip() in [c + '!' for c in short_confirm]:
         return {"type": "confirm", "action": "confirm", "needs_search": False, "needs_memory": False}
@@ -647,19 +609,16 @@ async def analyze_message(user_id, user_message):
     if q in simple_greetings or q in [g + '!' for g in simple_greetings]:
         return {"type": "greeting", "action": "greeting", "needs_search": False, "needs_memory": False}
     
-    # Личные вопросы (из памяти)
     personal_triggers = ['имя', 'город', 'работа', 'возраст', 'интерес', 'хобби', 'меня зовут']
     for trigger in personal_triggers:
         if trigger in q:
             return {"type": "personal", "action": "memory", "needs_search": False, "needs_memory": True}
     
-    # Поиск в старой памяти
     memory_triggers = ['помнишь', 'ты помнишь', 'напомни', 'что я говорил', 'что я писал', 'вспомни']
     for trigger in memory_triggers:
         if trigger in q:
             return {"type": "memory_query", "action": "memory_search", "needs_search": False, "needs_memory": True}
     
-    # ===== ЗАПРОСЫ ДАТЫ И ВРЕМЕНИ (ОТВЕЧАЕМ ЛОКАЛЬНО) =====
     date_time_triggers = [
         'какая дата', 'какое сегодня число', 'сегодняшняя дата', 'какой сегодня день',
         'который час', 'сколько времени', 'текущее время', 'сейчас время',
@@ -669,7 +628,6 @@ async def analyze_message(user_id, user_message):
         if trigger in q:
             return {"type": "date_time", "action": "date_time", "needs_search": False, "needs_memory": False}
     
-    # Расширенные триггеры для интернет-поиска
     internet_triggers = [
         'в интернете', 'найди в интернете', 'проверь в интернете',
         'актуализируй', 'актуализируйте', 'обнови', 'обновить',
@@ -684,7 +642,6 @@ async def analyze_message(user_id, user_message):
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
     
-    # Динамичные темы (требуют интернета) — БЕЗ слов времени и даты
     dynamic_triggers = [
         'погод', 'температур', 'дожд', 'снег', 'ветер', 'градус',
         'курс', 'доллар', 'евро', 'юань', 'биткоин',
@@ -695,17 +652,12 @@ async def analyze_message(user_id, user_message):
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
     
-    # Инструкции (требуют интернета)
     instructional_triggers = ['как ', 'как сделать', 'как настроить', 'как установить', 'инструкция', 'руководство']
     for trigger in instructional_triggers:
         if trigger in q:
             return {"type": "instructional", "action": "internet", "needs_search": True, "needs_memory": False}
     
     return {"type": "static", "action": "memory", "needs_search": False, "needs_memory": True}
-
-# ============================================================
-# ПОИСК ЧЕРЕЗ APISERPENT
-# ============================================================
 
 def search_apiserpent(query):
     if not APISERPENT_API_KEY:
@@ -749,10 +701,6 @@ def search_apiserpent(query):
     except Exception as e:
         print(f"❌ Ошибка поиска APISerpent: {e}")
         return []
-
-# ============================================================
-# ЗАПРОС К DEEPSEEK
-# ============================================================
 
 async def ask_deepseek(messages, retries=3, max_tokens=None):
     session = await get_http_session()
@@ -804,10 +752,6 @@ async def ask_deepseek(messages, retries=3, max_tokens=None):
             return None, f"unknown: {str(e)}"
     return None, "max_retries"
 
-# ============================================================
-# ГЕНЕРАЦИЯ ОТВЕТА (С ПРИОРИТЕТОМ ИНТЕРНЕТА НАД ДАТОЙ)
-# ============================================================
-
 async def generate_response(user_id, user_message, analysis_result, history, profile):
     action = analysis_result.get("action", "memory")
     source = "🧠 из модели"
@@ -833,11 +777,9 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         answer = f"📅 Сегодня: {CURRENT_DATE} ({weekday})\n🕐 Текущее время: {CURRENT_TIME}"
         return answer, False, "📂 локально"
     
-    # ===== СНАЧАЛА ИНТЕРНЕТ-ПОИСК (ЕСЛИ ТРЕБУЕТСЯ) =====
     if action == "internet":
         results = search_apiserpent(user_message)
         if not results:
-            # Если поиск не дал результатов, отвечаем из модели с учётом профиля
             system_parts = []
             for key, value in profile.items():
                 if key.startswith("last_check_") or key.startswith("update_history_"):
@@ -889,7 +831,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         source = "🌐 из интернета"
         return answer, True, source
     
-    # ===== ПОИСК ПО ДАТЕ (ЕСЛИ ИНТЕРНЕТ НЕ НУЖЕН) =====
     date_match = re.search(r'\b(сегодня|вчера|завтра|\d{2}\.\d{2}(\.\d{4})?|\d{4}-\d{2}-\d{2})\b', user_message, re.IGNORECASE)
     if date_match:
         date_query = date_match.group(1)
@@ -906,7 +847,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                     answer += f"\n... и ещё {len(date_results)-10} сообщений"
                 return answer, False, "📂 из памяти (по дате)"
     
-    # ===== ПОИСК ПО ВРЕМЕНИ =====
     time_match = re.search(r'(\d{1,2}:\d{2}(:\d{2})?)', user_message)
     if time_match:
         time_str = time_match.group(1)
@@ -921,7 +861,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 answer += f"\n... и ещё {len(time_results)-5} сообщений"
             return answer, False, "📂 из памяти (по времени)"
     
-    # ===== ОБЫЧНЫЙ ОТВЕТ ИЗ МОДЕЛИ =====
     system_parts = []
     for key, value in profile.items():
         if key.startswith("last_check_") or key.startswith("update_history_"):
@@ -951,10 +890,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         return f"⚠️ {analyze_error(err_code)}", False, None
     source = "🧠 из модели"
     return answer, True, source
-
-# ============================================================
-# КОМАНДЫ БОТА
-# ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1186,7 +1121,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ **Запомнил факт:** {text}")
         return
     
-    # ===== ПРИНУДИТЕЛЬНЫЙ ПОИСК ПО КОМАНДЕ "бро" =====
     if user_message.lower().startswith("бро "):
         search_query = user_message[4:].strip()
         if not search_query:
@@ -1225,7 +1159,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await asyncio.sleep(1)
         return
     
-    # --- ЕСЛИ ЭТО ЗАПРОС НА ПОИСК ПО ДАТЕ/ВРЕМЕНИ ---
     date_keywords = ['сегодня', 'вчера', 'завтра', 'помнишь', 'напомни', 'что я писал', 'что я говорил']
     if any(kw in user_message.lower() for kw in date_keywords):
         date_match = re.search(r'\b(сегодня|вчера|завтра|\d{2}\.\d{2}(\.\d{4})?|\d{4}-\d{2}-\d{2})\b', user_message, re.IGNORECASE)
@@ -1245,7 +1178,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(answer)
             return
     
-    # --- ОСНОВНАЯ ЛОГИКА ---
     analysis_result = await analyze_message(user_id, user_message)
     print(f"📊 Анализ: {analysis_result}")
     
