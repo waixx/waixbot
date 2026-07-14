@@ -86,7 +86,7 @@ print(f"  🔍 APISERPENT_API_KEY: {'✅' if APISERPENT_API_KEY else '❌'}")
 print(f"  👤 ADMIN_USER_ID: {ADMIN_USER_ID}")
 print(f"  👥 Разрешённых пользователей: {len(ALLOWED_USERS_LIST)}")
 print(f"  📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
-print(f"  💾 Кэширование: ВКЛЮЧЕНО")
+print(f"  💾 Кэширование: ВКЛЮЧЕНО (системный промпт СТАТИЧНЫЙ)")
 print(f"  💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
 print("=" * 50 + "\n")
 
@@ -581,7 +581,7 @@ async def ask_deepseek(messages, retries=3, max_tokens=None):
     return None, "❌ Превышено количество попыток."
 
 # ============================================================
-# 12. ГЕНЕРАЦИЯ ОТВЕТА
+# 12. ГЕНЕРАЦИЯ ОТВЕТА (ИЗМЕНЕНО!)
 # ============================================================
 
 async def generate_response(user_id, user_message, analysis_result, history, profile):
@@ -604,9 +604,12 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 return value, False
         return "👋 Привет! Чем могу помочь?", False
     
-    # --- СБОР СИСТЕМНОГО ПРОМПТА ---
-    system_parts = [f"Сегодня: {CURRENT_DATE} {CURRENT_TIME}"]
+    # ============================================================
+    # СТАТИЧНЫЙ СИСТЕМНЫЙ ПРОМПТ (БЕЗ ДАТЫ!)
+    # ============================================================
+    system_parts = []
     
+    # Профиль (имя, город, работа и т.д.)
     for key, value in profile.items():
         if key.startswith("last_check_") or key.startswith("update_history_"):
             continue
@@ -618,20 +621,23 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         else:
             system_parts.append(f"{key}: {str(value)[:50]}")
     
+    # Уровни памяти (сжатые)
     if profile.get("level_2"):
         system_parts.append(f"📚 1000: {', '.join(profile['level_2'][-10:])}")
     if profile.get("level_3"):
         system_parts.append(f"📖 10000: {', '.join(profile['level_3'][-5:])}")
     
+    # ⚡ СТАТИЧНЫЙ ПРОМПТ (без даты!)
     system_prompt = ". ".join(system_parts)
     
-    # --- ЕСЛИ СООБЩЕНИЕ КОРОТКОЕ → КОРОТКИЙ ОТВЕТ ---
-    if len(user_message) < 30:
-        system_prompt = f"Сегодня: {CURRENT_DATE}. Ответь кратко, 1-2 предложения."
-    elif len(system_prompt) > 800:
+    # Ограничиваем длину
+    if len(system_prompt) > 800:
         system_prompt = system_prompt[:800] + "..."
     
     system_msg = {"role": "system", "content": system_prompt}
+    
+    # --- ДАТУ ДОБАВЛЯЕМ В СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ ---
+    user_message_with_date = f"[Сегодня: {CURRENT_DATE} {CURRENT_TIME}]\n\n{user_message}"
     
     # --- ПОИСК В ПАМЯТИ ---
     if action == "memory_search":
@@ -642,14 +648,14 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 "role": "system",
                 "content": f"Нашёл в истории:\n{memory_text}\n\nОтветь кратко на вопрос."
             }
-            history.append({"role": "user", "content": user_message})
+            history.append({"role": "user", "content": user_message_with_date})
             messages = [system_msg, prompt] + history
             answer, error = await ask_deepseek(messages)
             if error:
                 return f"⚠️ {error}", False
             return answer, True
         else:
-            history.append({"role": "user", "content": user_message})
+            history.append({"role": "user", "content": user_message_with_date})
             messages = [system_msg] + history
             answer, error = await ask_deepseek(messages)
             if error:
@@ -660,7 +666,7 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
     if action == "internet":
         results = search_apiserpent(user_message)
         if not results:
-            history.append({"role": "user", "content": user_message})
+            history.append({"role": "user", "content": user_message_with_date})
             messages = [system_msg] + history
             answer, error = await ask_deepseek(messages)
             if error:
@@ -673,9 +679,7 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         
         search_prompt = {
             "role": "system",
-            "content": f"""Сегодня: {CURRENT_DATE}.
-
-Вопрос: "{user_message}"
+            "content": f"""Вопрос пользователя: "{user_message}"
 
 {search_text}
 
@@ -683,7 +687,7 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
 Если вопрос короткий — ответь кратко."""
         }
         
-        history.append({"role": "user", "content": user_message})
+        history.append({"role": "user", "content": user_message_with_date})
         messages = [system_msg, search_prompt] + history
         answer, error = await ask_deepseek(messages)
         if error:
@@ -691,7 +695,7 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         return answer, True
     
     # --- ОБЫЧНЫЙ ОТВЕТ ---
-    history.append({"role": "user", "content": user_message})
+    history.append({"role": "user", "content": user_message_with_date})
     messages = [system_msg] + history
     answer, error = await ask_deepseek(messages)
     if error:
@@ -863,7 +867,7 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Нет бэкапов для восстановления.")
 
 # ============================================================
-# 14. ГЛАВНЫЙ ОБРАБОТЧИК
+# 14. ГЛАВНЫЙ ОБРАБОТЧИК (ИЗМЕНЕНО!)
 # ============================================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -894,17 +898,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ **Запомнил факт:** {text}")
         return
     
+    # --- АНАЛИЗ ---
     analysis_result = await analyze_message(user_id, user_message)
     print(f"📊 Анализ: {analysis_result}")
     
     history = load_memory(user_id)
     profile = get_profile_cached(user_id)
     
+    # --- ГЕНЕРАЦИЯ ОТВЕТА ---
     answer, should_save = await generate_response(user_id, user_message, analysis_result, history, profile)
     
-    # ===== СОХРАНЯЕМ В ИСТОРИЮ ДО ОТПРАВКИ =====
+    # ===== СОХРАНЯЕМ В ИСТОРИЮ С ДАТОЙ =====
     if should_save:
-        history.append({"role": "user", "content": user_message})
+        # Сохраняем ВСЁ сообщение (с датой)
+        user_message_with_date = f"[Сегодня: {CURRENT_DATE} {CURRENT_TIME}]\n\n{user_message}"
+        history.append({"role": "user", "content": user_message_with_date})
         history.append({"role": "assistant", "content": answer})
         save_memory(user_id, history)
     
