@@ -78,7 +78,7 @@ if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     sys.exit(1)
 
 print("\n" + "=" * 50)
-print("🚀 БОТ ЗАПУЩЕН (ПИРАМИДАЛЬНАЯ ПАМЯТЬ + ОПТИМИЗАЦИЯ)")
+print("🚀 БОТ ЗАПУЩЕН (ФИНАЛЬНАЯ ВЕРСИЯ)")
 print("=" * 50)
 print(f"  🤖 TELEGRAM_TOKEN: {'✅' if TELEGRAM_TOKEN else '❌'}")
 print(f"  🔑 DEEPSEEK_API_KEY: {'✅' if DEEPSEEK_API_KEY else '❌'}")
@@ -86,7 +86,7 @@ print(f"  🔍 APISERPENT_API_KEY: {'✅' if APISERPENT_API_KEY else '❌'}")
 print(f"  👤 ADMIN_USER_ID: {ADMIN_USER_ID}")
 print(f"  👥 Разрешённых пользователей: {len(ALLOWED_USERS_LIST)}")
 print(f"  📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
-print(f"  💾 Кэширование: ВКЛЮЧЕНО (системный промпт СТАТИЧНЫЙ)")
+print(f"  💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН")
 print(f"  💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
 print("=" * 50 + "\n")
 
@@ -100,13 +100,68 @@ os.makedirs("data/backups", exist_ok=True)
 MEMORY_FILE = "data/memory.json"
 PROFILE_FILE = "data/user_profile.json"
 BACKUP_DIR = "data/backups"
+CACHE_FILE = "data/profile_cache.json"
 
-PROFILE_CACHE = {}
+PROFILE_CACHE = {}  # RAM-кэш
 CACHE_TTL = 60
 MESSAGE_COUNTER = {}
 
-def get_profile_cached(user_id):
+# ============================================================
+# 4. ГИБРИДНЫЙ КЭШ (RAM + ФАЙЛ)
+# ============================================================
+
+def load_cache_from_file():
+    """Загружает кэш из файла в RAM"""
+    global PROFILE_CACHE
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                for user_id, (profile, timestamp_str) in data.items():
+                    PROFILE_CACHE[user_id] = (profile, datetime.fromisoformat(timestamp_str))
+                print(f"💾 Загружено {len(PROFILE_CACHE)} записей кэша из файла")
+                return True
+    except Exception as e:
+        print(f"⚠️ Ошибка загрузки кэша: {e}")
+    return False
+
+def save_cache_to_file():
+    """Сохраняет RAM-кэш в файл"""
+    global PROFILE_CACHE
+    try:
+        serializable = {}
+        for user_id, (profile, timestamp) in PROFILE_CACHE.items():
+            serializable[user_id] = (profile, timestamp.isoformat())
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"⚠️ Ошибка сохранения кэша: {e}")
+        return False
+
+def clean_old_cache(max_age_hours=24):
+    """Удаляет записи старше max_age_hours из кэша"""
+    global PROFILE_CACHE
     now = datetime.now()
+    to_remove = []
+    for user_id, (_, timestamp) in PROFILE_CACHE.items():
+        if (now - timestamp).seconds > max_age_hours * 3600:
+            to_remove.append(user_id)
+    for user_id in to_remove:
+        del PROFILE_CACHE[user_id]
+    if to_remove:
+        save_cache_to_file()
+        print(f"🧹 Очищено {len(to_remove)} старых записей кэша")
+    return PROFILE_CACHE
+
+def get_profile_cached(user_id):
+    """Загружает профиль из RAM-кэша (с авто-восстановлением из файла)"""
+    global PROFILE_CACHE
+    now = datetime.now()
+    
+    if not PROFILE_CACHE:
+        load_cache_from_file()
+    
     if user_id in PROFILE_CACHE:
         profile, timestamp = PROFILE_CACHE[user_id]
         if (now - timestamp).seconds < CACHE_TTL:
@@ -114,11 +169,16 @@ def get_profile_cached(user_id):
     
     profile = load_profile(user_id)
     PROFILE_CACHE[user_id] = (profile.copy() if profile else {}, now)
+    save_cache_to_file()
+    
     return profile.copy() if profile else {}
 
 def invalidate_cache(user_id):
+    """Очищает кэш для пользователя (RAM + файл)"""
+    global PROFILE_CACHE
     if user_id in PROFILE_CACHE:
         del PROFILE_CACHE[user_id]
+        save_cache_to_file()
 
 def is_allowed(user_id):
     if not ALLOWED_USERS_LIST:
@@ -126,7 +186,7 @@ def is_allowed(user_id):
     return user_id in ALLOWED_USERS_LIST
 
 # ============================================================
-# 4. ЗАГРУЗКА/СОХРАНЕНИЕ ПРОФИЛЯ
+# 5. ЗАГРУЗКА/СОХРАНЕНИЕ ПРОФИЛЯ
 # ============================================================
 
 def load_profile(user_id):
@@ -162,7 +222,7 @@ def save_profile(user_id, profile, backup=True):
         return False
 
 # ============================================================
-# 5. АВТОМАТИЧЕСКИЕ БЭКАПЫ
+# 6. АВТОМАТИЧЕСКИЕ БЭКАПЫ
 # ============================================================
 
 def create_backup(user_id, data_type):
@@ -210,7 +270,7 @@ def restore_backup(user_id, data_type):
         return False
 
 # ============================================================
-# 6. СЖАТИЕ ДАННЫХ
+# 7. СЖАТИЕ ДАННЫХ
 # ============================================================
 
 def extract_key_points(text, max_len=30):
@@ -260,7 +320,7 @@ def compress_ultra_old(items, target_count=50):
     return compressed + items[-target_count:]
 
 # ============================================================
-# 7. ФУНКЦИИ ПАМЯТИ
+# 8. ФУНКЦИИ ПАМЯТИ
 # ============================================================
 
 def compress_history(history):
@@ -331,7 +391,7 @@ def save_memory(user_id, history, backup=True):
         return False
 
 # ============================================================
-# 8. ОБНОВЛЕНИЕ УРОВНЕЙ
+# 9. ОБНОВЛЕНИЕ УРОВНЕЙ
 # ============================================================
 
 def update_level_2(user_id, messages):
@@ -436,7 +496,7 @@ def update_level_5(user_id, messages):
     save_profile(user_id, profile, backup=False)
 
 # ============================================================
-# 9. ПОИСК ПО ПИРАМИДЕ
+# 10. ПОИСК ПО ПИРАМИДЕ
 # ============================================================
 
 def search_in_pyramid(user_id, query):
@@ -470,41 +530,35 @@ def search_in_pyramid(user_id, query):
     return results[:15]
 
 # ============================================================
-# 10. АНАЛИЗАТОР СООБЩЕНИЙ
+# 11. АНАЛИЗАТОР СООБЩЕНИЙ
 # ============================================================
 
 async def analyze_message(user_id, user_message):
     q = user_message.lower().strip()
     
-    # --- КОРОТКИЕ ПОДТВЕРЖДЕНИЯ ---
     short_confirm = ['да', 'нет', 'ок', 'хорошо', 'понял', 'поняла', 'ага', 'угу', 'так', 'ясно', 'ладно', 'окей']
     if q.strip() in short_confirm or q.strip() in [c + '.' for c in short_confirm] or q.strip() in [c + '!' for c in short_confirm]:
         return {"type": "confirm", "action": "confirm", "needs_search": False, "needs_memory": False}
     
-    # --- ПРИВЕТСТВИЯ ---
     simple_greetings = ['привет', 'здравствуй', 'здрасте', 'приветствую', 'салют', 'hello', 'hi']
     if q in simple_greetings or q in [g + '!' for g in simple_greetings]:
         return {"type": "greeting", "action": "greeting", "needs_search": False, "needs_memory": False}
     
-    # --- ЛИЧНЫЕ ВОПРОСЫ ---
     personal_triggers = ['имя', 'город', 'работа', 'возраст', 'интерес', 'хобби', 'меня зовут']
     for trigger in personal_triggers:
         if trigger in q:
             return {"type": "personal", "action": "memory", "needs_search": False, "needs_memory": True}
     
-    # --- ПОИСК В ПАМЯТИ ---
     memory_triggers = ['помнишь', 'ты помнишь', 'напомни', 'что я говорил', 'что я писал', 'вспомни']
     for trigger in memory_triggers:
         if trigger in q:
             return {"type": "memory_query", "action": "memory_search", "needs_search": False, "needs_memory": True}
     
-    # --- ДИНАМИЧНЫЕ ТЕМЫ ---
     dynamic_triggers = ['погод', 'температур', 'дожд', 'снег', 'ветер', 'курс', 'доллар', 'евро', 'новост', 'событи']
     for trigger in dynamic_triggers:
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
     
-    # --- ИНСТРУКЦИИ ---
     instructional_triggers = ['как ', 'как сделать', 'как настроить', 'как установить', 'инструкция', 'руководство']
     for trigger in instructional_triggers:
         if trigger in q:
@@ -513,7 +567,7 @@ async def analyze_message(user_id, user_message):
     return {"type": "static", "action": "memory", "needs_search": False, "needs_memory": True}
 
 # ============================================================
-# 11. API ФУНКЦИИ
+# 12. API ФУНКЦИИ
 # ============================================================
 
 def search_apiserpent(query):
@@ -581,17 +635,15 @@ async def ask_deepseek(messages, retries=3, max_tokens=None):
     return None, "❌ Превышено количество попыток."
 
 # ============================================================
-# 12. ГЕНЕРАЦИЯ ОТВЕТА (ИЗМЕНЕНО!)
+# 13. ГЕНЕРАЦИЯ ОТВЕТА
 # ============================================================
 
 async def generate_response(user_id, user_message, analysis_result, history, profile):
     action = analysis_result.get("action", "memory")
     
-    # --- БЫСТРЫЙ ОТВЕТ НА ПОДТВЕРЖДЕНИЯ ---
     if action == "confirm":
         return "✅ Понял! Продолжаем.", False
     
-    # --- ПРИВЕТСТВИЯ ---
     if action == "greeting":
         greetings = {
             'привет': '👋 Привет! Как дела?',
@@ -604,12 +656,9 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 return value, False
         return "👋 Привет! Чем могу помочь?", False
     
-    # ============================================================
     # СТАТИЧНЫЙ СИСТЕМНЫЙ ПРОМПТ (БЕЗ ДАТЫ!)
-    # ============================================================
     system_parts = []
     
-    # Профиль (имя, город, работа и т.д.)
     for key, value in profile.items():
         if key.startswith("last_check_") or key.startswith("update_history_"):
             continue
@@ -621,25 +670,20 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         else:
             system_parts.append(f"{key}: {str(value)[:50]}")
     
-    # Уровни памяти (сжатые)
     if profile.get("level_2"):
         system_parts.append(f"📚 1000: {', '.join(profile['level_2'][-10:])}")
     if profile.get("level_3"):
         system_parts.append(f"📖 10000: {', '.join(profile['level_3'][-5:])}")
     
-    # ⚡ СТАТИЧНЫЙ ПРОМПТ (без даты!)
     system_prompt = ". ".join(system_parts)
-    
-    # Ограничиваем длину
     if len(system_prompt) > 800:
         system_prompt = system_prompt[:800] + "..."
     
     system_msg = {"role": "system", "content": system_prompt}
     
-    # --- ДАТУ ДОБАВЛЯЕМ В СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ ---
+    # ДАТУ ДОБАВЛЯЕМ В СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ
     user_message_with_date = f"[Сегодня: {CURRENT_DATE} {CURRENT_TIME}]\n\n{user_message}"
     
-    # --- ПОИСК В ПАМЯТИ ---
     if action == "memory_search":
         memory_results = search_in_pyramid(user_id, user_message)
         if memory_results:
@@ -662,7 +706,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 return f"⚠️ {error}", False
             return answer, True
     
-    # --- ПОИСК В ИНТЕРНЕТЕ ---
     if action == "internet":
         results = search_apiserpent(user_message)
         if not results:
@@ -694,7 +737,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
             return f"⚠️ {error}", False
         return answer, True
     
-    # --- ОБЫЧНЫЙ ОТВЕТ ---
     history.append({"role": "user", "content": user_message_with_date})
     messages = [system_msg] + history
     answer, error = await ask_deepseek(messages)
@@ -703,7 +745,7 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
     return answer, True
 
 # ============================================================
-# 13. КОМАНДЫ БОТА
+# 14. КОМАНДЫ БОТА
 # ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -867,7 +909,7 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Нет бэкапов для восстановления.")
 
 # ============================================================
-# 14. ГЛАВНЫЙ ОБРАБОТЧИК (ИЗМЕНЕНО!)
+# 15. ГЛАВНЫЙ ОБРАБОТЧИК
 # ============================================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -898,25 +940,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ **Запомнил факт:** {text}")
         return
     
-    # --- АНАЛИЗ ---
     analysis_result = await analyze_message(user_id, user_message)
     print(f"📊 Анализ: {analysis_result}")
     
     history = load_memory(user_id)
     profile = get_profile_cached(user_id)
     
-    # --- ГЕНЕРАЦИЯ ОТВЕТА ---
     answer, should_save = await generate_response(user_id, user_message, analysis_result, history, profile)
     
-    # ===== СОХРАНЯЕМ В ИСТОРИЮ С ДАТОЙ =====
     if should_save:
-        # Сохраняем ВСЁ сообщение (с датой)
         user_message_with_date = f"[Сегодня: {CURRENT_DATE} {CURRENT_TIME}]\n\n{user_message}"
         history.append({"role": "user", "content": user_message_with_date})
         history.append({"role": "assistant", "content": answer})
         save_memory(user_id, history)
     
-    # Отправляем ответ (с разбивкой длинных сообщений)
     if len(answer) > 4096:
         for i in range(0, len(answer), 4096):
             try:
@@ -930,7 +967,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"⚠️ Ошибка отправки: {e}")
 
 # ============================================================
-# 15. ЗАПУСК
+# 16. ЗАПУСК
 # ============================================================
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -960,7 +997,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print("✅ БОТ ЗАПУЩЕН С МАКСИМАЛЬНОЙ ОПТИМИЗАЦИЕЙ!")
     print(f"📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
-    print(f"💾 Кэширование: ВКЛЮЧЕНО (TTL: {CACHE_TTL} сек)")
+    print(f"💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН (TTL: {CACHE_TTL} сек)")
     print(f"💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
     print(f"👥 Разрешённых пользователей: {len(ALLOWED_USERS_LIST)}")
     print("=" * 50)
