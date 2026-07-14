@@ -2,6 +2,7 @@ import logging
 import os
 import json
 import sys
+import asyncio  # ✅ ДОБАВЛЕНО!
 from datetime import datetime
 import aiohttp
 import requests
@@ -177,21 +178,66 @@ def search_apiserpent(query):
         print(f"❌ Ошибка APISerpent: {str(e)}")
         return []
 
-# --- НАСТРОЙКА HTTP СЕССИИ (УЛУЧШЕНИЕ) ---
+# --- НАСТРОЙКА HTTP СЕССИИ ---
 def create_http_session():
     """Создает настроенную HTTP сессию с таймаутами и поддержкой keep-alive"""
     connector = aiohttp.TCPConnector(
-        limit=100,  # Максимальное количество одновременных соединений
-        limit_per_host=30,  # Максимум на один хост
-        keepalive_timeout=30,  # Время жизни соединения
-        enable_cleanup_closed=True  # Очистка закрытых соединений
+        limit=100,
+        limit_per_host=30,
+        keepalive_timeout=30,
+        enable_cleanup_closed=True
     )
     timeout = aiohttp.ClientTimeout(
-        total=60,  # Общий таймаут (включая соединение и чтение)
-        connect=10,  # Таймаут на соединение
-        sock_read=30  # Таймаут на чтение данных
+        total=60,
+        connect=10,
+        sock_read=30
     )
     return connector, timeout
+
+# --- ФУНКЦИЯ ДЛЯ ЗАПРОСОВ К DEEPSEEK ---
+async def ask_deepseek(messages, model=MODEL_DEFAULT, max_retries=3):
+    """Отправляет запрос к DeepSeek API с повторными попытками"""
+    connector, timeout = create_http_session()
+    
+    for attempt in range(max_retries):
+        try:
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.post(
+                    f"{DEEPSEEK_API_BASE}/chat/completions",
+                    headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+                    json={"model": model, "messages": messages},
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data["choices"][0]["message"]["content"], None
+                    elif response.status == 429:
+                        wait_time = min(2 ** attempt, 30)
+                        print(f"⚠️ Превышен лимит запросов, ждем {wait_time} секунд...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    elif response.status == 401:
+                        return None, "❌ Ошибка авторизации API. Проверьте DEEPSEEK_API_KEY."
+                    elif response.status == 500:
+                        return None, "⚠️ Внутренняя ошибка сервера DeepSeek. Попробуйте позже."
+                    else:
+                        error_text = await response.text()
+                        return None, f"❌ Ошибка API ({response.status}): {error_text}"
+        except aiohttp.ClientConnectionError:
+            if attempt < max_retries - 1:
+                print(f"⚠️ Ошибка соединения, попытка {attempt + 1} из {max_retries}...")
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return None, "❌ Ошибка соединения с API DeepSeek. Проверьте интернет-соединение."
+        except asyncio.TimeoutError:
+            if attempt < max_retries - 1:
+                print(f"⚠️ Таймаут, попытка {attempt + 1} из {max_retries}...")
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return None, "❌ Превышен таймаут ожидания ответа от DeepSeek."
+        except Exception as e:
+            return None, f"❌ Неизвестная ошибка: {str(e)}"
+    
+    return None, "❌ Превышено количество попыток подключения к API."
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -286,52 +332,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             text=f"✅ Выбрана модель: **{MODEL_DEFAULT}** (Flash)\n\n⚡ Быстрая и экономичная!"
         )
-
-# --- ФУНКЦИЯ ДЛЯ ЗАПРОСОВ К DEEPSEEK (УЛУЧШЕННАЯ) ---
-async def ask_deepseek(messages, model=MODEL_DEFAULT, max_retries=3):
-    """Отправляет запрос к DeepSeek API с повторными попытками"""
-    connector, timeout = create_http_session()
-    
-    for attempt in range(max_retries):
-        try:
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.post(
-                    f"{DEEPSEEK_API_BASE}/chat/completions",
-                    headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-                    json={"model": model, "messages": messages},
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return data["choices"][0]["message"]["content"], None
-                    elif response.status == 429:
-                        # Too Many Requests - ждем и пробуем снова
-                        wait_time = min(2 ** attempt, 30)  # Экспоненциальная задержка
-                        print(f"⚠️ Превышен лимит запросов, ждем {wait_time} секунд...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    elif response.status == 401:
-                        return None, "❌ Ошибка авторизации API. Проверьте DEEPSEEK_API_KEY."
-                    elif response.status == 500:
-                        return None, "⚠️ Внутренняя ошибка сервера DeepSeek. Попробуйте позже."
-                    else:
-                        error_text = await response.text()
-                        return None, f"❌ Ошибка API ({response.status}): {error_text}"
-        except aiohttp.ClientConnectionError:
-            if attempt < max_retries - 1:
-                print(f"⚠️ Ошибка соединения, попытка {attempt + 1} из {max_retries}...")
-                await asyncio.sleep(2 ** attempt)
-                continue
-            return None, "❌ Ошибка соединения с API DeepSeek. Проверьте интернет-соединение."
-        except asyncio.TimeoutError:
-            if attempt < max_retries - 1:
-                print(f"⚠️ Таймаут, попытка {attempt + 1} из {max_retries}...")
-                await asyncio.sleep(2 ** attempt)
-                continue
-            return None, "❌ Превышен таймаут ожидания ответа от DeepSeek."
-        except Exception as e:
-            return None, f"❌ Неизвестная ошибка: {str(e)}"
-    
-    return None, "❌ Превышено количество попыток подключения к API."
 
 # --- ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
