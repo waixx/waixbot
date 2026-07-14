@@ -2,7 +2,8 @@ import logging
 import os
 import json
 import sys
-import asyncio  # ✅ ДОБАВЛЕНО!
+import asyncio
+import re
 from datetime import datetime
 import aiohttp
 import requests
@@ -18,10 +19,9 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
-# Загрузка переменных окружения
 load_dotenv()
 
-# --- КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---
+# --- КОНФИГ ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 APISERPENT_API_KEY = os.getenv("APISERPENT_API_KEY")
@@ -30,262 +30,269 @@ try:
     ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 except ValueError:
     ADMIN_USER_ID = 0
-    print("⚠️ ADMIN_USER_ID не является числом, установлено значение 0")
 
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "30"))
 KEEP_RECENT = int(os.getenv("KEEP_RECENT", "10"))
 MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-v4-flash")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 
-# Проверка обязательных переменных
-if not TELEGRAM_TOKEN:
-    print("❌ Ошибка: TELEGRAM_TOKEN не задан!")
+# --- ТЕКУЩАЯ ДАТА ---
+NOW = datetime.now()
+CURRENT_DATE = NOW.strftime("%d.%m.%Y")
+CURRENT_TIME = NOW.strftime("%H:%M")
+CURRENT_YEAR = NOW.year
+CURRENT_MONTH = NOW.month
+
+# --- ПРОВЕРКА ПЕРЕМЕННЫХ ---
+if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
+    print("❌ TELEGRAM_TOKEN или DEEPSEEK_API_KEY не заданы")
     sys.exit(1)
 
-if not DEEPSEEK_API_KEY:
-    print("❌ Ошибка: DEEPSEEK_API_KEY не задан!")
-    sys.exit(1)
-
-if not APISERPENT_API_KEY:
-    print("⚠️ ВНИМАНИЕ: APISERPENT_API_KEY не задан! Поиск работать не будет.")
-
-if ADMIN_USER_ID == 0:
-    print("⚠️ ВНИМАНИЕ: ADMIN_USER_ID не задан! Бот доступен всем.")
-
-# Вывод конфигурации
-print("\n" + "="*50)
-print("🚀 КОНФИГУРАЦИЯ БОТА:")
-print("="*50)
+print("\n" + "=" * 50)
+print("🚀 БОТ ЗАПУЩЕН")
+print("=" * 50)
 print(f"  🤖 TELEGRAM_TOKEN: {'✅' if TELEGRAM_TOKEN else '❌'}")
 print(f"  🔑 DEEPSEEK_API_KEY: {'✅' if DEEPSEEK_API_KEY else '❌'}")
 print(f"  🔍 APISERPENT_API_KEY: {'✅' if APISERPENT_API_KEY else '❌'}")
 print(f"  👤 ADMIN_USER_ID: {ADMIN_USER_ID}")
-print(f"  📦 Модель: {MODEL_DEFAULT}")
-print(f"  💾 MAX_HISTORY: {MAX_HISTORY}")
-print(f"  📌 KEEP_RECENT: {KEEP_RECENT}")
-print(f"  🔗 API Base: {DEEPSEEK_API_BASE}")
-print("="*50 + "\n")
+print(f"  📅 Текущая дата: {CURRENT_DATE} {CURRENT_TIME}")
+print("=" * 50 + "\n")
 
-# --- НАСТРОЙКА ПАМЯТИ ---
+# --- ПАМЯТЬ ---
 os.makedirs("data", exist_ok=True)
 MEMORY_FILE = "data/memory.json"
 
 def compress_history(history):
-    """Компрессирует историю диалога, если она превышает MAX_HISTORY"""
     if len(history) <= MAX_HISTORY:
         return history
-    
     recent = history[-KEEP_RECENT:]
-    old_messages = history[:-KEEP_RECENT]
-    
-    summary_parts = []
-    for msg in old_messages:
+    old = history[:-KEEP_RECENT]
+    summary = []
+    for msg in old:
         role = msg.get("role", "")
         content = msg.get("content", "")
         if role == "user":
-            summary_parts.append(f"Пользователь: {content[:150]}")
+            summary.append(f"Пользователь: {content[:150]}")
         elif role == "assistant":
-            summary_parts.append(f"Ассистент: {content[:150]}")
-    
-    if summary_parts:
-        compressed_summary = {
-            "role": "system",
-            "content": "Краткая выжимка предыдущего диалога:\n" + "\n".join(summary_parts[-5:])
-        }
-        return [compressed_summary] + recent
-    
+            summary.append(f"Ассистент: {content[:150]}")
+    if summary:
+        return [{"role": "system", "content": "Краткая выжимка диалога:\n" + "\n".join(summary[-5:])}] + recent
     return recent
 
 def load_memory(user_id):
-    """Загружает историю диалога пользователя"""
     try:
         if os.path.exists(MEMORY_FILE):
             with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                history = data.get(str(user_id), [])
-                compressed = compress_history(history)
-                print(f"📂 Загружено {len(compressed)} сообщений для пользователя {user_id}")
-                return compressed
+                return compress_history(data.get(str(user_id), []))
     except Exception as e:
         print(f"⚠️ Ошибка загрузки памяти: {e}")
     return []
 
 def save_memory(user_id, history):
-    """Сохраняет историю диалога пользователя"""
     try:
         data = {}
         if os.path.exists(MEMORY_FILE):
             with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-        
-        compressed_history = compress_history(history)
-        data[str(user_id)] = compressed_history
-        
+        data[str(user_id)] = compress_history(history)
         with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        print(f"✅ Память сохранена для пользователя {user_id}, сообщений: {len(compressed_history)}")
+        print(f"✅ Память сохранена ({len(history)} сообщений)")
     except Exception as e:
         print(f"❌ Ошибка сохранения памяти: {e}")
 
-# --- ПОИСК ЧЕРЕЗ APISERPENT ---
+# --- ПОИСК В ИНТЕРНЕТЕ ---
 def search_apiserpent(query):
-    """Выполняет поиск через APISerpent API"""
     if not APISERPENT_API_KEY:
-        print("❌ APISERPENT_API_KEY не задан!")
         return []
-    
-    url = "https://apiserpent.com/api/search"
-    params = {"q": query, "engine": "google", "num": 5}
-    headers = {"X-API-Key": APISERPENT_API_KEY}
-    
     try:
-        print(f"🔍 APISerpent запрос: {query}")
-        response = requests.get(url, params=params, headers=headers, timeout=15)
-        print(f"📊 APISerpent статус: {response.status_code}")
-        
-        if response.status_code == 200:
-            data = response.json()
-            results = []
-            
-            # Парсим результаты в зависимости от формата ответа
-            if "results" in data and isinstance(data["results"], dict):
-                if "organic" in data["results"]:
-                    results = data["results"]["organic"]
-            elif "organic_results" in data:
-                results = data["organic_results"]
-            elif isinstance(data.get("results"), list):
-                results = data["results"]
-            
-            formatted_results = []
-            for res in results[:5]:
-                if isinstance(res, dict):
-                    formatted_results.append({
-                        "title": str(res.get("title", "Без названия"))[:200],
-                        "snippet": str(res.get("snippet", res.get("description", "Нет описания")))[:300],
-                        "link": str(res.get("url", res.get("link", "#")))[:200]
-                    })
-            
-            if formatted_results:
-                print(f"✅ Найдено {len(formatted_results)} результатов")
-                return formatted_results
-            print("⚠️ Результатов нет")
+        response = requests.get(
+            "https://apiserpent.com/api/search",
+            params={"q": query, "engine": "google", "num": 5},
+            headers={"X-API-Key": APISERPENT_API_KEY},
+            timeout=15
+        )
+        if response.status_code != 200:
             return []
-        else:
-            print(f"❌ Ошибка APISerpent: {response.status_code}")
-            return []
+        data = response.json()
+        results = []
+        if "results" in data and isinstance(data["results"], dict):
+            results = data["results"].get("organic", [])
+        elif "organic_results" in data:
+            results = data["organic_results"]
+        elif isinstance(data.get("results"), list):
+            results = data["results"]
+        formatted = []
+        for r in results[:5]:
+            if isinstance(r, dict):
+                formatted.append({
+                    "title": str(r.get("title", "Без названия"))[:200],
+                    "snippet": str(r.get("snippet", r.get("description", "Нет описания")))[:300],
+                    "link": str(r.get("url", r.get("link", "#")))[:200]
+                })
+        return formatted
     except Exception as e:
-        print(f"❌ Ошибка APISerpent: {str(e)}")
+        print(f"❌ Ошибка поиска: {e}")
         return []
 
-# --- НАСТРОЙКА HTTP СЕССИИ ---
-def create_http_session():
-    """Создает настроенную HTTP сессию с таймаутами и поддержкой keep-alive"""
-    connector = aiohttp.TCPConnector(
+# --- АНАЛИЗ: МОЖЕТ ЛИ ОТВЕТ УСТАРЕТЬ ---
+def is_time_sensitive(query):
+    """
+    Определяет, может ли информация по запросу устареть.
+    Если ДА — бот пойдёт в интернет.
+    """
+    q = query.lower()
+
+    # Статичные темы (НЕ устаревают)
+    static_patterns = [
+        r'\bматематик\b', r'\bуравнени[ея]\b', r'\bформул[аы]\b',
+        r'\bфизик\b', r'\bхими\w*\b', r'\bгравитаци\w*\b',
+        r'\bзакон\b', r'\bтеорем\w*\b',
+        r'\bклассик\w*\b', r'\bантичн\w*\b', r'\bдревн\w*\b',
+        r'\bисторическ\w*\b', r'\bсредневеков\w*\b',
+        r'\bкто такой\b', r'\bкто такая\b',
+        r'\bбиографи\w*\b', r'\bродилс\w*\b', r'\bумер\w*\b',
+        r'\bпроизведени\w*\b', r'\bкниг\w*\b', r'\bроман\b',
+        r'\bстих\w*\b', r'\bпоэм\w*\b',
+        r'\bперевод\w*\b', r'\bсмысл\b', r'\bопределени\w*\b',
+        r'\bчто такое\b', r'\bчто значит\b',
+        r'\bкак работает\b', r'\bпринцип\b',
+    ]
+    for pattern in static_patterns:
+        if re.search(pattern, q):
+            return False
+
+    # Темы, которые МОГУТ устареть
+    dynamic_keywords = [
+        'погод', 'температур', 'дожд', 'снег', 'ветер', 'градус',
+        'врем', 'час', 'минут', 'дата', 'сегодня', 'завтра', 'вчера', 'сейчас',
+        'новост', 'событи', 'происшеств', 'авар', 'выбор', 'кризис', 'войн',
+        'курс', 'доллар', 'евро', 'юань', 'биткоин', 'криптовалют',
+        'матч', 'счет', 'побед', 'спорт', 'футбол', 'хоккей', 'баскетбол',
+        'акции', 'биржа', 'котировки', 'индекс',
+        'президент', 'правительств', 'реформа', 'закон',
+        'релиз', 'обновлени', 'анонс', 'презентаци',
+        'концерт', 'премьер', 'фестиваль',
+        'завтра', 'на этой неделе', 'в следующем',
+        'сегодня вечером', 'завтра утром',
+    ]
+    for kw in dynamic_keywords:
+        if kw in q:
+            return True
+
+    # Годы
+    years = re.findall(r'\b(19[0-9]{2}|20[0-9]{2})\b', q)
+    for y in years:
+        if int(y) >= CURRENT_YEAR - 1:
+            return True
+
+    # Дни недели
+    weekdays = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье']
+    today = NOW.strftime('%A').lower()
+    ru_weekdays = {
+        'monday': 'понедельник', 'tuesday': 'вторник', 'wednesday': 'среда',
+        'thursday': 'четверг', 'friday': 'пятница', 'saturday': 'суббота', 'sunday': 'воскресенье'
+    }
+    today_ru = ru_weekdays.get(today, today)
+    for day in weekdays:
+        if day in q and day != today_ru:
+            return True
+
+    # Если вопрос начинается с "когда", "во сколько" — скорее всего актуально
+    if re.search(r'\bкогда\b|\bво сколько\b', q):
+        return True
+
+    return False
+
+# --- HTTP СЕССИЯ ---
+def create_session():
+    return aiohttp.TCPConnector(
         limit=100,
         limit_per_host=30,
         keepalive_timeout=30,
         enable_cleanup_closed=True
-    )
-    timeout = aiohttp.ClientTimeout(
-        total=60,
-        connect=10,
-        sock_read=30
-    )
-    return connector, timeout
+    ), aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
 
-# --- ФУНКЦИЯ ДЛЯ ЗАПРОСОВ К DEEPSEEK ---
-async def ask_deepseek(messages, model=MODEL_DEFAULT, max_retries=3):
-    """Отправляет запрос к DeepSeek API с повторными попытками"""
-    connector, timeout = create_http_session()
-    
-    for attempt in range(max_retries):
+async def ask_deepseek(messages, retries=3):
+    connector, timeout = create_session()
+    for attempt in range(retries):
         try:
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 async with session.post(
                     f"{DEEPSEEK_API_BASE}/chat/completions",
                     headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-                    json={"model": model, "messages": messages},
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
+                    json={"model": MODEL_DEFAULT, "messages": messages},
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
                         return data["choices"][0]["message"]["content"], None
-                    elif response.status == 429:
-                        wait_time = min(2 ** attempt, 30)
-                        print(f"⚠️ Превышен лимит запросов, ждем {wait_time} секунд...")
-                        await asyncio.sleep(wait_time)
+                    if resp.status == 429:
+                        await asyncio.sleep(min(2 ** attempt, 30))
                         continue
-                    elif response.status == 401:
+                    if resp.status == 401:
                         return None, "❌ Ошибка авторизации API. Проверьте DEEPSEEK_API_KEY."
-                    elif response.status == 500:
+                    if resp.status == 500:
                         return None, "⚠️ Внутренняя ошибка сервера DeepSeek. Попробуйте позже."
-                    else:
-                        error_text = await response.text()
-                        return None, f"❌ Ошибка API ({response.status}): {error_text}"
-        except aiohttp.ClientConnectionError:
-            if attempt < max_retries - 1:
-                print(f"⚠️ Ошибка соединения, попытка {attempt + 1} из {max_retries}...")
+                    return None, f"❌ Ошибка API ({resp.status}): {await resp.text()}"
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+            if attempt < retries - 1:
                 await asyncio.sleep(2 ** attempt)
                 continue
-            return None, "❌ Ошибка соединения с API DeepSeek. Проверьте интернет-соединение."
-        except asyncio.TimeoutError:
-            if attempt < max_retries - 1:
-                print(f"⚠️ Таймаут, попытка {attempt + 1} из {max_retries}...")
-                await asyncio.sleep(2 ** attempt)
-                continue
-            return None, "❌ Превышен таймаут ожидания ответа от DeepSeek."
+            return None, "❌ Ошибка соединения с API DeepSeek."
         except Exception as e:
             return None, f"❌ Неизвестная ошибка: {str(e)}"
-    
-    return None, "❌ Превышено количество попыток подключения к API."
+    return None, "❌ Превышено количество попыток."
 
-# --- ОБРАБОТЧИКИ КОМАНД ---
+# --- КОМАНДЫ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
     user_id = update.effective_user.id
-    
     if user_id != ADMIN_USER_ID and ADMIN_USER_ID != 0:
-        await update.message.reply_text("❌ Доступ запрещён. Бот предназначен только для владельца.")
+        await update.message.reply_text("❌ Доступ запрещён.")
         return
-    
     await update.message.reply_text(
-        "🤖 Привет! Я бот на DeepSeek-V4 Flash.\n\n"
-        "🔍 **Напиши 'бро ' и пробел, чтобы я поискал в интернете!**\n"
+        f"🤖 Привет! Я бот на DeepSeek-V4 Flash.\n\n"
+        f"📅 Сегодня: {CURRENT_DATE} {CURRENT_TIME}\n\n"
+        "🧠 **Я проверяю актуальность своих знаний:**\n"
+        "• Если вопрос статичный (математика, факты, классика) — отвечаю сразу.\n"
+        "• Если информация может быть устаревшей — ищу в интернете.\n\n"
+        "🌐 Когда ищу — пишу: «Актуализирую информацию в интернете...»\n"
+        "✅ Затем даю проверенный ответ.\n\n"
         "📋 Команды:\n"
-        "  /model - показать текущую модель\n"
-        "  /clear - очистить историю диалога\n"
-        "  /stats - показать статистику памяти\n\n"
-        "🧠 **Я запоминаю всё**, что мы обсуждаем!\n"
-        "💡 Пример: бро погода в Москве\n\n"
-        "⚡ Модель Flash — быстрая и экономичная!"
+        "  /model — модель\n"
+        "  /clear — очистить историю\n"
+        "  /stats — статистика\n"
+        "  /date — показать дату\n\n"
+        "💡 Просто задавай вопросы!"
+    )
+
+async def date_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID and ADMIN_USER_ID != 0:
+        await update.message.reply_text("❌ Доступ запрещён.")
+        return
+    await update.message.reply_text(
+        f"📅 Текущая дата и время:\n\n"
+        f"📆 {NOW.strftime('%d.%m.%Y')}\n"
+        f"🕐 {NOW.strftime('%H:%M:%S')}\n"
+        f"📅 {NOW.strftime('%A')}\n"
+        f"📅 {NOW.strftime('%B')} {NOW.year}"
     )
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /model"""
-    user_id = update.effective_user.id
-    
-    if user_id != ADMIN_USER_ID and ADMIN_USER_ID != 0:
+    if update.effective_user.id != ADMIN_USER_ID and ADMIN_USER_ID != 0:
         await update.message.reply_text("❌ Доступ запрещён.")
         return
-    
-    keyboard = [[InlineKeyboardButton("⚡ Flash (экономичная)", callback_data=MODEL_DEFAULT)]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
+    keyboard = [[InlineKeyboardButton("⚡ Flash", callback_data=MODEL_DEFAULT)]]
     await update.message.reply_text(
-        f"✅ Используется модель: **{MODEL_DEFAULT}**\n\n"
-        "⚡ Flash — быстрая, дешёвая и подходит для большинства задач.\n"
-        "💰 Экономия: $0.14 за 1M входных токенов.",
-        reply_markup=reply_markup
+        f"✅ Модель: **{MODEL_DEFAULT}**",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Очищает историю диалога пользователя"""
     user_id = update.effective_user.id
-    
     if user_id != ADMIN_USER_ID and ADMIN_USER_ID != 0:
         await update.message.reply_text("❌ Доступ запрещён.")
         return
-    
     if os.path.exists(MEMORY_FILE):
         with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -293,182 +300,153 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del data[str(user_id)]
             with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            await update.message.reply_text("🧹 История очищена! Я буду помнить только новые сообщения.")
+            await update.message.reply_text("🧹 История очищена.")
         else:
-            await update.message.reply_text("📭 История и так пуста.")
+            await update.message.reply_text("📭 История пуста.")
     else:
-        await update.message.reply_text("📭 История и так пуста.")
+        await update.message.reply_text("📭 История пуста.")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает статистику памяти"""
     user_id = update.effective_user.id
-    
     if user_id != ADMIN_USER_ID and ADMIN_USER_ID != 0:
         await update.message.reply_text("❌ Доступ запрещён.")
         return
-    
     history = load_memory(user_id)
     await update.message.reply_text(
-        f"📊 Статистика памяти:\n\n"
-        f"📝 Всего сообщений в истории: {len(history)}\n"
-        f"💾 Максимум: {MAX_HISTORY} сообщений\n"
-        f"📌 Сохраняется последних: {KEEP_RECENT} сообщений\n"
-        f"📁 Файл памяти: {MEMORY_FILE}"
+        f"📊 Статистика:\n"
+        f"📝 Сообщений: {len(history)}\n"
+        f"💾 Максимум: {MAX_HISTORY}\n"
+        f"📌 Сохраняется: {KEEP_RECENT}\n"
+        f"📅 Текущая дата: {CURRENT_DATE}"
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатий на кнопки"""
     query = update.callback_query
     await query.answer()
-    
-    user_id = update.effective_user.id
-    if user_id != ADMIN_USER_ID and ADMIN_USER_ID != 0:
-        await query.edit_message_text("❌ Доступ запрещён.")
-        return
-    
-    data = query.data
-    if data == MODEL_DEFAULT:
-        context.user_data['model'] = MODEL_DEFAULT
-        await query.edit_message_text(
-            text=f"✅ Выбрана модель: **{MODEL_DEFAULT}** (Flash)\n\n⚡ Быстрая и экономичная!"
-        )
+    if query.data == MODEL_DEFAULT:
+        await query.edit_message_text(f"✅ Модель: **{MODEL_DEFAULT}**")
 
-# --- ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ---
+# --- ОСНОВНОЙ ОБРАБОТЧИК ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает все текстовые сообщения"""
     user_id = update.effective_user.id
-    
-    # Проверка доступа
     if user_id != ADMIN_USER_ID and ADMIN_USER_ID != 0:
-        await update.message.reply_text("❌ Доступ запрещён. Бот предназначен только для владельца.")
+        await update.message.reply_text("❌ Доступ запрещён.")
         return
-    
+
     user_message = update.message.text
     await update.message.chat.send_action(action=ChatAction.TYPING)
-    
-    # Загружаем историю
+
     history = load_memory(user_id)
-    model = MODEL_DEFAULT
-    
-    # --- ОБРАБОТКА ПОИСКОВОГО ЗАПРОСА (команда "бро") ---
+
+    # Определяем, нужно ли искать в интернете
+    need_search = is_time_sensitive(user_message)
+
+    # Если пользователь явно написал "бро" — принудительный поиск
     if user_message.lower().startswith("бро "):
-        search_query = user_message[4:].strip()
-        if not search_query:
-            await update.message.reply_text("❌ Напиши что искать после 'бро '.\nПример: бро погода в Москве")
+        need_search = True
+        user_message = user_message[4:].strip()
+        if not user_message:
+            await update.message.reply_text("❌ Напиши, что искать после 'бро'.")
             return
-        
-        print(f"🔍 Поиск по запросу: {search_query}")
-        results = search_apiserpent(search_query)
-        
+
+    # --- ЕСЛИ НУЖЕН ПОИСК В ИНТЕРНЕТЕ ---
+    if need_search and user_message:
+        # Первое сообщение — уведомление о поиске
+        status_msg = await update.message.reply_text("🌐 Актуализирую информацию в интернете...")
+
+        results = search_apiserpent(user_message)
+
         if not results:
-            await update.message.reply_text("❌ По вашему запросу ничего не найдено. Попробуйте переформулировать запрос.")
+            await status_msg.edit_text("⚠️ Не удалось найти актуальную информацию. Отвечаю из базы знаний.")
+            # Отвечаем из базы, но с учётом даты
+            system = {"role": "system", "content": f"Сегодня: {CURRENT_DATE} {CURRENT_TIME}. Отвечай на русском языке."}
+            history.append({"role": "user", "content": user_message})
+            answer, error = await ask_deepseek([system] + history)
+            if error:
+                await update.message.reply_text(error)
+                return
+            history.append({"role": "assistant", "content": answer})
+            save_memory(user_id, history)
+            await update.message.reply_text(answer)
             return
-        
-        # Формируем результаты поиска с текущей датой
-        current_datetime = datetime.now()
-        current_date = current_datetime.strftime("%d.%m.%Y")
-        current_time = current_datetime.strftime("%H:%M")
-        
-        search_results_text = f"📅 Сегодня: {current_date}, текущее время: {current_time}\n\n"
-        search_results_text += f"🔍 Результаты поиска по запросу: '{search_query}'\n\n"
-        
-        for i, res in enumerate(results[:5], 1):
-            search_results_text += f"{i}. **{res.get('title')}**\n"
-            search_results_text += f"   {res.get('snippet')}\n"
-            search_results_text += f"   🔗 {res.get('link')}\n\n"
-        
-        # Создаем системный промпт с четкой инструкцией использовать результаты поиска
+
+        # Формируем ответ на основе поиска
+        search_text = f"📅 Сегодня: {CURRENT_DATE} {CURRENT_TIME}\n\n"
+        search_text += f"🔍 Результаты по запросу: '{user_message}'\n\n"
+        for i, r in enumerate(results[:5], 1):
+            search_text += f"{i}. **{r['title']}**\n   {r['snippet']}\n   🔗 {r['link']}\n\n"
+
         system_prompt = {
             "role": "system",
-            "content": f"""Ты — полезный ассистент с доступом к интернет-поиску. Сегодня: {current_date}, время: {current_time}.
+            "content": f"""Ты — полезный ассистент. Сегодня: {CURRENT_DATE} {CURRENT_TIME}.
 
-Пользователь попросил найти информацию: "{search_query}"
+Пользователь спросил: "{user_message}"
 
-Вот РЕАЛЬНЫЕ результаты поиска из интернета (используй ТОЛЬКО их для ответа):
-{search_results_text}
+Я проверил актуальность в интернете и нашёл свежие данные:
+{search_text}
 
-ВАЖНЫЕ ПРАВИЛА:
-1. Используй ТОЛЬКО информацию из результатов поиска выше
-2. НЕ выдумывай и НЕ добавляй информацию от себя
-3. Если пользователь спросил время, дату, погоду, новости — ответь на основе найденных данных
-4. Всегда указывай источники (ссылки) в конце ответа
-5. Отвечай на русском языке, кратко и информативно
+ПРАВИЛА:
+1. Отвечай ТОЛЬКО на основе найденных данных.
+2. Если информация совпадает с твоими знаниями — подтверди.
+3. Если данные обновились — дай новую информацию.
+4. Всегда указывай источники (ссылки).
+5. Отвечай на русском языке.
 
-Твой ответ должен быть основан ИСКЛЮЧИТЕЛЬНО на предоставленных результатах поиска."""
+Твой ответ должен быть проверенным и актуальным на {CURRENT_DATE}."""
         }
-        
-        # Добавляем сообщение пользователя в историю
+
         history.append({"role": "user", "content": user_message})
-        
-        # Подготавливаем сообщения для API (используем всю историю)
-        messages_for_api = [system_prompt] + history
-        
-        # Отправляем запрос к DeepSeek с улучшенной обработкой
-        answer, error = await ask_deepseek(messages_for_api, model)
-        
+        messages = [system_prompt] + history
+
+        answer, error = await ask_deepseek(messages)
+        await status_msg.delete()  # Удаляем сообщение о поиске
+
         if error:
             await update.message.reply_text(error)
             return
-        
-        # Сохраняем ответ в историю
+
         history.append({"role": "assistant", "content": answer})
         save_memory(user_id, history)
-        
         await update.message.reply_text(answer)
         return
-    
-    # --- ОБЫЧНЫЙ ДИАЛОГ (без поиска) ---
-    # Добавляем сообщение пользователя в историю
+
+    # --- ОБЫЧНЫЙ ОТВЕТ (БЕЗ ПОИСКА) ---
+    system = {"role": "system", "content": f"Сегодня: {CURRENT_DATE} {CURRENT_TIME}. Отвечай на русском языке."}
     history.append({"role": "user", "content": user_message})
-    
-    # Отправляем запрос к DeepSeek с улучшенной обработкой
-    answer, error = await ask_deepseek(history, model)
-    
+    answer, error = await ask_deepseek([system] + history)
+
     if error:
         await update.message.reply_text(error)
         return
-    
-    # Сохраняем ответ в историю
+
     history.append({"role": "assistant", "content": answer})
     save_memory(user_id, history)
-    
     await update.message.reply_text(answer)
 
-# --- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ---
+# --- ОБРАБОТЧИК ОШИБОК ---
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает все ошибки"""
     try:
         raise context.error
     except Exception as e:
-        print(f"⚠️ Глобальная ошибка: {e}")
+        print(f"⚠️ Ошибка: {e}")
         import traceback
         traceback.print_exc()
         if update and update.effective_message:
-            await update.effective_message.reply_text(
-                "⚠️ Произошла ошибка. Пожалуйста, попробуйте позже."
-            )
+            await update.effective_message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
 
-# --- ЗАПУСК БОТА ---
+# --- ЗАПУСК ---
 if __name__ == "__main__":
-    # Настройка логирования
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Создаем приложение
+    logging.basicConfig(level=logging.INFO)
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    
-    # Регистрируем обработчики
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("date", date_command))
     app.add_handler(CommandHandler("model", model_command))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    
-    print("✅ Бот запущен и готов к работе!")
-    
-    # Запускаем бота
+
+    print(f"✅ Бот запущен. Текущая дата: {CURRENT_DATE}")
     app.run_polling()
