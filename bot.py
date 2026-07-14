@@ -47,7 +47,7 @@ if ADMIN_USER_ID != 0 and ADMIN_USER_ID not in ALLOWED_USERS_LIST:
     ALLOWED_USERS_LIST.append(ADMIN_USER_ID)
 
 # ============================================================
-# 2. ПИРАМИДАЛЬНАЯ ПАМЯТЬ
+# 2. ПИРАМИДАЛЬНАЯ ПАМЯТЬ (НАСТРОЙКИ)
 # ============================================================
 
 LEVEL_1 = {'max_history': 80, 'keep_recent': 20, 'compress_to': 20}
@@ -56,29 +56,27 @@ LEVEL_3 = {'max_items': 10000, 'compress_interval': 200, 'compress_to': 100}
 LEVEL_4 = {'max_items': 100000, 'compress_interval': 1000, 'compress_to': 200}
 LEVEL_5 = {'max_items': 1000000, 'compress_interval': 10000, 'compress_to': 500}
 
-DEFAULT_TTL = {
-    'critical': 60,
-    'instructional': 720,
-    'important': 720,
-    'static': 1440,
-    'personal': 999999,
-    'default': 1440
-}
+# Ограничения кэша
+MAX_CACHE_ITEMS = int(os.getenv("MAX_CACHE_ITEMS", "100"))
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "60"))
 
+# Модель и API
 MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-v4-flash")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 
+# Текущая дата
 NOW = datetime.now()
 CURRENT_DATE = NOW.strftime("%d.%m.%Y")
 CURRENT_TIME = NOW.strftime("%H:%M")
 CURRENT_YEAR = NOW.year
 
+# Проверка обязательных переменных
 if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     print("❌ TELEGRAM_TOKEN или DEEPSEEK_API_KEY не заданы")
     sys.exit(1)
 
 print("\n" + "=" * 50)
-print("🚀 БОТ ЗАПУЩЕН (ФИНАЛЬНАЯ ВЕРСИЯ)")
+print("🚀 БОТ ЗАПУЩЕН (МАКСИМАЛЬНАЯ ЗАЩИТА + УМНЫЕ ОШИБКИ)")
 print("=" * 50)
 print(f"  🤖 TELEGRAM_TOKEN: {'✅' if TELEGRAM_TOKEN else '❌'}")
 print(f"  🔑 DEEPSEEK_API_KEY: {'✅' if DEEPSEEK_API_KEY else '❌'}")
@@ -86,8 +84,9 @@ print(f"  🔍 APISERPENT_API_KEY: {'✅' if APISERPENT_API_KEY else '❌'}")
 print(f"  👤 ADMIN_USER_ID: {ADMIN_USER_ID}")
 print(f"  👥 Разрешённых пользователей: {len(ALLOWED_USERS_LIST)}")
 print(f"  📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
-print(f"  💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН")
+print(f"  💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН (TTL: {CACHE_TTL} сек, макс. {MAX_CACHE_ITEMS} записей)")
 print(f"  💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
+print(f"  🛡️ Умная обработка ошибок: ВКЛЮЧЕНА")
 print("=" * 50 + "\n")
 
 # ============================================================
@@ -101,61 +100,137 @@ MEMORY_FILE = "data/memory.json"
 PROFILE_FILE = "data/user_profile.json"
 BACKUP_DIR = "data/backups"
 CACHE_FILE = "data/profile_cache.json"
+COUNTER_FILE = "data/counter.json"
 
-PROFILE_CACHE = {}  # RAM-кэш
-CACHE_TTL = 60
-MESSAGE_COUNTER = {}
+PROFILE_CACHE = {}
 
 # ============================================================
-# 4. ГИБРИДНЫЙ КЭШ (RAM + ФАЙЛ)
+# 4. АНАЛИЗАТОР ОШИБОК (ДЛЯ ПОЛЬЗОВАТЕЛЯ, 0 ТОКЕНОВ)
+# ============================================================
+
+def analyze_error(error_text):
+    """
+    Анализирует текст ошибки и возвращает понятное описание для пользователя.
+    """
+    error_lower = error_text.lower()
+    
+    if "timeout" in error_lower or "timed out" in error_lower:
+        return "⏰ Превышено время ожидания ответа от сервера. Попробуйте позже."
+    if "connection" in error_lower or "network" in error_lower:
+        return "🌐 Проблемы с интернет-соединением. Проверьте связь."
+    if "429" in error_text or "too many requests" in error_lower:
+        return "📊 Слишком много запросов. Подождите минуту и повторите."
+    if "401" in error_text or "unauthorized" in error_lower:
+        return "🔑 Ошибка авторизации API. Проверьте ключи доступа."
+    if "500" in error_text or "internal server" in error_lower:
+        return "⚠️ Внутренняя ошибка сервера. Проблема на стороне API, повторите позже."
+    if "not found" in error_lower or "404" in error_text:
+        return "🔍 Ресурс не найден. Возможно, изменился адрес API."
+    if "message is too long" in error_lower:
+        return "📝 Сообщение слишком длинное. Я разбиваю его на части."
+    if "empty" in error_lower or "invalid_response" in error_lower:
+        return "📭 Получен пустой или некорректный ответ от сервера. Попробуйте переформулировать вопрос."
+    if "max_retries" in error_lower:
+        return "⚠️ Не удалось получить ответ после нескольких попыток. Проверьте соединение."
+    if "bad request" in error_lower:
+        return "⚠️ Некорректный запрос. Проверьте правильность ввода."
+    else:
+        return f"⚠️ Неизвестная ошибка: {error_text[:150]}..."
+
+# ============================================================
+# 5. АТОМАРНАЯ ЗАПИСЬ В ФАЙЛ
+# ============================================================
+
+def atomic_write(filename, data, as_json=True):
+    temp_file = filename + ".tmp"
+    try:
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            if as_json:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            else:
+                f.write(data)
+        os.replace(temp_file, filename)
+        return True
+    except Exception as e:
+        print(f"⚠️ Ошибка атомарной записи {filename}: {e}")
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+        return False
+
+def atomic_read(filename, default=None, as_json=True):
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            if as_json:
+                return json.load(f)
+            else:
+                return f.read()
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
+        print(f"⚠️ Ошибка чтения {filename}: {e}")
+        restored = restore_from_backup(filename)
+        if restored is not None:
+            return restored
+        return default
+
+def restore_from_backup(filename):
+    try:
+        if "profile" in filename:
+            data_type = "profile"
+        elif "memory" in filename:
+            data_type = "memory"
+        else:
+            return None
+        backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith(data_type + "_")])
+        if not backups:
+            return None
+        latest = backups[-1]
+        with open(os.path.join(BACKUP_DIR, latest), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        print(f"🔄 Восстановлен {filename} из бэкапа {latest}")
+        atomic_write(filename, data)
+        return data
+    except Exception as e:
+        print(f"❌ Ошибка восстановления {filename}: {e}")
+        return None
+
+# ============================================================
+# 6. ГИБРИДНЫЙ КЭШ (RAM + ФАЙЛ)
 # ============================================================
 
 def load_cache_from_file():
-    """Загружает кэш из файла в RAM"""
     global PROFILE_CACHE
-    try:
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                for user_id, (profile, timestamp_str) in data.items():
-                    PROFILE_CACHE[user_id] = (profile, datetime.fromisoformat(timestamp_str))
-                print(f"💾 Загружено {len(PROFILE_CACHE)} записей кэша из файла")
-                return True
-    except Exception as e:
-        print(f"⚠️ Ошибка загрузки кэша: {e}")
+    data = atomic_read(CACHE_FILE, default={})
+    if data:
+        try:
+            for user_id, (profile, timestamp_str) in data.items():
+                PROFILE_CACHE[user_id] = (profile, datetime.fromisoformat(timestamp_str))
+            print(f"💾 Загружено {len(PROFILE_CACHE)} записей кэша из файла")
+            return True
+        except Exception as e:
+            print(f"⚠️ Ошибка загрузки кэша: {e}")
     return False
 
 def save_cache_to_file():
-    """Сохраняет RAM-кэш в файл"""
     global PROFILE_CACHE
     try:
+        if len(PROFILE_CACHE) > MAX_CACHE_ITEMS:
+            sorted_items = sorted(PROFILE_CACHE.items(), key=lambda x: x[1][1])
+            for user_id, _ in sorted_items[:len(PROFILE_CACHE) - MAX_CACHE_ITEMS]:
+                del PROFILE_CACHE[user_id]
+            print(f"🧹 Кэш ограничен до {MAX_CACHE_ITEMS} записей")
+        
         serializable = {}
         for user_id, (profile, timestamp) in PROFILE_CACHE.items():
             serializable[user_id] = (profile, timestamp.isoformat())
-        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(serializable, f, ensure_ascii=False, indent=2)
+        atomic_write(CACHE_FILE, serializable)
         return True
     except Exception as e:
         print(f"⚠️ Ошибка сохранения кэша: {e}")
         return False
 
-def clean_old_cache(max_age_hours=24):
-    """Удаляет записи старше max_age_hours из кэша"""
-    global PROFILE_CACHE
-    now = datetime.now()
-    to_remove = []
-    for user_id, (_, timestamp) in PROFILE_CACHE.items():
-        if (now - timestamp).seconds > max_age_hours * 3600:
-            to_remove.append(user_id)
-    for user_id in to_remove:
-        del PROFILE_CACHE[user_id]
-    if to_remove:
-        save_cache_to_file()
-        print(f"🧹 Очищено {len(to_remove)} старых записей кэша")
-    return PROFILE_CACHE
-
 def get_profile_cached(user_id):
-    """Загружает профиль из RAM-кэша (с авто-восстановлением из файла)"""
     global PROFILE_CACHE
     now = datetime.now()
     
@@ -174,7 +249,6 @@ def get_profile_cached(user_id):
     return profile.copy() if profile else {}
 
 def invalidate_cache(user_id):
-    """Очищает кэш для пользователя (RAM + файл)"""
     global PROFILE_CACHE
     if user_id in PROFILE_CACHE:
         del PROFILE_CACHE[user_id]
@@ -186,43 +260,39 @@ def is_allowed(user_id):
     return user_id in ALLOWED_USERS_LIST
 
 # ============================================================
-# 5. ЗАГРУЗКА/СОХРАНЕНИЕ ПРОФИЛЯ
+# 7. ЗАГРУЗКА/СОХРАНЕНИЕ ПРОФИЛЯ
 # ============================================================
 
 def load_profile(user_id):
-    try:
-        if os.path.exists(PROFILE_FILE):
-            with open(PROFILE_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return data.get(str(user_id), {})
-    except Exception as e:
-        print(f"⚠️ Ошибка загрузки профиля: {e}")
-    return {}
+    data = atomic_read(PROFILE_FILE, default={})
+    return data.get(str(user_id), {})
 
 def save_profile(user_id, profile, backup=True):
-    try:
-        data = {}
-        if os.path.exists(PROFILE_FILE):
-            with open(PROFILE_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        
-        profile["updated"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        data[str(user_id)] = profile
-        
-        with open(PROFILE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        if backup:
-            create_backup(user_id, "profile")
-        
-        invalidate_cache(user_id)
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка сохранения профиля: {e}")
+    data = atomic_read(PROFILE_FILE, default={})
+    profile["updated"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    data[str(user_id)] = profile
+    if not atomic_write(PROFILE_FILE, data):
         return False
+    if backup:
+        create_backup(user_id, "profile")
+    invalidate_cache(user_id)
+    return True
 
 # ============================================================
-# 6. АВТОМАТИЧЕСКИЕ БЭКАПЫ
+# 8. СЧЁТЧИК БЭКАПОВ
+# ============================================================
+
+def load_counter(user_id):
+    data = atomic_read(COUNTER_FILE, default={})
+    return data.get(str(user_id), 0)
+
+def save_counter(user_id, count):
+    data = atomic_read(COUNTER_FILE, default={})
+    data[str(user_id)] = count
+    atomic_write(COUNTER_FILE, data)
+
+# ============================================================
+# 9. БЭКАПЫ
 # ============================================================
 
 def create_backup(user_id, data_type):
@@ -232,18 +302,18 @@ def create_backup(user_id, data_type):
         
         if data_type == "profile":
             profile = get_profile_cached(user_id)
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(profile, f, ensure_ascii=False, indent=2)
+            atomic_write(filename, profile)
         elif data_type == "memory":
             history = load_memory(user_id)
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(history, f, ensure_ascii=False, indent=2)
+            atomic_write(filename, history)
         
         backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith(f"{data_type}_{user_id}")])
         if len(backups) > 10:
             for old_file in backups[:-10]:
-                os.remove(os.path.join(BACKUP_DIR, old_file))
-        
+                try:
+                    os.remove(os.path.join(BACKUP_DIR, old_file))
+                except:
+                    pass
         return True
     except Exception as e:
         print(f"⚠️ Ошибка создания бэкапа: {e}")
@@ -254,23 +324,21 @@ def restore_backup(user_id, data_type):
         backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith(f"{data_type}_{user_id}")])
         if not backups:
             return False
-        
         latest = backups[-1]
-        with open(os.path.join(BACKUP_DIR, latest), 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
+        data = atomic_read(os.path.join(BACKUP_DIR, latest), default=None)
+        if data is None:
+            return False
         if data_type == "profile":
             save_profile(user_id, data, backup=False)
         elif data_type == "memory":
             save_memory(user_id, data, backup=False)
-        
         return True
     except Exception as e:
         print(f"⚠️ Ошибка восстановления бэкапа: {e}")
         return False
 
 # ============================================================
-# 7. СЖАТИЕ ДАННЫХ
+# 10. СЖАТИЕ ДАННЫХ
 # ============================================================
 
 def extract_key_points(text, max_len=30):
@@ -308,28 +376,26 @@ def extract_keywords_ultra(text, max_len=12):
 def compress_ultra_old(items, target_count=50):
     if len(items) <= target_count:
         return items
-    
     old_items = items[:200]
     compressed = []
-    
     for i in range(0, len(old_items), 4):
         batch = old_items[i:i+4]
         combined = " | ".join([item[:20] for item in batch])
         compressed.append(f"[архив] {combined}")
-    
-    return compressed + items[-target_count:]
+    result = compressed + items[-target_count:]
+    if len(result) > target_count + 10:
+        result = result[-target_count:]
+    return result
 
 # ============================================================
-# 8. ФУНКЦИИ ПАМЯТИ
+# 11. ФУНКЦИИ ПАМЯТИ
 # ============================================================
 
 def compress_history(history):
     if len(history) <= LEVEL_1['max_history']:
         return history
-    
     recent = history[-LEVEL_1['keep_recent']:]
     old = history[:-LEVEL_1['keep_recent']]
-    
     summary = []
     for msg in old[-10:]:
         role = msg.get("role", "")
@@ -338,67 +404,51 @@ def compress_history(history):
             summary.append(f"Q: {extract_key_points(content, 50)}")
         elif role == "assistant":
             summary.append(f"A: {extract_key_points(content, 50)}")
-    
     if summary:
         return [{"role": "system", "content": "📚 История:\n" + "\n".join(summary[-5:])}] + recent
     return recent
 
 def load_memory(user_id):
-    try:
-        if os.path.exists(MEMORY_FILE):
-            with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return compress_history(data.get(str(user_id), []))
-    except Exception as e:
-        print(f"⚠️ Ошибка загрузки памяти: {e}")
-    return []
+    data = atomic_read(MEMORY_FILE, default={})
+    return compress_history(data.get(str(user_id), []))
 
 def save_memory(user_id, history, backup=True):
-    try:
-        data = {}
-        if os.path.exists(MEMORY_FILE):
-            with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        
-        if len(history) > LEVEL_1['max_history']:
-            old_messages = history[:-LEVEL_1['keep_recent']]
-            if old_messages:
-                update_level_2(user_id, old_messages)
-                
-                profile = get_profile_cached(user_id)
-                if len(profile.get("level_2", [])) >= LEVEL_2['compress_to']:
-                    update_level_3(user_id, old_messages)
-                if len(profile.get("level_3", [])) >= LEVEL_3['compress_to']:
-                    update_level_4(user_id, old_messages)
-                if len(profile.get("level_4", [])) >= LEVEL_4['compress_to']:
-                    update_level_5(user_id, old_messages)
-        
-        data[str(user_id)] = compress_history(history)
-        with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        if backup:
-            create_backup(user_id, "memory")
-        
-        global MESSAGE_COUNTER
-        MESSAGE_COUNTER[user_id] = MESSAGE_COUNTER.get(user_id, 0) + 1
-        if MESSAGE_COUNTER[user_id] % 10 == 0:
-            create_backup(user_id, "profile")
-        
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка сохранения памяти: {e}")
+    data = atomic_read(MEMORY_FILE, default={})
+    
+    if len(history) > LEVEL_1['max_history']:
+        old_messages = history[:-LEVEL_1['keep_recent']]
+        if old_messages:
+            update_level_2(user_id, old_messages)
+            profile = get_profile_cached(user_id)
+            if len(profile.get("level_2", [])) >= LEVEL_2['compress_to']:
+                update_level_3(user_id, old_messages)
+            if len(profile.get("level_3", [])) >= LEVEL_3['compress_to']:
+                update_level_4(user_id, old_messages)
+            if len(profile.get("level_4", [])) >= LEVEL_4['compress_to']:
+                update_level_5(user_id, old_messages)
+    
+    data[str(user_id)] = compress_history(history)
+    if not atomic_write(MEMORY_FILE, data):
         return False
+    
+    if backup:
+        create_backup(user_id, "memory")
+    
+    count = load_counter(user_id) + 1
+    save_counter(user_id, count)
+    if count % 10 == 0:
+        create_backup(user_id, "profile")
+    
+    return True
 
 # ============================================================
-# 9. ОБНОВЛЕНИЕ УРОВНЕЙ
+# 12. ОБНОВЛЕНИЕ УРОВНЕЙ
 # ============================================================
 
 def update_level_2(user_id, messages):
     profile = get_profile_cached(user_id)
     if "level_2" not in profile:
         profile["level_2"] = []
-    
     batch = messages[-LEVEL_2['compress_interval']:]
     compressed = []
     for msg in batch:
@@ -408,21 +458,17 @@ def update_level_2(user_id, messages):
             compressed.append(f"Q: {extract_key_points(content, 30)}")
         elif role == "assistant":
             compressed.append(f"A: {extract_key_points(content, 30)}")
-    
     timestamp = datetime.now().strftime("%d.%m")
     for item in compressed:
         profile["level_2"].append(f"[{timestamp}] {item}")
-    
     if len(profile["level_2"]) > LEVEL_2['compress_to']:
         profile["level_2"] = profile["level_2"][-LEVEL_2['compress_to']:]
-    
     save_profile(user_id, profile, backup=False)
 
 def update_level_3(user_id, messages):
     profile = get_profile_cached(user_id)
     if "level_3" not in profile:
         profile["level_3"] = []
-    
     batch = messages[-LEVEL_3['compress_interval']:]
     compressed = []
     for msg in batch:
@@ -432,21 +478,17 @@ def update_level_3(user_id, messages):
             compressed.append(f"Q: {extract_keywords_aggressive(content, 25)}")
         elif role == "assistant":
             compressed.append(f"A: {extract_keywords_aggressive(content, 25)}")
-    
     timestamp = datetime.now().strftime("%m.%d")
     for item in compressed:
         profile["level_3"].append(f"[{timestamp}] {item}")
-    
     if len(profile["level_3"]) > LEVEL_3['compress_to']:
         profile["level_3"] = profile["level_3"][-LEVEL_3['compress_to']:]
-    
     save_profile(user_id, profile, backup=False)
 
 def update_level_4(user_id, messages):
     profile = get_profile_cached(user_id)
     if "level_4" not in profile:
         profile["level_4"] = []
-    
     batch = messages[-LEVEL_4['compress_interval']:]
     compressed = []
     for msg in batch:
@@ -456,21 +498,17 @@ def update_level_4(user_id, messages):
             compressed.append(f"Q: {extract_keywords_aggressive(content, 20)}")
         elif role == "assistant":
             compressed.append(f"A: {extract_keywords_aggressive(content, 20)}")
-    
     timestamp = datetime.now().strftime("%m.%d")
     for item in compressed:
         profile["level_4"].append(f"[{timestamp}] {item}")
-    
     if len(profile["level_4"]) > LEVEL_4['compress_to']:
         profile["level_4"] = profile["level_4"][-LEVEL_4['compress_to']:]
-    
     save_profile(user_id, profile, backup=False)
 
 def update_level_5(user_id, messages):
     profile = get_profile_cached(user_id)
     if "level_5" not in profile:
         profile["level_5"] = []
-    
     batch = messages[-LEVEL_5['compress_interval']:]
     compressed = []
     for msg in batch:
@@ -480,23 +518,19 @@ def update_level_5(user_id, messages):
             compressed.append(f"Q: {extract_keywords_ultra(content, 15)}")
         elif role == "assistant":
             compressed.append(f"A: {extract_keywords_ultra(content, 15)}")
-    
     timestamp = datetime.now().strftime("%y.%m")
     for item in compressed:
         profile["level_5"].append(f"[{timestamp}] {item}")
-    
     if len(profile["level_5"]) > LEVEL_5['compress_to'] + 100:
         old_items = profile["level_5"][:200]
         compressed_old = compress_ultra_old(old_items, 50)
         profile["level_5"] = compressed_old + profile["level_5"][200:]
-    
     if len(profile["level_5"]) > LEVEL_5['compress_to']:
         profile["level_5"] = profile["level_5"][-LEVEL_5['compress_to']:]
-    
     save_profile(user_id, profile, backup=False)
 
 # ============================================================
-# 10. ПОИСК ПО ПИРАМИДЕ
+# 13. ПОИСК ПО ПИРАМИДЕ
 # ============================================================
 
 def search_in_pyramid(user_id, query):
@@ -514,15 +548,12 @@ def search_in_pyramid(user_id, query):
     for item in profile.get("level_2", []):
         if q in item.lower():
             results.append(f"📚 {item}")
-    
     for item in profile.get("level_3", []):
         if q in item.lower():
             results.append(f"📖 {item}")
-    
     for item in profile.get("level_4", []):
         if q in item.lower():
             results.append(f"📕 {item}")
-    
     for item in profile.get("level_5", []):
         if q in item.lower():
             results.append(f"📗 {item}")
@@ -530,7 +561,7 @@ def search_in_pyramid(user_id, query):
     return results[:15]
 
 # ============================================================
-# 11. АНАЛИЗАТОР СООБЩЕНИЙ
+# 14. АНАЛИЗАТОР СООБЩЕНИЙ
 # ============================================================
 
 async def analyze_message(user_id, user_message):
@@ -554,7 +585,10 @@ async def analyze_message(user_id, user_message):
         if trigger in q:
             return {"type": "memory_query", "action": "memory_search", "needs_search": False, "needs_memory": True}
     
-    dynamic_triggers = ['погод', 'температур', 'дожд', 'снег', 'ветер', 'курс', 'доллар', 'евро', 'новост', 'событи']
+    dynamic_triggers = ['погод', 'температур', 'дожд', 'снег', 'ветер', 'градус',
+                        'курс', 'доллар', 'евро', 'юань', 'биткоин',
+                        'новост', 'событи', 'происшеств', 'авар', 'выбор', 'кризис', 'войн',
+                        'врем', 'час', 'минут', 'дата', 'сегодня', 'завтра', 'вчера', 'сейчас']
     for trigger in dynamic_triggers:
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
@@ -567,7 +601,7 @@ async def analyze_message(user_id, user_message):
     return {"type": "static", "action": "memory", "needs_search": False, "needs_memory": True}
 
 # ============================================================
-# 12. API ФУНКЦИИ
+# 15. API ФУНКЦИИ
 # ============================================================
 
 def search_apiserpent(query):
@@ -584,19 +618,30 @@ def search_apiserpent(query):
             return []
         data = response.json()
         results = []
+        # Множественные fallback
         if "results" in data and isinstance(data["results"], dict):
             results = data["results"].get("organic", [])
         elif "organic_results" in data:
             results = data["organic_results"]
         elif isinstance(data.get("results"), list):
             results = data["results"]
+        elif "organic" in data:
+            results = data["organic"]
+        elif "items" in data:
+            results = data["items"]
+        if not results and isinstance(data, dict):
+            for key in data:
+                if isinstance(data[key], list) and len(data[key]) > 0:
+                    if isinstance(data[key][0], dict):
+                        results = data[key]
+                        break
         formatted = []
         for r in results[:5]:
             if isinstance(r, dict):
                 formatted.append({
-                    "title": str(r.get("title", "Без названия"))[:150],
-                    "snippet": str(r.get("snippet", r.get("description", "Нет описания")))[:250],
-                    "link": str(r.get("url", r.get("link", "#")))[:150]
+                    "title": str(r.get("title", r.get("name", "Без названия")))[:150],
+                    "snippet": str(r.get("snippet", r.get("description", r.get("text", "Нет описания"))))[:250],
+                    "link": str(r.get("url", r.get("link", r.get("href", "#"))))[:150]
                 })
         return formatted
     except Exception as e:
@@ -623,19 +668,38 @@ async def ask_deepseek(messages, retries=3, max_tokens=None):
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        return data["choices"][0]["message"]["content"], None
+                        if data.get("choices") and len(data["choices"]) > 0:
+                            content = data["choices"][0].get("message", {}).get("content")
+                            if content:
+                                return content, None
+                            return None, "empty"
+                        return None, "invalid_response"
                     if resp.status == 429:
-                        await asyncio.sleep(2 ** attempt)
+                        await asyncio.sleep(min(2 ** attempt, 30))
                         continue
-                    return None, f"❌ Ошибка API ({resp.status})"
+                    if resp.status == 401:
+                        return None, "unauthorized"
+                    if resp.status == 500:
+                        return None, "server_error"
+                    return None, f"http_{resp.status}"
+        except aiohttp.ClientConnectionError:
+            if attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return None, "connection_error"
+        except asyncio.TimeoutError:
+            if attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            return None, "timeout"
         except Exception as e:
             if attempt < retries - 1:
                 continue
-            return None, f"❌ Ошибка: {str(e)}"
-    return None, "❌ Превышено количество попыток."
+            return None, f"unknown: {str(e)}"
+    return None, "max_retries"
 
 # ============================================================
-# 13. ГЕНЕРАЦИЯ ОТВЕТА
+# 16. ГЕНЕРАЦИЯ ОТВЕТА
 # ============================================================
 
 async def generate_response(user_id, user_message, analysis_result, history, profile):
@@ -656,9 +720,8 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 return value, False
         return "👋 Привет! Чем могу помочь?", False
     
-    # СТАТИЧНЫЙ СИСТЕМНЫЙ ПРОМПТ (БЕЗ ДАТЫ!)
+    # СТАТИЧНЫЙ СИСТЕМНЫЙ ПРОМПТ (БЕЗ ДАТЫ)
     system_parts = []
-    
     for key, value in profile.items():
         if key.startswith("last_check_") or key.startswith("update_history_"):
             continue
@@ -681,7 +744,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
     
     system_msg = {"role": "system", "content": system_prompt}
     
-    # ДАТУ ДОБАВЛЯЕМ В СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ
     user_message_with_date = f"[Сегодня: {CURRENT_DATE} {CURRENT_TIME}]\n\n{user_message}"
     
     if action == "memory_search":
@@ -694,16 +756,16 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
             }
             history.append({"role": "user", "content": user_message_with_date})
             messages = [system_msg, prompt] + history
-            answer, error = await ask_deepseek(messages)
-            if error:
-                return f"⚠️ {error}", False
+            answer, err_code = await ask_deepseek(messages)
+            if err_code:
+                return f"⚠️ {analyze_error(err_code)}", False
             return answer, True
         else:
             history.append({"role": "user", "content": user_message_with_date})
             messages = [system_msg] + history
-            answer, error = await ask_deepseek(messages)
-            if error:
-                return f"⚠️ {error}", False
+            answer, err_code = await ask_deepseek(messages)
+            if err_code:
+                return f"⚠️ {analyze_error(err_code)}", False
             return answer, True
     
     if action == "internet":
@@ -711,9 +773,9 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         if not results:
             history.append({"role": "user", "content": user_message_with_date})
             messages = [system_msg] + history
-            answer, error = await ask_deepseek(messages)
-            if error:
-                return f"⚠️ {error}", False
+            answer, err_code = await ask_deepseek(messages)
+            if err_code:
+                return f"⚠️ {analyze_error(err_code)}", False
             return answer, True
         
         search_text = f"🔍 Результаты поиска:\n\n"
@@ -732,20 +794,20 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         
         history.append({"role": "user", "content": user_message_with_date})
         messages = [system_msg, search_prompt] + history
-        answer, error = await ask_deepseek(messages)
-        if error:
-            return f"⚠️ {error}", False
+        answer, err_code = await ask_deepseek(messages)
+        if err_code:
+            return f"⚠️ {analyze_error(err_code)}", False
         return answer, True
     
     history.append({"role": "user", "content": user_message_with_date})
     messages = [system_msg] + history
-    answer, error = await ask_deepseek(messages)
-    if error:
-        return f"⚠️ {error}", False
+    answer, err_code = await ask_deepseek(messages)
+    if err_code:
+        return f"⚠️ {analyze_error(err_code)}", False
     return answer, True
 
 # ============================================================
-# 14. КОМАНДЫ БОТА
+# 17. КОМАНДЫ БОТА
 # ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -786,14 +848,12 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     lines = ["🧠 **Пирамидальная память:**\n"]
-    
     level_labels = {
         'level_2': '📚 1000 сообщений',
         'level_3': '📖 10000 сообщений',
         'level_4': '📕 100000 сообщений',
         'level_5': '📗 1 000 000+ сообщений'
     }
-    
     for key, label in level_labels.items():
         value = profile.get(key, [])
         lines.append(f"• {label}: {len(value)} пунктов")
@@ -872,6 +932,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     backup_count = len([f for f in os.listdir(BACKUP_DIR) if f.startswith(f"profile_{user_id}")])
     lines.append(f"\n💾 Бэкапов: {backup_count}")
     
+    counter = load_counter(user_id)
+    lines.append(f"📊 Счётчик сообщений: {counter}")
+    
     total_messages = total_punkts * 50
     lines.append(f"📊 Всего в памяти: ~{total_messages:,} сообщений")
     lines.append(f"🔄 Обновлён: {profile.get('updated', 'неизвестно')}")
@@ -887,6 +950,7 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_profile(user_id, {})
     save_memory(user_id, [])
     invalidate_cache(user_id)
+    save_counter(user_id, 0)
     await update.message.reply_text("🧹 **Я забыл всё, что знал о тебе!**")
 
 async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -909,7 +973,7 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Нет бэкапов для восстановления.")
 
 # ============================================================
-# 15. ГЛАВНЫЙ ОБРАБОТЧИК
+# 18. ГЛАВНЫЙ ОБРАБОТЧИК
 # ============================================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -960,28 +1024,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(answer[i:i+4096])
             except Exception as e:
                 print(f"⚠️ Ошибка отправки: {e}")
+                await update.message.reply_text(analyze_error(str(e)))
     else:
         try:
             await update.message.reply_text(answer)
         except Exception as e:
             print(f"⚠️ Ошибка отправки: {e}")
+            await update.message.reply_text(analyze_error(str(e)))
 
 # ============================================================
-# 16. ЗАПУСК
+# 19. ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК (С АНАЛИЗОМ)
 # ============================================================
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         raise context.error
     except Exception as e:
-        print(f"⚠️ Ошибка: {e}")
+        error_str = str(e)
+        print(f"⚠️ Глобальная ошибка: {error_str}")
         import traceback
         traceback.print_exc()
+        
+        user_message = analyze_error(error_str)
         if update and update.effective_message:
-            await update.effective_message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+            await update.effective_message.reply_text(user_message)
+
+# ============================================================
+# 20. ЗАПУСК
+# ============================================================
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
@@ -995,10 +1071,12 @@ if __name__ == "__main__":
     app.add_error_handler(error_handler)
     
     print("=" * 50)
-    print("✅ БОТ ЗАПУЩЕН С МАКСИМАЛЬНОЙ ОПТИМИЗАЦИЕЙ!")
+    print("✅ БОТ ЗАПУЩЕН С МАКСИМАЛЬНОЙ ЗАЩИТОЙ И УМНЫМИ ОШИБКАМИ!")
     print(f"📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
-    print(f"💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН (TTL: {CACHE_TTL} сек)")
+    print(f"💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН (TTL: {CACHE_TTL} сек, макс. {MAX_CACHE_ITEMS} записей)")
     print(f"💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
+    print(f"🛡️ Атомарная запись файлов: ВКЛЮЧЕНА")
+    print(f"🛡️ Умная обработка ошибок: ВКЛЮЧЕНА (0 токенов)")
     print(f"👥 Разрешённых пользователей: {len(ALLOWED_USERS_LIST)}")
     print("=" * 50)
     
