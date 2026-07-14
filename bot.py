@@ -47,7 +47,7 @@ if ADMIN_USER_ID != 0 and ADMIN_USER_ID not in ALLOWED_USERS_LIST:
     ALLOWED_USERS_LIST.append(ADMIN_USER_ID)
 
 # ============================================================
-# 2. ПИРАМИДАЛЬНАЯ ПАМЯТЬ (НАСТРОЙКИ)
+# 2. ПИРАМИДАЛЬНАЯ ПАМЯТЬ
 # ============================================================
 
 LEVEL_1 = {'max_history': 80, 'keep_recent': 20, 'compress_to': 20}
@@ -56,27 +56,39 @@ LEVEL_3 = {'max_items': 10000, 'compress_interval': 200, 'compress_to': 100}
 LEVEL_4 = {'max_items': 100000, 'compress_interval': 1000, 'compress_to': 200}
 LEVEL_5 = {'max_items': 1000000, 'compress_interval': 10000, 'compress_to': 500}
 
-# Ограничения кэша
 MAX_CACHE_ITEMS = int(os.getenv("MAX_CACHE_ITEMS", "100"))
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "60"))
 
-# Модель и API
 MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-v4-flash")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 
-# Текущая дата
+# --- ОПРЕДЕЛЕНИЕ ПИКОВЫХ ЧАСОВ DEEPSEEK ---
+PEAK_HOURS = [(9, 12), (14, 18)]
+
+def is_peak_hour():
+    now = datetime.now()
+    hour = now.hour
+    for start, end in PEAK_HOURS:
+        if start <= hour < end:
+            return True
+    return False
+
+def get_peak_status():
+    if is_peak_hour():
+        return "⚠️ Сейчас пиковые часы DeepSeek (9:00–12:00, 14:00–18:00) — стоимость API удвоена."
+    return "✅ Сейчас непиковые часы DeepSeek — стандартная стоимость."
+
 NOW = datetime.now()
 CURRENT_DATE = NOW.strftime("%d.%m.%Y")
 CURRENT_TIME = NOW.strftime("%H:%M")
 CURRENT_YEAR = NOW.year
 
-# Проверка обязательных переменных
 if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     print("❌ TELEGRAM_TOKEN или DEEPSEEK_API_KEY не заданы")
     sys.exit(1)
 
 print("\n" + "=" * 50)
-print("🚀 БОТ ЗАПУЩЕН (МАКСИМАЛЬНАЯ ЗАЩИТА + УМНЫЕ ОШИБКИ)")
+print("🚀 БОТ ЗАПУЩЕН (МАКСИМАЛЬНАЯ ЗАЩИТА + ЧЕРНОВИКИ)")
 print("=" * 50)
 print(f"  🤖 TELEGRAM_TOKEN: {'✅' if TELEGRAM_TOKEN else '❌'}")
 print(f"  🔑 DEEPSEEK_API_KEY: {'✅' if DEEPSEEK_API_KEY else '❌'}")
@@ -86,7 +98,8 @@ print(f"  👥 Разрешённых пользователей: {len(ALLOWED_U
 print(f"  📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
 print(f"  💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН (TTL: {CACHE_TTL} сек, макс. {MAX_CACHE_ITEMS} записей)")
 print(f"  💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
-print(f"  🛡️ Умная обработка ошибок: ВКЛЮЧЕНА")
+print(f"  🕐 Поиск по дате и времени: ВКЛЮЧЕН")
+print(f"  💾 Сохранение черновиков (до отправки): ВКЛЮЧЕНО")
 print("=" * 50 + "\n")
 
 # ============================================================
@@ -103,17 +116,31 @@ CACHE_FILE = "data/profile_cache.json"
 COUNTER_FILE = "data/counter.json"
 
 PROFILE_CACHE = {}
+_http_session = None
 
 # ============================================================
-# 4. АНАЛИЗАТОР ОШИБОК (ДЛЯ ПОЛЬЗОВАТЕЛЯ, 0 ТОКЕНОВ)
+# 4. ПЕРЕИСПОЛЬЗУЕМАЯ HTTP-СЕССИЯ
+# ============================================================
+
+async def get_http_session():
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        connector = aiohttp.TCPConnector(
+            limit=50,
+            limit_per_host=20,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True
+        )
+        timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
+        _http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+    return _http_session
+
+# ============================================================
+# 5. АНАЛИЗАТОР ОШИБОК
 # ============================================================
 
 def analyze_error(error_text):
-    """
-    Анализирует текст ошибки и возвращает понятное описание для пользователя.
-    """
     error_lower = error_text.lower()
-    
     if "timeout" in error_lower or "timed out" in error_lower:
         return "⏰ Превышено время ожидания ответа от сервера. Попробуйте позже."
     if "connection" in error_lower or "network" in error_lower:
@@ -138,7 +165,7 @@ def analyze_error(error_text):
         return f"⚠️ Неизвестная ошибка: {error_text[:150]}..."
 
 # ============================================================
-# 5. АТОМАРНАЯ ЗАПИСЬ В ФАЙЛ
+# 6. АТОМАРНАЯ ЗАПИСЬ
 # ============================================================
 
 def atomic_write(filename, data, as_json=True):
@@ -196,7 +223,7 @@ def restore_from_backup(filename):
         return None
 
 # ============================================================
-# 6. ГИБРИДНЫЙ КЭШ (RAM + ФАЙЛ)
+# 7. ГИБРИДНЫЙ КЭШ
 # ============================================================
 
 def load_cache_from_file():
@@ -260,7 +287,7 @@ def is_allowed(user_id):
     return user_id in ALLOWED_USERS_LIST
 
 # ============================================================
-# 7. ЗАГРУЗКА/СОХРАНЕНИЕ ПРОФИЛЯ
+# 8. ЗАГРУЗКА/СОХРАНЕНИЕ ПРОФИЛЯ
 # ============================================================
 
 def load_profile(user_id):
@@ -279,7 +306,7 @@ def save_profile(user_id, profile, backup=True):
     return True
 
 # ============================================================
-# 8. СЧЁТЧИК БЭКАПОВ
+# 9. СЧЁТЧИК БЭКАПОВ
 # ============================================================
 
 def load_counter(user_id):
@@ -292,7 +319,7 @@ def save_counter(user_id, count):
     atomic_write(COUNTER_FILE, data)
 
 # ============================================================
-# 9. БЭКАПЫ
+# 10. БЭКАПЫ
 # ============================================================
 
 def create_backup(user_id, data_type):
@@ -338,7 +365,7 @@ def restore_backup(user_id, data_type):
         return False
 
 # ============================================================
-# 10. СЖАТИЕ ДАННЫХ
+# 11. СЖАТИЕ ДАННЫХ
 # ============================================================
 
 def extract_key_points(text, max_len=30):
@@ -388,7 +415,7 @@ def compress_ultra_old(items, target_count=50):
     return result
 
 # ============================================================
-# 11. ФУНКЦИИ ПАМЯТИ
+# 12. ФУНКЦИИ ПАМЯТИ
 # ============================================================
 
 def compress_history(history):
@@ -410,9 +437,30 @@ def compress_history(history):
 
 def load_memory(user_id):
     data = atomic_read(MEMORY_FILE, default={})
-    return compress_history(data.get(str(user_id), []))
+    raw_history = data.get(str(user_id), [])
+    return compress_history(raw_history)
 
 def save_memory(user_id, history, backup=True):
+    # Загружаем старую историю для сохранения timestamp
+    old_data = atomic_read(MEMORY_FILE, default={})
+    old_history = old_data.get(str(user_id), [])
+    
+    old_timestamps = {}
+    for msg in old_history:
+        if "timestamp" in msg:
+            key = f"{msg.get('role', '')}:{msg.get('content', '')}"
+            old_timestamps[key] = msg["timestamp"]
+    
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    for msg in history:
+        if "timestamp" not in msg:
+            key = f"{msg.get('role', '')}:{msg.get('content', '')}"
+            if key in old_timestamps:
+                msg["timestamp"] = old_timestamps[key]
+            else:
+                msg["timestamp"] = now_str
+
     data = atomic_read(MEMORY_FILE, default={})
     
     if len(history) > LEVEL_1['max_history']:
@@ -442,7 +490,7 @@ def save_memory(user_id, history, backup=True):
     return True
 
 # ============================================================
-# 12. ОБНОВЛЕНИЕ УРОВНЕЙ
+# 13. ОБНОВЛЕНИЕ УРОВНЕЙ
 # ============================================================
 
 def update_level_2(user_id, messages):
@@ -530,8 +578,85 @@ def update_level_5(user_id, messages):
     save_profile(user_id, profile, backup=False)
 
 # ============================================================
-# 13. ПОИСК ПО ПИРАМИДЕ
+# 14. ПОИСК ПО ВРЕМЕНИ И ДАТЕ
 # ============================================================
+
+def parse_time_query(time_query):
+    try:
+        parts = time_query.split(":")
+        if len(parts) == 2:
+            return int(parts[0]), int(parts[1]), None
+        elif len(parts) == 3:
+            return int(parts[0]), int(parts[1]), int(parts[2])
+    except:
+        pass
+    return None, None, None
+
+def search_by_time(user_id, time_query):
+    history = load_memory(user_id)
+    results = []
+    query_hour, query_min, query_sec = parse_time_query(time_query)
+    
+    if query_hour is None:
+        return results
+    
+    for msg in history:
+        timestamp = msg.get("timestamp", "")
+        if not timestamp:
+            continue
+        try:
+            msg_time = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+            if msg_time.hour == query_hour and msg_time.minute == query_min:
+                results.append(msg)
+        except:
+            if time_query in timestamp:
+                results.append(msg)
+    
+    return results
+
+def parse_date_query(query):
+    q = query.lower().strip()
+    now = datetime.now()
+    
+    if q == "сегодня":
+        return now.strftime("%Y-%m-%d")
+    if q == "вчера":
+        yesterday = now - timedelta(days=1)
+        return yesterday.strftime("%Y-%m-%d")
+    if q == "завтра":
+        tomorrow = now + timedelta(days=1)
+        return tomorrow.strftime("%Y-%m-%d")
+    
+    patterns = [
+        r'(\d{2})\.(\d{2})\.(\d{4})',
+        r'(\d{2})\.(\d{2})',
+        r'(\d{4})-(\d{2})-(\d{2})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, query)
+        if match:
+            groups = match.groups()
+            if len(groups) == 3:
+                if '.' in query:
+                    day, month, year = groups
+                    return f"{year}-{month}-{day}"
+                else:
+                    year, month, day = groups
+                    return f"{year}-{month}-{day}"
+            elif len(groups) == 2:
+                day, month = groups
+                year = now.year
+                return f"{year}-{month}-{day}"
+    return None
+
+def search_by_date(user_id, date_str):
+    history = load_memory(user_id)
+    results = []
+    for msg in history:
+        timestamp = msg.get("timestamp", "")
+        if timestamp and timestamp.startswith(date_str):
+            results.append(msg)
+    return results
 
 def search_in_pyramid(user_id, query):
     profile = get_profile_cached(user_id)
@@ -541,9 +666,11 @@ def search_in_pyramid(user_id, query):
     history = load_memory(user_id)
     for msg in history[-20:]:
         content = msg.get("content", "")
+        timestamp = msg.get("timestamp", "")
         if q in content.lower():
             role = "👤" if msg.get("role") == "user" else "🤖"
-            results.append(f"{role} {extract_key_points(content, 80)}")
+            time_str = f" [{timestamp}]" if timestamp else ""
+            results.append(f"{role}{time_str} {extract_key_points(content, 80)}")
     
     for item in profile.get("level_2", []):
         if q in item.lower():
@@ -561,7 +688,7 @@ def search_in_pyramid(user_id, query):
     return results[:15]
 
 # ============================================================
-# 14. АНАЛИЗАТОР СООБЩЕНИЙ
+# 15. АНАЛИЗАТОР СООБЩЕНИЙ
 # ============================================================
 
 async def analyze_message(user_id, user_message):
@@ -601,7 +728,7 @@ async def analyze_message(user_id, user_message):
     return {"type": "static", "action": "memory", "needs_search": False, "needs_memory": True}
 
 # ============================================================
-# 15. API ФУНКЦИИ
+# 16. API ФУНКЦИИ (С ПЕРЕИСПОЛЬЗУЕМОЙ СЕССИЕЙ)
 # ============================================================
 
 def search_apiserpent(query):
@@ -618,7 +745,6 @@ def search_apiserpent(query):
             return []
         data = response.json()
         results = []
-        # Множественные fallback
         if "results" in data and isinstance(data["results"], dict):
             results = data["results"].get("organic", [])
         elif "organic_results" in data:
@@ -649,39 +775,39 @@ def search_apiserpent(query):
         return []
 
 async def ask_deepseek(messages, retries=3, max_tokens=None):
+    session = await get_http_session()
+    
     for attempt in range(retries):
         try:
-            async with aiohttp.ClientSession() as session:
-                payload = {
-                    "model": MODEL_DEFAULT,
-                    "messages": messages,
-                    "temperature": 0.3
-                }
-                if max_tokens:
-                    payload["max_tokens"] = max_tokens
-                
-                async with session.post(
-                    f"{DEEPSEEK_API_BASE}/chat/completions",
-                    headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-                    json=payload,
-                    timeout=30
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("choices") and len(data["choices"]) > 0:
-                            content = data["choices"][0].get("message", {}).get("content")
-                            if content:
-                                return content, None
-                            return None, "empty"
-                        return None, "invalid_response"
-                    if resp.status == 429:
-                        await asyncio.sleep(min(2 ** attempt, 30))
-                        continue
-                    if resp.status == 401:
-                        return None, "unauthorized"
-                    if resp.status == 500:
-                        return None, "server_error"
-                    return None, f"http_{resp.status}"
+            payload = {
+                "model": MODEL_DEFAULT,
+                "messages": messages,
+                "temperature": 0.3
+            }
+            if max_tokens:
+                payload["max_tokens"] = max_tokens
+            
+            async with session.post(
+                f"{DEEPSEEK_API_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+                json=payload
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("choices") and len(data["choices"]) > 0:
+                        content = data["choices"][0].get("message", {}).get("content")
+                        if content:
+                            return content, None
+                        return None, "empty"
+                    return None, "invalid_response"
+                if resp.status == 429:
+                    await asyncio.sleep(min(2 ** attempt, 30))
+                    continue
+                if resp.status == 401:
+                    return None, "unauthorized"
+                if resp.status == 500:
+                    return None, "server_error"
+                return None, f"http_{resp.status}"
         except aiohttp.ClientConnectionError:
             if attempt < retries - 1:
                 await asyncio.sleep(2 ** attempt)
@@ -699,14 +825,15 @@ async def ask_deepseek(messages, retries=3, max_tokens=None):
     return None, "max_retries"
 
 # ============================================================
-# 16. ГЕНЕРАЦИЯ ОТВЕТА
+# 17. ГЕНЕРАЦИЯ ОТВЕТА (С СОХРАНЕНИЕМ ЧЕРНОВИКА)
 # ============================================================
 
 async def generate_response(user_id, user_message, analysis_result, history, profile):
     action = analysis_result.get("action", "memory")
+    source = "🧠 из модели"
     
     if action == "confirm":
-        return "✅ Понял! Продолжаем.", False
+        return "✅ Понял! Продолжаем.", False, None
     
     if action == "greeting":
         greetings = {
@@ -717,10 +844,42 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         }
         for key, value in greetings.items():
             if key in user_message.lower():
-                return value, False
-        return "👋 Привет! Чем могу помочь?", False
+                return value, False, None
+        return "👋 Привет! Чем могу помочь?", False, None
     
-    # СТАТИЧНЫЙ СИСТЕМНЫЙ ПРОМПТ (БЕЗ ДАТЫ)
+    # --- ПОИСК ПО ДАТЕ ---
+    date_match = re.search(r'\b(сегодня|вчера|завтра|\d{2}\.\d{2}(\.\d{4})?|\d{4}-\d{2}-\d{2})\b', user_message, re.IGNORECASE)
+    if date_match and not user_message.lower().startswith("бро"):
+        date_query = date_match.group(1)
+        date_str = parse_date_query(date_query)
+        if date_str:
+            date_results = search_by_date(user_id, date_str)
+            if date_results:
+                result_text = "\n".join([
+                    f"{msg.get('timestamp', '')} {msg.get('role', '')}: {msg.get('content', '')[:100]}"
+                    for msg in date_results[:10]
+                ])
+                answer = f"📅 Сообщения за {date_query}:\n{result_text}"
+                if len(date_results) > 10:
+                    answer += f"\n... и ещё {len(date_results)-10} сообщений"
+                return answer, False, "📂 из памяти (по дате)"
+    
+    # --- ПОИСК ПО ВРЕМЕНИ ---
+    time_match = re.search(r'(\d{1,2}:\d{2}(:\d{2})?)', user_message)
+    if time_match and not user_message.lower().startswith("бро"):
+        time_str = time_match.group(1)
+        time_results = search_by_time(user_id, time_str)
+        if time_results:
+            result_text = "\n".join([
+                f"{msg.get('timestamp', '')} {msg.get('role', '')}: {msg.get('content', '')[:100]}"
+                for msg in time_results[:5]
+            ])
+            answer = f"🕐 Найдено по времени {time_str}:\n{result_text}"
+            if len(time_results) > 5:
+                answer += f"\n... и ещё {len(time_results)-5} сообщений"
+            return answer, False, "📂 из памяти (по времени)"
+    
+    # --- СТАНДАРТНЫЙ СИСТЕМНЫЙ ПРОМПТ ---
     system_parts = []
     for key, value in profile.items():
         if key.startswith("last_check_") or key.startswith("update_history_"):
@@ -758,15 +917,17 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
             messages = [system_msg, prompt] + history
             answer, err_code = await ask_deepseek(messages)
             if err_code:
-                return f"⚠️ {analyze_error(err_code)}", False
-            return answer, True
+                return f"⚠️ {analyze_error(err_code)}", False, None
+            source = "📂 из памяти"
+            return answer, True, source
         else:
             history.append({"role": "user", "content": user_message_with_date})
             messages = [system_msg] + history
             answer, err_code = await ask_deepseek(messages)
             if err_code:
-                return f"⚠️ {analyze_error(err_code)}", False
-            return answer, True
+                return f"⚠️ {analyze_error(err_code)}", False, None
+            source = "🧠 из модели (память не найдена)"
+            return answer, True, source
     
     if action == "internet":
         results = search_apiserpent(user_message)
@@ -775,8 +936,9 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
             messages = [system_msg] + history
             answer, err_code = await ask_deepseek(messages)
             if err_code:
-                return f"⚠️ {analyze_error(err_code)}", False
-            return answer, True
+                return f"⚠️ {analyze_error(err_code)}", False, None
+            source = "🧠 из модели (интернет не помог)"
+            return answer, True, source
         
         search_text = f"🔍 Результаты поиска:\n\n"
         for i, r in enumerate(results[:5], 1):
@@ -796,18 +958,20 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         messages = [system_msg, search_prompt] + history
         answer, err_code = await ask_deepseek(messages)
         if err_code:
-            return f"⚠️ {analyze_error(err_code)}", False
-        return answer, True
+            return f"⚠️ {analyze_error(err_code)}", False, None
+        source = "🌐 из интернета"
+        return answer, True, source
     
     history.append({"role": "user", "content": user_message_with_date})
     messages = [system_msg] + history
     answer, err_code = await ask_deepseek(messages)
     if err_code:
-        return f"⚠️ {analyze_error(err_code)}", False
-    return answer, True
+        return f"⚠️ {analyze_error(err_code)}", False, None
+    source = "🧠 из модели"
+    return answer, True, source
 
 # ============================================================
-# 17. КОМАНДЫ БОТА
+# 18. КОМАНДЫ БОТА
 # ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -818,15 +982,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     profile = get_profile_cached(user_id)
     name = profile.get("name", "друг")
+    peak_status = get_peak_status()
+    
     await update.message.reply_text(
         f"👋 Привет, {name}!\n\n"
         f"📅 Сегодня: {CURRENT_DATE} {CURRENT_TIME}\n\n"
+        f"{peak_status}\n\n"
         "🧠 **Пирамидальная память (1 000 000+ сообщений):**\n"
         "• 📝 80 последних (полностью)\n"
         "• 📚 1000 сообщений (сжато)\n"
         "• 📖 10000 сообщений (сжато)\n"
         "• 📕 100000 сообщений (сжато)\n"
         "• 📗 1 000 000+ сообщений (суть)\n\n"
+        "🕐 **Я запоминаю время каждого сообщения!**\n"
+        "📂 **В каждом ответе я указываю источник:**\n"
+        "   • 📂 из памяти — ответ из профиля или истории\n"
+        "   • 🌐 из интернета — найден через APISerpent\n"
+        "   • 🧠 из модели — сгенерирован DeepSeek\n\n"
+        "🔍 **Я сам ищу сообщения по дате и времени!**\n"
+        "   • Просто спроси: «что я писал вчера?» или «покажи 14.07.2026»\n"
+        "   • Или по времени: «что я писал в 13:44?»\n\n"
+        "💾 **Черновики сохраняются ДО отправки** — даже при сбое ответ не потеряется.\n\n"
         "📋 **Команды:**\n"
         "• `/profile` — что я помню\n"
         "• `/stats` — статистика\n"
@@ -871,6 +1047,7 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not found:
         lines.append("• Пока ничего не запомнил")
     
+    lines.append(f"\n⏰ {get_peak_status()}")
     lines.append(f"\n🔄 **Обновлено:** {profile.get('updated', 'неизвестно')}")
     await update.message.reply_text("\n".join(lines))
 
@@ -884,11 +1061,37 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🔍 **Поиск в памяти:**\n"
             "Напиши: `/memory что искать`\n"
-            "Например: `/memory погода`"
+            "Например: `/memory погода` или `/memory 13:44` или `/memory 14.07.2026`"
         )
         return
     
     query = ' '.join(context.args)
+    
+    date_str = parse_date_query(query)
+    if date_str:
+        date_results = search_by_date(user_id, date_str)
+        if date_results:
+            lines = [f"📅 Сообщения за {query}:\n"]
+            for msg in date_results[:10]:
+                lines.append(f"{msg.get('timestamp', '')} {msg.get('role', '')}: {msg.get('content', '')[:100]}")
+            if len(date_results) > 10:
+                lines.append(f"\n... и ещё {len(date_results)-10} сообщений")
+            await update.message.reply_text("\n".join(lines))
+            return
+    
+    time_match = re.search(r'(\d{1,2}:\d{2}(:\d{2})?)', query)
+    if time_match:
+        time_str = time_match.group(1)
+        time_results = search_by_time(user_id, time_str)
+        if time_results:
+            lines = [f"🕐 Найдено по времени {time_str}:\n"]
+            for msg in time_results[:5]:
+                lines.append(f"{msg.get('timestamp', '')} {msg.get('role', '')}: {msg.get('content', '')[:100]}")
+            if len(time_results) > 5:
+                lines.append(f"\n... и ещё {len(time_results)-5} сообщений")
+            await update.message.reply_text("\n".join(lines))
+            return
+    
     results = search_in_pyramid(user_id, query)
     
     if not results:
@@ -937,6 +1140,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     total_messages = total_punkts * 50
     lines.append(f"📊 Всего в памяти: ~{total_messages:,} сообщений")
+    lines.append(f"⏰ {get_peak_status()}")
     lines.append(f"🔄 Обновлён: {profile.get('updated', 'неизвестно')}")
     
     await update.message.reply_text("\n".join(lines))
@@ -973,7 +1177,7 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Нет бэкапов для восстановления.")
 
 # ============================================================
-# 18. ГЛАВНЫЙ ОБРАБОТЧИК
+# 19. ГЛАВНЫЙ ОБРАБОТЧИК
 # ============================================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1004,36 +1208,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ **Запомнил факт:** {text}")
         return
     
+    # --- ЕСЛИ ЭТО ЗАПРОС НА ПОИСК ПО ДАТЕ/ВРЕМЕНИ ---
+    date_keywords = ['сегодня', 'вчера', 'завтра', 'помнишь', 'напомни', 'что я писал', 'что я говорил']
+    if any(kw in user_message.lower() for kw in date_keywords):
+        date_match = re.search(r'\b(сегодня|вчера|завтра|\d{2}\.\d{2}(\.\d{4})?|\d{4}-\d{2}-\d{2})\b', user_message, re.IGNORECASE)
+        time_match = re.search(r'(\d{1,2}:\d{2}(:\d{2})?)', user_message)
+        
+        if date_match or time_match:
+            analysis_result = {"type": "memory_query", "action": "memory_search", "needs_search": False, "needs_memory": True}
+            history = load_memory(user_id)
+            profile = get_profile_cached(user_id)
+            answer, should_save, source = await generate_response(user_id, user_message, analysis_result, history, profile)
+            
+            if source and not answer.startswith("⚠️") and not answer.startswith("✅"):
+                answer = f"{source}\n\n{answer}"
+            
+            if is_peak_hour() and not answer.startswith("⚠️"):
+                answer = f"⏰ Внимание: сейчас пиковые часы DeepSeek (9:00–12:00, 14:00–18:00). Стоимость API удвоена.\n\n{answer}"
+            
+            await update.message.reply_text(answer)
+            return
+    
+    # --- ОСНОВНАЯ ЛОГИКА ---
     analysis_result = await analyze_message(user_id, user_message)
     print(f"📊 Анализ: {analysis_result}")
     
     history = load_memory(user_id)
     profile = get_profile_cached(user_id)
     
-    answer, should_save = await generate_response(user_id, user_message, analysis_result, history, profile)
+    answer, should_save, source = await generate_response(user_id, user_message, analysis_result, history, profile)
     
+    if source and not answer.startswith("⚠️") and not answer.startswith("✅"):
+        answer = f"{source}\n\n{answer}"
+    
+    if is_peak_hour() and not answer.startswith("⚠️"):
+        answer = f"⏰ Внимание: сейчас пиковые часы DeepSeek (9:00–12:00, 14:00–18:00). Стоимость API удвоена.\n\n{answer}"
+    
+    # --- СОХРАНЕНИЕ ЧЕРНОВИКА (ДО ОТПРАВКИ) ---
     if should_save:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         user_message_with_date = f"[Сегодня: {CURRENT_DATE} {CURRENT_TIME}]\n\n{user_message}"
-        history.append({"role": "user", "content": user_message_with_date})
-        history.append({"role": "assistant", "content": answer})
+        history.append({"role": "user", "content": user_message_with_date, "timestamp": now_str})
+        history.append({"role": "assistant", "content": answer, "timestamp": now_str})
         save_memory(user_id, history)
     
-    if len(answer) > 4096:
-        for i in range(0, len(answer), 4096):
-            try:
-                await update.message.reply_text(answer[i:i+4096])
-            except Exception as e:
-                print(f"⚠️ Ошибка отправки: {e}")
-                await update.message.reply_text(analyze_error(str(e)))
-    else:
+    # --- ОТПРАВКА С ПОВТОРОМ ПРИ ОШИБКЕ ---
+    max_retry_send = 3
+    for attempt in range(max_retry_send):
         try:
-            await update.message.reply_text(answer)
+            if len(answer) > 4096:
+                for i in range(0, len(answer), 4096):
+                    await update.message.reply_text(answer[i:i+4096])
+            else:
+                await update.message.reply_text(answer)
+            break  # Успешно отправлено
         except Exception as e:
-            print(f"⚠️ Ошибка отправки: {e}")
-            await update.message.reply_text(analyze_error(str(e)))
+            print(f"⚠️ Ошибка отправки (попытка {attempt+1}): {e}")
+            if attempt == max_retry_send - 1:
+                await update.message.reply_text(analyze_error(str(e)))
+            else:
+                await asyncio.sleep(1)
 
 # ============================================================
-# 19. ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК (С АНАЛИЗОМ)
+# 20. ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК
 # ============================================================
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1050,7 +1287,17 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(user_message)
 
 # ============================================================
-# 20. ЗАПУСК
+# 21. ЗАКРЫТИЕ СЕССИИ
+# ============================================================
+
+async def shutdown_session():
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
+        print("🔒 HTTP-сессия закрыта")
+
+# ============================================================
+# 22. ЗАПУСК
 # ============================================================
 
 if __name__ == "__main__":
@@ -1071,13 +1318,18 @@ if __name__ == "__main__":
     app.add_error_handler(error_handler)
     
     print("=" * 50)
-    print("✅ БОТ ЗАПУЩЕН С МАКСИМАЛЬНОЙ ЗАЩИТОЙ И УМНЫМИ ОШИБКАМИ!")
+    print("✅ БОТ ЗАПУЩЕН (СОХРАНЕНИЕ ЧЕРНОВИКОВ + ЗАЩИТА)")
     print(f"📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
     print(f"💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН (TTL: {CACHE_TTL} сек, макс. {MAX_CACHE_ITEMS} записей)")
     print(f"💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
-    print(f"🛡️ Атомарная запись файлов: ВКЛЮЧЕНА")
-    print(f"🛡️ Умная обработка ошибок: ВКЛЮЧЕНА (0 токенов)")
+    print(f"🕐 Поиск по дате и времени: ВКЛЮЧЕН")
+    print(f"💾 Сохранение черновиков (до отправки): ВКЛЮЧЕНО")
+    print(f"🔄 Повторная отправка при сбое: ВКЛЮЧЕНА (3 попытки)")
     print(f"👥 Разрешённых пользователей: {len(ALLOWED_USERS_LIST)}")
     print("=" * 50)
     
-    app.run_polling()
+    try:
+        app.run_polling()
+    finally:
+        import asyncio
+        asyncio.run(shutdown_session())
