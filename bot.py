@@ -654,7 +654,7 @@ async def analyze_message(user_id, user_message):
         if trigger in q:
             return {"type": "memory_query", "action": "memory_search", "needs_search": False, "needs_memory": True}
     
-    # ===== НОВЫЕ ТРИГГЕРЫ: ЯВНЫЕ ПРОСЬБЫ ОБ ИНТЕРНЕТ-ПОИСКЕ =====
+    # Явные просьбы об интернет-поиске
     internet_triggers = [
         'в интернете', 'найди в интернете', 'проверь в интернете',
         'актуализируй', 'актуализируйте', 'обнови', 'обновить',
@@ -664,7 +664,6 @@ async def analyze_message(user_id, user_message):
     for trigger in internet_triggers:
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
-    # ===========================================================
     
     # Динамичные темы (требуют интернета)
     dynamic_triggers = ['погод', 'температур', 'дожд', 'снег', 'ветер', 'градус',
@@ -917,7 +916,8 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         return f"⚠️ {analyze_error(err_code)}", False, None
     source = "🧠 из модели"
     return answer, True, source
-    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_allowed(user_id):
         await update.message.reply_text("❌ Доступ запрещён.")
