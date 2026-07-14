@@ -598,7 +598,8 @@ def search_in_pyramid(user_id, query):
             results.append(f"📗 {item}")
     
     return results[:15]
-    async def analyze_message(user_id, user_message):
+
+async def analyze_message(user_id, user_message):
     q = user_message.lower().strip()
     
     short_confirm = ['да', 'нет', 'ок', 'хорошо', 'понял', 'поняла', 'ага', 'угу', 'так', 'ясно', 'ладно', 'окей']
