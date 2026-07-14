@@ -20,14 +20,6 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
-# Попытка импорта DuckDuckGo для fallback-поиска
-try:
-    from duckduckgo_search import DDGS
-    DDGS_AVAILABLE = True
-except ImportError:
-    DDGS_AVAILABLE = False
-    print("⚠️ Библиотека duckduckgo-search не установлена. Fallback-поиск через DuckDuckGo недоступен.")
-
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -87,7 +79,7 @@ if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     sys.exit(1)
 
 print("\n" + "=" * 50)
-print("🚀 БОТ ЗАПУЩЕН (ФИНАЛЬНАЯ ВЕРСИЯ С DUCKDUCKGO)")
+print("🚀 БОТ ЗАПУЩЕН (СТАБИЛЬНАЯ ВЕРСИЯ)")
 print("=" * 50)
 print(f"  🤖 TELEGRAM_TOKEN: {'✅' if TELEGRAM_TOKEN else '❌'}")
 print(f"  🔑 DEEPSEEK_API_KEY: {'✅' if DEEPSEEK_API_KEY else '❌'}")
@@ -99,8 +91,8 @@ print(f"  💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН (TTL: 
 print(f"  💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
 print(f"  🕐 Поиск по дате и времени: ВКЛЮЧЕН")
 print(f"  💾 Сохранение черновиков (до отправки): ВКЛЮЧЕНО")
+print(f"  🔍 Расширенные триггеры для интернет-поиска: ВКЛЮЧЕНЫ")
 print(f"  🔍 Команда 'бро' принудительно включает интернет-поиск")
-print(f"  🦆 Fallback-поиск через DuckDuckGo: {'✅ ДОСТУПЕН' if DDGS_AVAILABLE else '❌ НЕДОСТУПЕН'}")
 print("=" * 50 + "\n")
 
 os.makedirs("data", exist_ok=True)
@@ -640,7 +632,7 @@ def search_in_pyramid(user_id, query):
     return results[:15]
 
 # ============================================================
-# УЛУЧШЕННЫЙ АНАЛИЗАТОР СООБЩЕНИЙ (РАСШИРЕННЫЕ ТРИГГЕРЫ)
+# РАСШИРЕННЫЙ АНАЛИЗАТОР (БЕЗ DUCKDUCKGO)
 # ============================================================
 
 async def analyze_message(user_id, user_message):
@@ -667,7 +659,7 @@ async def analyze_message(user_id, user_message):
         if trigger in q:
             return {"type": "memory_query", "action": "memory_search", "needs_search": False, "needs_memory": True}
     
-    # ===== РАСШИРЕННЫЕ ТРИГГЕРЫ ДЛЯ ИНТЕРНЕТ-ПОИСКА =====
+    # Расширенные триггеры для интернет-поиска
     internet_triggers = [
         'в интернете', 'найди в интернете', 'проверь в интернете',
         'актуализируй', 'актуализируйте', 'обнови', 'обновить',
@@ -681,9 +673,8 @@ async def analyze_message(user_id, user_message):
     for trigger in internet_triggers:
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
-    # =========================================================
     
-    # Динамичные темы (требуют интернета)
+    # Динамичные темы
     dynamic_triggers = [
         'погод', 'температур', 'дожд', 'снег', 'ветер', 'градус',
         'курс', 'доллар', 'евро', 'юань', 'биткоин',
@@ -694,7 +685,7 @@ async def analyze_message(user_id, user_message):
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
     
-    # Инструкции (требуют интернета)
+    # Инструкции
     instructional_triggers = ['как ', 'как сделать', 'как настроить', 'как установить', 'инструкция', 'руководство']
     for trigger in instructional_triggers:
         if trigger in q:
@@ -703,7 +694,7 @@ async def analyze_message(user_id, user_message):
     return {"type": "static", "action": "memory", "needs_search": False, "needs_memory": True}
 
 # ============================================================
-# ПОИСКОВЫЕ ФУНКЦИИ (APISERPENT + FALLBACK DUCKDUCKGO)
+# ПОИСК ЧЕРЕЗ APISERPENT
 # ============================================================
 
 def search_apiserpent(query):
@@ -714,7 +705,7 @@ def search_apiserpent(query):
             "https://apiserpent.com/api/search",
             params={"q": query, "engine": "google", "num": 5},
             headers={"X-API-Key": APISERPENT_API_KEY},
-            timeout=45  # увеличено с 30 до 45 секунд
+            timeout=30
         )
         if response.status_code != 200:
             return []
@@ -748,34 +739,6 @@ def search_apiserpent(query):
     except Exception as e:
         print(f"❌ Ошибка поиска APISerpent: {e}")
         return []
-
-def search_duckduckgo(query):
-    """Fallback-поиск через DuckDuckGo (бесплатно, без ключа)"""
-    if not DDGS_AVAILABLE:
-        return []
-    try:
-        with DDGS() as ddgs:
-            results = []
-            # Используем text() для получения результатов
-            for r in ddgs.text(query, max_results=3):
-                if isinstance(r, dict):
-                    results.append({
-                        "title": r.get("title", "Без названия")[:150],
-                        "snippet": r.get("body", "Нет описания")[:250],
-                        "link": r.get("href", "#")[:150]
-                    })
-            return results
-    except Exception as e:
-        print(f"⚠️ Ошибка DuckDuckGo поиска: {e}")
-        return []
-
-def search_combined(query):
-    """Сначала APISerpent, если пусто — DuckDuckGo"""
-    results = search_apiserpent(query)
-    if results:
-        return results
-    print("🔄 APISerpent не дал результатов, пробуем DuckDuckGo...")
-    return search_duckduckgo(query)
 
 # ============================================================
 # ЗАПРОС К DEEPSEEK
@@ -832,12 +795,12 @@ async def ask_deepseek(messages, retries=3, max_tokens=None):
     return None, "max_retries"
 
 # ============================================================
-# ГЕНЕРАЦИЯ ОТВЕТА (С УЛУЧШЕННЫМ СООБЩЕНИЕМ ПРИ ПУСТОМ ПОИСКЕ)
+# ГЕНЕРАЦИЯ ОТВЕТА (С ПРИОРИТЕТОМ ИНТЕРНЕТА НАД ДАТОЙ)
 # ============================================================
 
 async def generate_response(user_id, user_message, analysis_result, history, profile):
     action = analysis_result.get("action", "memory")
-    source = "🧠 из модели"
+    source = "🧠 из模型"
     
     if action == "confirm":
         return "✅ Понял! Продолжаем.", False, None
@@ -854,9 +817,46 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 return value, False, None
         return "👋 Привет! Чем могу помочь?", False, None
     
-    # Поиск по дате
+    # ===== СНАЧАЛА ИНТЕРНЕТ-ПОИСК (ЕСЛИ ТРЕБУЕТСЯ) =====
+    if action == "internet":
+        results = search_apiserpent(user_message)
+        if not results:
+            # Если поиск не дал результатов, отвечаем из модели
+            history.append({"role": "user", "content": user_message})
+            messages = [{"role": "system", "content": f"Сегодня: {CURRENT_DATE} {CURRENT_TIME}. Ты — полезный ассистент. Отвечай на вопросы, используя свои знания."}] + history
+            answer, err_code = await ask_deepseek(messages)
+            if err_code:
+                return f"⚠️ {analyze_error(err_code)}", False, None
+            source = "🧠 из модели (интернет ничего не дал)"
+            return answer, True, source
+        
+        search_text = f"🔍 Результаты поиска:\n\n"
+        for i, r in enumerate(results[:5], 1):
+            search_text += f"{i}. **{r['title']}**\n   {r['snippet'][:200]}\n   🔗 {r['link']}\n\n"
+        
+        search_prompt = {
+            "role": "system",
+            "content": f"""Сегодня: {CURRENT_DATE} {CURRENT_TIME}.
+
+Вопрос пользователя: "{user_message}"
+
+{search_text}
+
+ОТВЕЧАЙ ТОЛЬКО НА ОСНОВЕ НАЙДЕННЫХ ДАННЫХ.
+Если вопрос короткий — ответь кратко."""
+        }
+        
+        history.append({"role": "user", "content": user_message})
+        messages = [search_prompt] + history
+        answer, err_code = await ask_deepseek(messages)
+        if err_code:
+            return f"⚠️ {analyze_error(err_code)}", False, None
+        source = "🌐 из интернета"
+        return answer, True, source
+    
+    # ===== ПОИСК ПО ДАТЕ (ЕСЛИ ИНТЕРНЕТ НЕ НУЖЕН) =====
     date_match = re.search(r'\b(сегодня|вчера|завтра|\d{2}\.\d{2}(\.\d{4})?|\d{4}-\d{2}-\d{2})\b', user_message, re.IGNORECASE)
-    if date_match and not user_message.lower().startswith("бро"):
+    if date_match:
         date_query = date_match.group(1)
         date_str = parse_date_query(date_query)
         if date_str:
@@ -871,9 +871,9 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                     answer += f"\n... и ещё {len(date_results)-10} сообщений"
                 return answer, False, "📂 из памяти (по дате)"
     
-    # Поиск по времени
+    # ===== ПОИСК ПО ВРЕМЕНИ =====
     time_match = re.search(r'(\d{1,2}:\d{2}(:\d{2})?)', user_message)
-    if time_match and not user_message.lower().startswith("бро"):
+    if time_match:
         time_str = time_match.group(1)
         time_results = search_by_time(user_id, time_str)
         if time_results:
@@ -886,7 +886,7 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 answer += f"\n... и ещё {len(time_results)-5} сообщений"
             return answer, False, "📂 из памяти (по времени)"
     
-    # Системный промпт
+    # ===== ОБЫЧНЫЙ ОТВЕТ ИЗ МОДЕЛИ =====
     system_parts = []
     for key, value in profile.items():
         if key.startswith("last_check_") or key.startswith("update_history_"):
@@ -909,69 +909,7 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         system_prompt = system_prompt[:800] + "..."
     
     system_msg = {"role": "system", "content": system_prompt}
-    
-    user_message_with_date = f"[Сегодня: {CURRENT_DATE} {CURRENT_TIME}]\n\n{user_message}"
-    
-    if action == "memory_search":
-        memory_results = search_in_pyramid(user_id, user_message)
-        if memory_results:
-            memory_text = "\n".join(memory_results[:10])
-            prompt = {
-                "role": "system",
-                "content": f"Нашёл в истории:\n{memory_text}\n\nОтветь кратко на вопрос."
-            }
-            history.append({"role": "user", "content": user_message_with_date})
-            messages = [system_msg, prompt] + history
-            answer, err_code = await ask_deepseek(messages)
-            if err_code:
-                return f"⚠️ {analyze_error(err_code)}", False, None
-            source = "📂 из памяти"
-            return answer, True, source
-        else:
-            history.append({"role": "user", "content": user_message_with_date})
-            messages = [system_msg] + history
-            answer, err_code = await ask_deepseek(messages)
-            if err_code:
-                return f"⚠️ {analyze_error(err_code)}", False, None
-            source = "🧠 из модели (память не найдена)"
-            return answer, True, source
-    
-    if action == "internet":
-        # Используем комбинированный поиск (APISerpent + DuckDuckGo)
-        results = search_combined(user_message)
-        if not results:
-            # Если поиск вообще ничего не дал
-            history.append({"role": "user", "content": user_message_with_date})
-            messages = [system_msg] + history
-            answer, err_code = await ask_deepseek(messages)
-            if err_code:
-                return f"⚠️ {analyze_error(err_code)}", False, None
-            source = "🧠 из модели (интернет ничего не дал)"
-            return answer, True, source
-        
-        search_text = f"🔍 Результаты поиска:\n\n"
-        for i, r in enumerate(results[:5], 1):
-            search_text += f"{i}. **{r['title']}**\n   {r['snippet'][:200]}\n   🔗 {r['link']}\n\n"
-        
-        search_prompt = {
-            "role": "system",
-            "content": f"""Вопрос пользователя: "{user_message}"
-
-{search_text}
-
-ОТВЕЧАЙ ТОЛЬКО НА ОСНОВЕ НАЙДЕННЫХ ДАННЫХ.
-Если вопрос короткий — ответь кратко."""
-        }
-        
-        history.append({"role": "user", "content": user_message_with_date})
-        messages = [system_msg, search_prompt] + history
-        answer, err_code = await ask_deepseek(messages)
-        if err_code:
-            return f"⚠️ {analyze_error(err_code)}", False, None
-        source = "🌐 из интернета"
-        return answer, True, source
-    
-    history.append({"role": "user", "content": user_message_with_date})
+    history.append({"role": "user", "content": user_message})
     messages = [system_msg] + history
     answer, err_code = await ask_deepseek(messages)
     if err_code:
@@ -1005,8 +943,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 📗 1 000 000+ сообщений (суть)\n\n"
         "🕐 **Я запоминаю время каждого сообщения!**\n"
         "📂 **В каждом ответе я указываю источник:**\n"
-        "   • 📂 из памяти — ответ из профиля или истории\n"
-        "   • 🌐 из интернета — найден через APISerpent или DuckDuckGo\n"
+        "   • 📂 из памяти — ответ из профиля или historii\n"
+        "   • 🌐 из интернета — найден через APISerpent\n"
         "   • 🧠 из модели — сгенерирован DeepSeek\n\n"
         "🔍 **Я сам ищу сообщения по дате и времени!**\n"
         "   • Просто спроси: «что я писал вчера?» или «покажи 14.07.2026»\n"
@@ -1018,8 +956,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/memory [текст]` — поиск в памяти\n"
         "• `/forget` — забыть всё\n"
         "• `/restore` — восстановить из бэкапа\n\n"
-        "🔍 **Принудительный поиск:** `бро погода`\n"
-        "🦆 **Если APISerpent не отвечает, я попробую поискать через DuckDuckGo.**"
+        "🔍 **Принудительный поиск:** `бро погода`"
     )
 
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1348,14 +1285,14 @@ if __name__ == "__main__":
     app.add_error_handler(error_handler)
     
     print("=" * 50)
-    print("✅ БОТ ЗАПУЩЕН (ФИНАЛЬНАЯ ВЕРСИЯ С DUCKDUCKGO)")
+    print("✅ БОТ ЗАПУЩЕН (СТАБИЛЬНАЯ ВЕРСИЯ)")
     print(f"📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
     print(f"💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН (TTL: {CACHE_TTL} сек, макс. {MAX_CACHE_ITEMS} записей)")
     print(f"💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
     print(f"🕐 Поиск по дате и времени: ВКЛЮЧЕН")
     print(f"💾 Сохранение черновиков (до отправки): ВКЛЮЧЕНО")
+    print(f"🔍 Расширенные триггеры для интернет-поиска: ВКЛЮЧЕНЫ")
     print(f"🔍 Команда 'бро' принудительно включает интернет-поиск")
-    print(f"🦆 Fallback-поиск через DuckDuckGo: {'✅ ДОСТУПЕН' if DDGS_AVAILABLE else '❌ НЕДОСТУПЕН'}")
     print(f"👥 Разрешённых пользователей: {len(ALLOWED_USERS_LIST)}")
     print("=" * 50)
     
