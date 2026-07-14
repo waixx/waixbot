@@ -79,7 +79,7 @@ if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     sys.exit(1)
 
 print("\n" + "=" * 50)
-print("🚀 БОТ ЗАПУЩЕН (СТАБИЛЬНАЯ ВЕРСИЯ)")
+print("🚀 БОТ ЗАПУЩЕН (ФИНАЛЬНАЯ СТАБИЛЬНАЯ ВЕРСИЯ)")
 print("=" * 50)
 print(f"  🤖 TELEGRAM_TOKEN: {'✅' if TELEGRAM_TOKEN else '❌'}")
 print(f"  🔑 DEEPSEEK_API_KEY: {'✅' if DEEPSEEK_API_KEY else '❌'}")
@@ -89,7 +89,7 @@ print(f"  👥 Разрешённых пользователей: {len(ALLOWED_U
 print(f"  📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
 print(f"  💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН (TTL: {CACHE_TTL} сек, макс. {MAX_CACHE_ITEMS} записей)")
 print(f"  💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
-print(f"  🕐 Поиск по дате и времени: ВКЛЮЧЕН")
+print(f"  🕐 Дата и время: ОТВЕЧАЮ ЛОКАЛЬНО (без интернета)")
 print(f"  💾 Сохранение черновиков (до отправки): ВКЛЮЧЕНО")
 print(f"  🔍 Расширенные триггеры для интернет-поиска: ВКЛЮЧЕНЫ")
 print(f"  🔍 Команда 'бро' принудительно включает интернет-поиск")
@@ -632,7 +632,7 @@ def search_in_pyramid(user_id, query):
     return results[:15]
 
 # ============================================================
-# РАСШИРЕННЫЙ АНАЛИЗАТОР (БЕЗ DUCKDUCKGO)
+# АНАЛИЗАТОР СООБЩЕНИЙ (С ЛОКАЛЬНЫМИ ДАТОЙ/ВРЕМЕНЕМ)
 # ============================================================
 
 async def analyze_message(user_id, user_message):
@@ -659,6 +659,16 @@ async def analyze_message(user_id, user_message):
         if trigger in q:
             return {"type": "memory_query", "action": "memory_search", "needs_search": False, "needs_memory": True}
     
+    # ===== ЗАПРОСЫ ДАТЫ И ВРЕМЕНИ (ОТВЕЧАЕМ ЛОКАЛЬНО) =====
+    date_time_triggers = [
+        'какая дата', 'какое сегодня число', 'сегодняшняя дата', 'какой сегодня день',
+        'который час', 'сколько времени', 'текущее время', 'сейчас время',
+        'дата сегодня', 'время сейчас'
+    ]
+    for trigger in date_time_triggers:
+        if trigger in q:
+            return {"type": "date_time", "action": "date_time", "needs_search": False, "needs_memory": False}
+    
     # Расширенные триггеры для интернет-поиска
     internet_triggers = [
         'в интернете', 'найди в интернете', 'проверь в интернете',
@@ -674,18 +684,18 @@ async def analyze_message(user_id, user_message):
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
     
-    # Динамичные темы
+    # Динамичные темы (требуют интернета) — БЕЗ слов времени и даты
     dynamic_triggers = [
         'погод', 'температур', 'дожд', 'снег', 'ветер', 'градус',
         'курс', 'доллар', 'евро', 'юань', 'биткоин',
         'новост', 'событи', 'происшеств', 'авар', 'выбор', 'кризис', 'войн',
-        'врем', 'час', 'минут', 'дата', 'сегодня', 'завтра', 'вчера', 'сейчас', 'на этой неделе'
+        'сегодня', 'завтра', 'вчера', 'сейчас', 'на этой неделе'
     ]
     for trigger in dynamic_triggers:
         if trigger in q:
             return {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
     
-    # Инструкции
+    # Инструкции (требуют интернета)
     instructional_triggers = ['как ', 'как сделать', 'как настроить', 'как установить', 'инструкция', 'руководство']
     for trigger in instructional_triggers:
         if trigger in q:
@@ -800,7 +810,7 @@ async def ask_deepseek(messages, retries=3, max_tokens=None):
 
 async def generate_response(user_id, user_message, analysis_result, history, profile):
     action = analysis_result.get("action", "memory")
-    source = "🧠 из模型"
+    source = "🧠 из модели"
     
     if action == "confirm":
         return "✅ Понял! Продолжаем.", False, None
@@ -817,13 +827,38 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 return value, False, None
         return "👋 Привет! Чем могу помочь?", False, None
     
+    if action == "date_time":
+        weekdays = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
+        weekday = weekdays[NOW.weekday()]
+        answer = f"📅 Сегодня: {CURRENT_DATE} ({weekday})\n🕐 Текущее время: {CURRENT_TIME}"
+        return answer, False, "📂 локально"
+    
     # ===== СНАЧАЛА ИНТЕРНЕТ-ПОИСК (ЕСЛИ ТРЕБУЕТСЯ) =====
     if action == "internet":
         results = search_apiserpent(user_message)
         if not results:
-            # Если поиск не дал результатов, отвечаем из модели
+            # Если поиск не дал результатов, отвечаем из модели с учётом профиля
+            system_parts = []
+            for key, value in profile.items():
+                if key.startswith("last_check_") or key.startswith("update_history_"):
+                    continue
+                if key in ["level_2", "level_3", "level_4", "level_5", "answer_cache"]:
+                    continue
+                if isinstance(value, list):
+                    if value:
+                        system_parts.append(f"{key}: {', '.join(str(v)[:50] for v in value[:3])}")
+                else:
+                    system_parts.append(f"{key}: {str(value)[:50]}")
+            if profile.get("level_2"):
+                system_parts.append(f"📚 1000: {', '.join(profile['level_2'][-10:])}")
+            if profile.get("level_3"):
+                system_parts.append(f"📖 10000: {', '.join(profile['level_3'][-5:])}")
+            system_prompt = ". ".join(system_parts)
+            if len(system_prompt) > 800:
+                system_prompt = system_prompt[:800] + "..."
+            system_msg = {"role": "system", "content": f"Сегодня: {CURRENT_DATE} {CURRENT_TIME}. {system_prompt}"}
             history.append({"role": "user", "content": user_message})
-            messages = [{"role": "system", "content": f"Сегодня: {CURRENT_DATE} {CURRENT_TIME}. Ты — полезный ассистент. Отвечай на вопросы, используя свои знания."}] + history
+            messages = [system_msg] + history
             answer, err_code = await ask_deepseek(messages)
             if err_code:
                 return f"⚠️ {analyze_error(err_code)}", False, None
@@ -908,7 +943,7 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
     if len(system_prompt) > 800:
         system_prompt = system_prompt[:800] + "..."
     
-    system_msg = {"role": "system", "content": system_prompt}
+    system_msg = {"role": "system", "content": f"Сегодня: {CURRENT_DATE} {CURRENT_TIME}. {system_prompt}"}
     history.append({"role": "user", "content": user_message})
     messages = [system_msg] + history
     answer, err_code = await ask_deepseek(messages)
@@ -941,9 +976,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 📖 10000 сообщений (сжато)\n"
         "• 📕 100000 сообщений (сжато)\n"
         "• 📗 1 000 000+ сообщений (суть)\n\n"
-        "🕐 **Я запоминаю время каждого сообщения!**\n"
+        "🕐 **Дату и время я отвечаю точно (локально, без интернета).**\n"
         "📂 **В каждом ответе я указываю источник:**\n"
-        "   • 📂 из памяти — ответ из профиля или historii\n"
+        "   • 📂 из памяти — ответ из профиля или истории\n"
         "   • 🌐 из интернета — найден через APISerpent\n"
         "   • 🧠 из модели — сгенерирован DeepSeek\n\n"
         "🔍 **Я сам ищу сообщения по дате и времени!**\n"
@@ -1157,10 +1192,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not search_query:
             await update.message.reply_text("❌ Напиши, что искать после 'бро'.")
             return
-        # Подменяем сообщение на то, что ищем
         user_message = search_query
         analysis_result = {"type": "dynamic", "action": "internet", "needs_search": True, "needs_memory": False}
-        # Пропускаем обычный анализ
         history = load_memory(user_id)
         profile = get_profile_cached(user_id)
         answer, should_save, source = await generate_response(user_id, user_message, analysis_result, history, profile)
@@ -1285,11 +1318,11 @@ if __name__ == "__main__":
     app.add_error_handler(error_handler)
     
     print("=" * 50)
-    print("✅ БОТ ЗАПУЩЕН (СТАБИЛЬНАЯ ВЕРСИЯ)")
+    print("✅ БОТ ЗАПУЩЕН (ФИНАЛЬНАЯ СТАБИЛЬНАЯ ВЕРСИЯ)")
     print(f"📊 Память: 80 → 1000 → 10000 → 100000 → 1 000 000+")
     print(f"💾 Гибридный кэш (RAM + файл): ВКЛЮЧЕН (TTL: {CACHE_TTL} сек, макс. {MAX_CACHE_ITEMS} записей)")
     print(f"💾 Авто-бэкап: ВКЛЮЧЕН (каждые 10 сообщений)")
-    print(f"🕐 Поиск по дате и времени: ВКЛЮЧЕН")
+    print(f"🕐 Дата и время: ОТВЕЧАЮ ЛОКАЛЬНО (без интернета)")
     print(f"💾 Сохранение черновиков (до отправки): ВКЛЮЧЕНО")
     print(f"🔍 Расширенные триггеры для интернет-поиска: ВКЛЮЧЕНЫ")
     print(f"🔍 Команда 'бро' принудительно включает интернет-поиск")
