@@ -1,6 +1,7 @@
 # ============================================================
 #  BroWaix Bot — максимально защищённая версия
 #  Принципы: не врать, точные ответы, не терять память
+#  + Автоматическое восстановление из бэкапов при старте
 # ============================================================
 import logging
 import os
@@ -657,7 +658,6 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {lab}: {len(p.get(k, []))} пунктов")
     lines.append(f"• 📝 активная история: {len(load_memory_raw(uid))} сообщений")
     lines.append("\n👤 **Личное:**")
-    # Исключаем служебные ключи и уровни памяти
     exclude = {'updated', 'level_2', 'level_3', 'level_4', 'level_5'}
     personal_keys = [k for k in p.keys() if k not in exclude]
     if personal_keys:
@@ -754,6 +754,48 @@ async def check_rate_limit(uid):
             if not request_count[u]: del request_count[u]
         return True
 
+# ---------- АВТОМАТИЧЕСКОЕ ВОССТАНОВЛЕНИЕ ПРИ СТАРТЕ ----------
+async def auto_restore_all_users():
+    """При запуске восстанавливает профиль и память из последних бэкапов для всех пользователей,
+    если основные файлы отсутствуют или пусты."""
+    logger.info("🔄 Проверка данных при старте...")
+    backup_files = os.listdir(BACKUP_DIR)
+    user_ids = set()
+    for fname in backup_files:
+        parts = fname.split('_')
+        if len(parts) >= 2 and parts[0] in ('profile', 'memory'):
+            try:
+                uid = int(parts[1])
+                user_ids.add(uid)
+            except ValueError:
+                continue
+
+    if not user_ids:
+        logger.info("✅ Нет пользователей для восстановления.")
+        return
+
+    for uid in user_ids:
+        mem_path = memory_path(uid)
+        prof_path = profile_path(uid)
+        need_restore = False
+
+        mem_data = atomic_read(mem_path, default=None)
+        if mem_data is None or (isinstance(mem_data, list) and len(mem_data) == 0):
+            need_restore = True
+
+        prof_data = atomic_read(prof_path, default=None)
+        if prof_data is None or (isinstance(prof_data, dict) and len(prof_data) == 0):
+            need_restore = True
+
+        if need_restore:
+            logger.info(f"🔄 Восстанавливаю данные для пользователя {uid} из бэкапов...")
+            profile_restored = await restore_backup(uid, "profile")
+            memory_restored = await restore_backup(uid, "memory")
+            if profile_restored or memory_restored:
+                logger.info(f"✅ Пользователь {uid} восстановлен (профиль: {profile_restored}, память: {memory_restored})")
+            else:
+                logger.warning(f"⚠️ Для пользователя {uid} бэкапов не найдено.")
+
 # ---------- ГЛАВНЫЙ ОБРАБОТЧИК ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user is None or update.effective_message is None:
@@ -776,7 +818,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("awaiting_internet_confirm"):
         if user_message.lower() in ("да", "нет", "д", "н", "yes", "no"):
             if user_message.lower() in ("да", "д", "yes"):
-                # Пользователь согласился — выполняем поиск
                 context.user_data["awaiting_internet_confirm"] = False
                 query = context.user_data.get("pending_query")
                 analysis = context.user_data.get("pending_analysis")
@@ -801,7 +842,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data.pop("pending_analysis", None)
                 return
             else:
-                # Пользователь отказался — отвечаем без интернета
                 context.user_data["awaiting_internet_confirm"] = False
                 query = context.user_data.get("pending_query")
                 analysis = context.user_data.get("pending_analysis")
@@ -826,7 +866,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data.pop("pending_analysis", None)
                 return
         else:
-            # Если ожидается подтверждение, а пользователь пишет что-то другое
             await safe_reply(update, "❓ Напишите «да» или «нет» — я продолжу.")
             return
 
@@ -865,10 +904,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_message = sq
         force_internet = True
 
-    # Анализ сообщения
     analysis = await analyze_message(user_message)
 
-    # Если принудительный поиск — сразу идём в интернет
     if force_internet:
         analysis["action"] = "internet"
         status_msg = await update.effective_message.reply_text("🌐 Ищу информацию в интернете...")
@@ -890,7 +927,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, answer)
         return
 
-    # Если анализ говорит, что нужен интернет — запрашиваем подтверждение
     if analysis.get("action") == "internet":
         context.user_data["awaiting_internet_confirm"] = True
         context.user_data["pending_query"] = user_message
@@ -898,7 +934,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, "🔍 Я могу поискать в интернете по вашему запросу. Напишите «да» или «нет».")
         return
 
-    # В остальных случаях (memory, date_time, confirm, greeting) — обычная генерация
     history = load_memory(uid)
     profile = load_profile(uid)
     answer, should_save, source = await generate_response(uid, user_message, analysis, history, profile)
@@ -931,6 +966,13 @@ async def shutdown_session():
 
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
+    # 1. Автоматическое восстановление при старте
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(auto_restore_all_users())
+    loop.close()
+
+    # 2. Запуск бота
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile_command))
