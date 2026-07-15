@@ -554,30 +554,103 @@ async def generate_response(uid, user_message, analysis, history, profile):
         return f"📅 Сегодня: {get_current_date()} ({wd})\n🕐 Время: {get_current_time()}", False, "📂 локально"
 
     if action == "internet":
-        results = await search_apiserpent_async(user_message)
         ctx = build_profile_context(profile)
-        if not results:
+        logger.info(f"🔍 Поиск по оригинальному запросу: {user_message}")
+        results_original = await search_apiserpent_async(user_message)
+
+        # Первый поиск: оригинальный запрос
+        all_results = results_original[:]
+        seen = set(res.get('link') for res in all_results if res.get('link'))
+
+        # Если результатов меньше порога, пробуем второй (оптимизированный) запрос
+        if len(all_results) < SEARCH_THRESHOLD:
+            logger.info("📭 Мало результатов, пробуем оптимизированный запрос...")
+            optimized = await rephrase_query(user_message)
+            if optimized and optimized != user_message:
+                results_optimized = await search_apiserpent_async(optimized)
+                for res in results_optimized:
+                    link = res.get('link')
+                    if link and link not in seen:
+                        seen.add(link)
+                        all_results.append(res)
+                logger.info(f"✅ После 2-го поиска: {len(all_results)} уникальных результатов")
+            else:
+                logger.info("⏭ Переформулировка не дала нового запроса")
+
+        # Если всё ещё меньше порога, пробуем третий (краткий) запрос
+        if len(all_results) < SEARCH_THRESHOLD:
+            logger.info("📭 Всё ещё мало результатов, пробуем краткий запрос...")
+            short = await simplify_query(user_message)
+            if short and short != user_message and short != optimized:
+                results_short = await search_apiserpent_async(short)
+                for res in results_short:
+                    link = res.get('link')
+                    if link and link not in seen:
+                        seen.add(link)
+                        all_results.append(res)
+                logger.info(f"✅ После 3-го поиска: {len(all_results)} уникальных результатов")
+            else:
+                logger.info("⏭ Краткий запрос не отличается, пропускаем")
+
+        if not all_results:
+            # Если ничего не найдено — отвечаем из знаний
             sysmsg = {"role": "system", "content":
                 f"{CORE_SYSTEM_RULE}\nСегодня: {get_current_date()} {get_current_time()}. {ctx}\n"
-                f"ВАЖНО: интернет-поиск не дал результатов. Если вопрос о текущих данных — "
-                f"честно скажи, что не можешь проверить, и НЕ выдумывай."}
+                f"ВАЖНО: интернет-поиск не дал результатов. "
+                f"Честно скажи, что не можешь проверить, и НЕ выдумывай."}
             history.append({"role": "user", "content": user_message})
             ans, err = await ask_deepseek([sysmsg] + history)
             if err: return f"⚠️ {analyze_error(err)}", False, None
             return (f"🔍 **Искал в интернете:** `{user_message}`\n\n"
-                    f"❌ Ничего не найдено. Уточните запрос (например: 'бро погода в Москве').\n\n"
-                    f"🧠 Ответ из знаний модели (может быть неактуален):\n{ans}"), True, "🧠 из модели (поиск пуст)"
-        stext = f"🔍 **Искал:** `{user_message}`\n\n📊 Найдено {len(results)}:\n\n"
-        for i, r in enumerate(results, 1):
+                    f"❌ Ничего не найдено. Попробуйте другие ключевые слова.\n\n"
+                    f"🧠 Ответ из знаний модели:\n{ans}"), True, "🧠 из модели (поиск пуст)"
+
+        # --- ОБРАБОТКА РЕЗУЛЬТАТОВ ---
+        # 1. Фильтруем слишком короткие сниппеты (менее 30 символов)
+        filtered_results = [r for r in all_results if len(r.get('snippet', '')) > 30]
+        if not filtered_results:
+            filtered_results = all_results  # если все короткие — оставляем как есть
+
+        # 2. Ранжируем по релевантности
+        keywords = set(user_message.lower().split())
+        stop_words = {'как', 'чтобы', 'для', 'при', 'на', 'в', 'и', 'не', 'через', 'vpn', 'бро', 'телеграм'}
+        keywords = {w for w in keywords if w not in stop_words and len(w) > 2}
+
+        def rank_result(res):
+            score = 0
+            text = (res.get('title', '') + ' ' + res.get('snippet', '')).lower()
+            for kw in keywords:
+                if kw in text:
+                    score += 1
+            return score
+
+        filtered_results.sort(key=rank_result, reverse=True)
+
+        # Берём топ-8 результатов (экономия токенов)
+        top_results = filtered_results[:8]
+
+        # Формируем текст для модели
+        stext = f"🔍 **Искал:** `{user_message}`\n\n📊 Найдено {len(top_results)} наиболее релевантных результатов:\n\n"
+        for i, r in enumerate(top_results, 1):
             stext += f"{i}. **{r['title']}**\n   {r['snippet'][:200]}\n   🔗 {r['link']}\n\n"
+
+        # Улучшенный системный промпт
         sp = {"role": "system", "content":
             f"{CORE_SYSTEM_RULE}\nСегодня: {get_current_date()} {get_current_time()}.\n"
-            f'Вопрос: "{user_message}"\n\n{stext}\nОТВЕЧАЙ ТОЛЬКО ПО НАЙДЕННЫМ ДАННЫМ. Мало данных — скажи прямо.'}
+            f'Вопрос пользователя: "{user_message}"\n'
+            f"Контекст профиля: {ctx}\n\n"
+            f"Найденные данные:\n{stext}\n"
+            f"ИНСТРУКЦИЯ:\n"
+            f"1. ОТВЕЧАЙ ТОЛЬКО НА ОСНОВЕ НАЙДЕННЫХ ДАННЫХ.\n"
+            f"2. Если в найденных данных есть конкретная инструкция — дай её пошагово.\n"
+            f"3. Если данных недостаточно для точного ответа — скажи честно, что знаешь только это, и предложи уточнить.\n"
+            f"4. Структурируй ответ: используй заголовки, списки, выделение важного.\n"
+            f"5. В конце укажи источники (ссылки).\n"
+            f"6. Если вопрос требует актуальных данных, а они могут устареть — предупреди."}
         history.append({"role": "user", "content": user_message})
         ans, err = await ask_deepseek([sp] + history)
         if err: return f"⚠️ {analyze_error(err)}", False, None
         return f"🔍 **Искал в интернете:** `{user_message}`\n\n{ans}", True, "🌐 из интернета"
-
     # поиск по дате
     dm = re.search(r'\b(сегодня|вчера|завтра|\d{2}\.\d{2}(\.\d{4})?|\d{4}-\d{2}-\d{2})\b', user_message, re.I)
     if dm:
