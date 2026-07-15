@@ -104,6 +104,15 @@ BACKUP_INTERVAL: int = 10  # каждые 10 сообщений
 INACTIVITY_TIMEOUT: int = 600  # 10 минут
 CLEANUP_INTERVAL: int = 3600  # 1 час
 
+def is_peak_hour() -> bool:
+    hour = now().hour
+    return any(start <= hour < end for start, end in PEAK_HOURS)
+
+def get_peak_status() -> str:
+    if is_peak_hour():
+        return "⚠️ Сейчас пиковые часы DeepSeek (9:00–12:00, 14:00–18:00) — стоимость API удвоена."
+    return "✅ Сейчас непиковые часы DeepSeek — стандартная стоимость."
+
 if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     logger.error("TELEGRAM_TOKEN или DEEPSEEK_API_KEY не заданы")
     sys.exit(1)
@@ -494,7 +503,6 @@ async def analyze_message(user_id: int, user_message: str) -> Dict[str, Any]:
     if any(t in q for t in memory_triggers):
         return {"action": "memory"}
 
-    # Объединённый список дат/времён
     date_time_keywords = {
         'дата', 'время', 'число', 'который час', 'сколько времени',
         'какая дата', 'какое сегодня число', 'какой сегодня день', 'текущее время'
@@ -1010,6 +1018,11 @@ async def shutdown_session() -> None:
 
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
+    # Создаём event loop вручную
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Строим приложение
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile_command))
@@ -1020,12 +1033,13 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    # Запускаем фоновые задачи
-    cleanup_task = asyncio.create_task(clean_request_count())
-    lock_cleanup_task = asyncio.create_task(clean_user_locks())
+    # Создаём фоновые задачи в текущем loop
+    cleanup_task = loop.create_task(clean_request_count())
+    lock_cleanup_task = loop.create_task(clean_user_locks())
 
     logger.info("✅ БОТ ЗАПУЩЕН. Готов к работе.")
     try:
+        # Запускаем бота (он будет использовать текущий loop)
         app.run_polling()
     except KeyboardInterrupt:
         logger.info("👋 Бот остановлен пользователем")
@@ -1033,8 +1047,10 @@ if __name__ == "__main__":
         # Отменяем фоновые задачи
         cleanup_task.cancel()
         lock_cleanup_task.cancel()
+        # Закрываем HTTP-сессию (если она создана)
         if _http_session and not _http_session.closed:
             try:
-                asyncio.run(shutdown_session())
+                loop.run_until_complete(shutdown_session())
             except Exception as e:
                 logger.error(f"Ошибка при закрытии сессии: {e}")
+        loop.close()
