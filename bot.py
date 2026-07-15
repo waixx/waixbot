@@ -754,18 +754,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(user_message) > 3500:
         user_message = user_message[:3500] + "... (обрезано)"
 
-    # запоминание
+    # запоминание (с проверкой сохранения)
     if user_message.lower().startswith("запомни "):
         text = user_message[8:].strip()
         async with get_user_lock(uid):
             p = load_profile(uid)
             if ":" in text:
                 k, v = text.split(":", 1)
-                p[k.strip()] = v.strip(); save_profile(uid, p)
-                await safe_reply(update, f"✅ Запомнил: {k.strip()} = {v.strip()}")
+                k, v = k.strip(), v.strip()
+                p[k] = v
+                if save_profile(uid, p):
+                    await safe_reply(update, f"✅ Запомнил: {k} = {v}")
+                else:
+                    await safe_reply(update, "❌ Не удалось сохранить. Проверьте права на запись в папку data/.")
             else:
-                p.setdefault("факты", []).append(text); save_profile(uid, p)
-                await safe_reply(update, f"✅ Запомнил факт: {text}")
+                p.setdefault("факты", []).append(text)
+                if save_profile(uid, p):
+                    await safe_reply(update, f"✅ Запомнил факт: {text}")
+                else:
+                    await safe_reply(update, "❌ Не удалось сохранить факт. Проверьте права на запись.")
         return
 
     # принудительный поиск
