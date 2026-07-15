@@ -76,6 +76,8 @@ MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-v4-flash")
 MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
+SEARCH_RESULTS_NUM = int(os.getenv("SEARCH_RESULTS_NUM", "15"))
+SEARCH_THRESHOLD = int(os.getenv("SEARCH_THRESHOLD", "3"))
 MODEL_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", "0.1"))
 
 CORE_SYSTEM_RULE = (
