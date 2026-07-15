@@ -644,10 +644,14 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {lab}: {len(p.get(k, []))} пунктов")
     lines.append(f"• 📝 активная история: {len(load_memory_raw(uid))} сообщений")
     lines.append("\n👤 **Личное:**")
-    found = False
-    for k in ['name','город','city','работа','job','возраст','age','факты']:
-        if k in p: lines.append(f"• {k}: {p[k]}"); found = True
-    if not found: lines.append("• Пока ничего не запомнил")
+    # Исключаем служебные ключи и уровни памяти
+    exclude = {'updated', 'level_2', 'level_3', 'level_4', 'level_5'}
+    personal_keys = [k for k in p.keys() if k not in exclude]
+    if personal_keys:
+        for k in personal_keys:
+            lines.append(f"• {k}: {p[k]}")
+    else:
+        lines.append("• Пока ничего не запомнил")
     lines.append(f"\n⏰ {get_peak_status()}\n🔄 Обновлено: {p.get('updated','неизвестно')}")
     await safe_reply(update, "\n".join(lines))
 
