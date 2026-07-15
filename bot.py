@@ -423,12 +423,25 @@ async def analyze_message(user_message):
         return {"action": "memory"}
     if any(t in q for t in ['помнишь','напомни','что я говорил','что я писал','вспомни']):
         return {"action": "memory"}
+
+    # Проверка на вопрос о дате/времени (локальный ответ)
     dt_kw = ['дата','время','число','который час','сколько времени','какая дата',
              'какое сегодня число','какой сегодня день','текущее время']
-    if any(k in q for k in dt_kw): return {"action": "date_time"}
+    if any(k in q for k in dt_kw):
+        return {"action": "date_time"}
+
+    # ===== НОВЫЙ БЛОК: автоматический интернет-поиск, если есть указание на сегодня/завтра/вчера/дату =====
+    date_indicators = ['сегодня', 'завтра', 'вчера']
+    has_date = any(ind in q for ind in date_indicators) or re.search(r'\d{2}\.\d{2}(\.\d{4})?', q)
+    if has_date:
+        return {"action": "internet"}
+
+    # Остальные динамические триггеры (погода, курс, новости)
     dyn = ['погод','температур','прогноз','осадк','курс валют','курс доллар','курс евро',
            'курс юан','биткоин','котировк','последние новости','свежие новости','что произошло сегодня']
-    if any(t in q for t in dyn): return {"action": "internet"}
+    if any(t in q for t in dyn):
+        return {"action": "internet"}
+
     return {"action": "memory"}
 
 # ---------- APISERPENT ----------
