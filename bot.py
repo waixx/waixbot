@@ -966,13 +966,14 @@ async def shutdown_session():
 
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
-    # 1. Автоматическое восстановление при старте
+    # Создаём один event loop на всё время работы
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(auto_restore_all_users())
-    loop.close()
 
-    # 2. Запуск бота
+    # Автоматическое восстановление при старте
+    loop.run_until_complete(auto_restore_all_users())
+
+    # Запуск бота
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile_command))
@@ -990,6 +991,7 @@ if __name__ == "__main__":
     finally:
         if _http_session and not _http_session.closed:
             try:
-                asyncio.run(shutdown_session())
+                loop.run_until_complete(shutdown_session())
             except Exception as ex:
                 logger.error(f"Ошибка закрытия сессии: {ex}")
+        loop.close()
