@@ -762,15 +762,75 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = update.effective_user.id
     if not is_allowed(uid):
-        await safe_reply(update, "❌ Доступ запрещён."); return
+        await safe_reply(update, "❌ Доступ запрещён.")
+        return
     if not await check_rate_limit(uid):
-        await safe_reply(update, "⏳ Слишком много запросов. Подождите 5 секунд."); return
+        await safe_reply(update, "⏳ Слишком много запросов. Подождите 5 секунд.")
+        return
 
     user_message = update.effective_message.text
     if len(user_message) > 3500:
         user_message = user_message[:3500] + "... (обрезано)"
 
-    # ЗАПОМИНАНИЕ (с проверкой сохранения)
+    # ---------- ОБРАБОТКА ПОДТВЕРЖДЕНИЯ ----------
+    if context.user_data.get("awaiting_internet_confirm"):
+        if user_message.lower() in ("да", "нет", "д", "н", "yes", "no"):
+            if user_message.lower() in ("да", "д", "yes"):
+                # Пользователь согласился — выполняем поиск
+                context.user_data["awaiting_internet_confirm"] = False
+                query = context.user_data.get("pending_query")
+                analysis = context.user_data.get("pending_analysis")
+                if query and analysis:
+                    await safe_reply(update, "🌐 Ищу информацию в интернете...")
+                    history = load_memory(uid)
+                    profile = load_profile(uid)
+                    answer, should_save, source = await generate_response(uid, query, analysis, history, profile)
+                    if source and not answer.startswith(("⚠️", "✅")):
+                        answer = f"{source}\n\n{answer}"
+                    if is_peak_hour() and not answer.startswith("⚠️"):
+                        answer = f"⏰ Внимание: пиковые часы DeepSeek. Стоимость API удвоена.\n\n{answer}"
+                    if should_save:
+                        now_str = now().strftime("%Y-%m-%d %H:%M:%S")
+                        history.append({"role": "user", "content": query, "timestamp": now_str})
+                        history.append({"role": "assistant", "content": answer, "timestamp": now_str})
+                        await save_memory(uid, history)
+                    await safe_reply(update, answer)
+                else:
+                    await safe_reply(update, "❌ Ошибка: запрос потерян. Попробуйте заново.")
+                context.user_data.pop("pending_query", None)
+                context.user_data.pop("pending_analysis", None)
+                return
+            else:
+                # Пользователь отказался — отвечаем без интернета
+                context.user_data["awaiting_internet_confirm"] = False
+                query = context.user_data.get("pending_query")
+                analysis = context.user_data.get("pending_analysis")
+                if query and analysis:
+                    analysis["action"] = "memory"
+                    history = load_memory(uid)
+                    profile = load_profile(uid)
+                    answer, should_save, source = await generate_response(uid, query, analysis, history, profile)
+                    if source and not answer.startswith(("⚠️", "✅")):
+                        answer = f"{source}\n\n{answer}"
+                    if is_peak_hour() and not answer.startswith("⚠️"):
+                        answer = f"⏰ Внимание: пиковые часы DeepSeek. Стоимость API удвоена.\n\n{answer}"
+                    if should_save:
+                        now_str = now().strftime("%Y-%m-%d %H:%M:%S")
+                        history.append({"role": "user", "content": query, "timestamp": now_str})
+                        history.append({"role": "assistant", "content": answer, "timestamp": now_str})
+                        await save_memory(uid, history)
+                    await safe_reply(update, answer)
+                else:
+                    await safe_reply(update, "❌ Ошибка: запрос потерян. Попробуйте заново.")
+                context.user_data.pop("pending_query", None)
+                context.user_data.pop("pending_analysis", None)
+                return
+        else:
+            # Если ожидается подтверждение, а пользователь пишет что-то другое
+            await safe_reply(update, "❓ Напишите «да» или «нет» — я продолжу.")
+            return
+
+    # ---------- ЗАПОМИНАНИЕ ----------
     if user_message.lower().startswith("запомни "):
         text = user_message[8:].strip()
         async with get_user_lock(uid):
@@ -780,7 +840,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 k, v = k.strip(), v.strip()
                 p[k] = v
                 if save_profile(uid, p):
-                    # Проверяем, что запись действительно сохранилась
                     check_p = load_profile(uid)
                     if k in check_p and check_p[k] == v:
                         await safe_reply(update, f"✅ Запомнил: {k} = {v}")
@@ -796,34 +855,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await safe_reply(update, "❌ Не удалось сохранить факт. Проверьте права на запись.")
         return
 
-    # ПРИНУДИТЕЛЬНЫЙ ПОИСК
-    force = False
-    status_msg = None
+    # ---------- ПРИНУДИТЕЛЬНЫЙ ПОИСК (бро) БЕЗ ПОДТВЕРЖДЕНИЯ ----------
+    force_internet = False
     if user_message.lower().startswith("бро "):
         sq = user_message[4:].strip()
         if not sq:
-            await safe_reply(update, "❌ Напиши, что искать после 'бро'."); return
-        user_message = sq; force = True
+            await safe_reply(update, "❌ Напиши, что искать после 'бро'.")
+            return
+        user_message = sq
+        force_internet = True
 
+    # Анализ сообщения
     analysis = await analyze_message(user_message)
-    if force and analysis.get("action") != "date_time":
-        analysis["action"] = "internet"
 
-    logger.info(f"📊 user={uid}: {analysis}")
+    # Если принудительный поиск — сразу идём в интернет
+    if force_internet:
+        analysis["action"] = "internet"
+        status_msg = await update.effective_message.reply_text("🌐 Ищу информацию в интернете...")
+        history = load_memory(uid)
+        profile = load_profile(uid)
+        answer, should_save, source = await generate_response(uid, user_message, analysis, history, profile)
+        if status_msg:
+            try: await status_msg.delete()
+            except Exception: pass
+        if source and not answer.startswith(("⚠️", "✅")):
+            answer = f"{source}\n\n{answer}"
+        if is_peak_hour() and not answer.startswith("⚠️"):
+            answer = f"⏰ Внимание: пиковые часы DeepSeek. Стоимость API удвоена.\n\n{answer}"
+        if should_save:
+            now_str = now().strftime("%Y-%m-%d %H:%M:%S")
+            history.append({"role": "user", "content": user_message, "timestamp": now_str})
+            history.append({"role": "assistant", "content": answer, "timestamp": now_str})
+            await save_memory(uid, history)
+        await safe_reply(update, answer)
+        return
+
+    # Если анализ говорит, что нужен интернет — запрашиваем подтверждение
+    if analysis.get("action") == "internet":
+        context.user_data["awaiting_internet_confirm"] = True
+        context.user_data["pending_query"] = user_message
+        context.user_data["pending_analysis"] = analysis
+        await safe_reply(update, "🔍 Я могу поискать в интернете по вашему запросу. Напишите «да» или «нет».")
+        return
+
+    # В остальных случаях (memory, date_time, confirm, greeting) — обычная генерация
     history = load_memory(uid)
     profile = load_profile(uid)
-
-    if analysis.get("action") == "internet":
-        try:
-            status_msg = await update.effective_message.reply_text("🌐 Ищу информацию в интернете...")
-        except Exception:
-            status_msg = None
-
     answer, should_save, source = await generate_response(uid, user_message, analysis, history, profile)
-
-    if status_msg:
-        try: await status_msg.delete()
-        except Exception: pass
 
     if source and not answer.startswith(("⚠️", "✅")):
         answer = f"{source}\n\n{answer}"
