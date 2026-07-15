@@ -490,17 +490,79 @@ async def generate_response(uid, user_message, analysis, history, profile):
 
 # ========== ОСТАЛЬНЫЕ ФУНКЦИИ (без изменений) ==========
 async def safe_reply(update: Update, text: str):
-    msg=update.effective_message
-    if msg is None: return
+    """Отправляет сообщение с автоматическим форматированием Markdown → HTML."""
+    msg = update.effective_message
+    if msg is None:
+        return
+
+    # Преобразуем Markdown-разметку в HTML
+    def markdown_to_html(t):
+        # 1. Жирный: **текст** → <b>текст</b>
+        t = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', t)
+        # 2. Курсив: __текст__ → <i>текст</i>
+        t = re.sub(r'\_\_([^_]+)\_\_', r'<i>\1</i>', t)
+        # 3. Ссылки: [текст](url) → <a href="url">текст</a>
+        t = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', t)
+        # 4. Заголовки вида "### текст" → "📌 <b>текст</b>"
+        t = re.sub(r'^#{1,3}\s+(.+)$', r'📌 <b>\1</b>', t, flags=re.MULTILINE)
+        # 5. Списки: строки, начинающиеся с "- " или "* " → "• "
+        t = re.sub(r'^[-*]\s+(.+)', r'• \1', t, flags=re.MULTILINE)
+        # 6. Цифровые списки: "1. текст" → "• текст"
+        t = re.sub(r'^\d+\.\s+(.+)', r'• \1', t, flags=re.MULTILINE)
+        # 7. Убираем Markdown-таблицы: строки с "|" заменяем на списки
+        lines = t.split('\n')
+        new_lines = []
+        in_table = False
+        for line in lines:
+            if '|' in line and '---' not in line:
+                parts = [p.strip() for p in line.split('|') if p.strip()]
+                if parts and not in_table:
+                    new_lines.append('📋 <b>Список:</b>')
+                    in_table = True
+                new_lines.append('• ' + ' – '.join(parts))
+            else:
+                if in_table and line.strip() == '':
+                    in_table = False
+                new_lines.append(line)
+        t = '\n'.join(new_lines)
+
+        # 8. Добавляем эмодзи перед ключевыми словами
+        emoji_map = {
+            'дата': '📅', 'выйдет': '📅', 'релиз': '🚀', 'выход': '📅',
+            'производительность': '⚡', 'скорость': '⚡',
+            'совместимость': '⚠️', 'изменения': '⚠️', 'breaking': '⚠️',
+            'источники': '🔗', 'ссылки': '🔗', 'pep': '🔗',
+            'цена': '💰', 'стоимость': '💰', 'топ': '🏆', 'рейтинг': '⭐'
+        }
+        for word, emoji in emoji_map.items():
+            t = re.sub(rf'(?i)({word}\s*:)', f'{emoji} \\1', t)
+
+        # 9. Убираем лишние пустые строки
+        t = re.sub(r'\n{3,}', '\n\n', t)
+        return t.strip()
+
+    # Если текст не слишком короткий и не содержит служебных команд – форматируем
+    if len(text) > 20 and not text.startswith(('/', '❌', '✅', '⏰', '📅')):
+        text = markdown_to_html(text)
+
+    # Отправляем с HTML-парсингом
     for attempt in range(3):
         try:
-            if len(text)>4096:
-                for i in range(0,len(text),4096): await msg.reply_text(text[i:i+4096])
-            else: await msg.reply_text(text)
+            if len(text) > 4096:
+                for i in range(0, len(text), 4096):
+                    await msg.reply_text(text[i:i+4096], parse_mode='HTML')
+            else:
+                await msg.reply_text(text, parse_mode='HTML')
             return
         except Exception as ex:
-            if attempt==2: logger.error(f"safe_reply не смог: {ex}")
-            else: await asyncio.sleep(1)
+            if attempt == 2:
+                logger.error(f"safe_reply не смог: {ex}")
+                try:
+                    await msg.reply_text(text)  # fallback без парсинга
+                except:
+                    pass
+            else:
+                await asyncio.sleep(1)
 
 def is_allowed(uid): return not ALLOWED_USERS_LIST or uid in ALLOWED_USERS_LIST
 
