@@ -4,6 +4,7 @@
 #  + Автоматическое восстановление из бэкапов при старте
 #  + Восстановление в atomic_read при повреждении
 #  + Очистка request_count
+#  + Улучшенный интернет-поиск с проверкой дат и источников
 # ============================================================
 import logging
 import os
@@ -242,7 +243,6 @@ def atomic_read(filename, default=None, as_json=True, user_id=None, data_type=No
 
 # ---------- ПРОФИЛЬ / СЧЁТЧИК ----------
 def load_profile(uid):
-    # Передаём user_id и data_type для возможности восстановления
     return atomic_read(profile_path(uid), default={}, user_id=uid, data_type="profile")
 
 def save_profile(uid, profile, backup=True):
@@ -476,9 +476,10 @@ async def analyze_message(user_message):
     if has_date:
         return {"action": "internet"}
 
-    # Остальные динамические триггеры (погода, курс, новости)
+    # ===== ИЗМЕНЕНИЕ: расширенный список динамических триггеров, включая технические новости =====
     dyn = ['погод','температур','прогноз','осадк','курс валют','курс доллар','курс евро',
-           'курс юан','биткоин','котировк','последние новости','свежие новости','что произошло сегодня']
+           'курс юан','биткоин','котировк','последние новости','свежие новости','что произошло сегодня',
+           'релиз','вышла','новая версия','обновление','python','выпущена']   # <-- добавлены ключевые слова
     if any(t in q for t in dyn):
         return {"action": "internet"}
 
@@ -531,10 +532,16 @@ async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
 
 # ---------- ФУНКЦИИ ДЛЯ ПЕРЕФОРМУЛИРОВКИ ЗАПРОСОВ ----------
 async def rephrase_query(query):
-    """Переформулирует запрос для более точного поиска."""
+    """Переформулирует запрос для более точного поиска, добавляет год для датных запросов."""
+    # ИЗМЕНЕНИЕ: добавляем текущий год, если запрос содержит ключевые слова о датах/релизах
+    date_keywords = ['релиз', 'выход', 'дата', 'release', 'when', 'new version', 'вышла', 'обновление']
+    if any(kw in query.lower() for kw in date_keywords):
+        if str(now().year) not in query:
+            query = f"{query} {now().year}"
+
     prompt = (
         "Переформулируй этот запрос для поиска в интернете так, чтобы найти максимально точную информацию. "
-        "Убери лишние слова, оставь ключевые термины, добавь уточнения. "
+        "Убери лишние слова, оставь ключевые термины, добавь уточнения (например, год, если это актуально). "
         "Ответь только переформулированным запросом, без пояснений.\n"
         f"Оригинал: {query}"
     )
@@ -623,6 +630,21 @@ def build_profile_context(profile):
     ctx = ". ".join(parts)
     return ctx[:800] + "..." if len(ctx) > 800 else ctx
 
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПОИСКА (НОВЫЕ) ----------
+def extract_year_from_text(text):
+    """Извлекает год (2020–2030) из текста, возвращает int или None."""
+    match = re.search(r'\b(20[2-9][0-9])\b', text)
+    return int(match.group(1)) if match else None
+
+def is_official_link(link):
+    """Проверяет, является ли ссылка официальным источником для технических вопросов."""
+    link_lower = link.lower()
+    return ('python.org' in link_lower or
+            'docs.python.org' in link_lower or
+            'peps.python.org' in link_lower or
+            'github.com/python' in link_lower or
+            'pypi.org' in link_lower)
+
 # ---------- ГЕНЕРАЦИЯ ОТВЕТА ----------
 async def generate_response(uid, user_message, analysis, history, profile):
     action = analysis.get("action", "memory")
@@ -699,45 +721,73 @@ async def generate_response(uid, user_message, analysis, history, profile):
                     f"❌ Ничего не найдено. Попробуйте другие ключевые слова.\n\n"
                     f"🧠 Ответ из знаний модели:\n{ans}"), True, "🧠 из модели (поиск пуст)"
 
-        # --- ОБРАБОТКА РЕЗУЛЬТАТОВ ---
-        filtered_results = [r for r in all_results if len(r.get('snippet', '')) > 30]
-        if not filtered_results:
-            filtered_results = all_results
+        # ===== НОВАЯ ОБРАБОТКА РЕЗУЛЬТАТОВ С УЧЁТОМ ГОДА И ОФИЦИАЛЬНЫХ ИСТОЧНИКОВ =====
+        # Извлекаем год из сниппета и заголовка
+        for res in all_results:
+            text = (res.get('title', '') + ' ' + res.get('snippet', ''))
+            res['year'] = extract_year_from_text(text) or 0
 
+        current_year = now().year
         keywords = set(user_message.lower().split())
         stop_words = {'как', 'чтобы', 'для', 'при', 'на', 'в', 'и', 'не', 'через', 'vpn', 'бро', 'телеграм'}
         keywords = {w for w in keywords if w not in stop_words and len(w) > 2}
 
         def rank_result(res):
             score = 0
+            # Приоритет официальных источников
+            if is_official_link(res.get('link', '')):
+                score += 10
+            # Приоритет свежих годов (близких к текущему)
+            if res.get('year') and abs(res['year'] - current_year) <= 1:
+                score += 5
+            # Совпадение ключевых слов
             text = (res.get('title', '') + ' ' + res.get('snippet', '')).lower()
             for kw in keywords:
                 if kw in text:
                     score += 1
             return score
 
-        filtered_results.sort(key=rank_result, reverse=True)
-        top_results = filtered_results[:8]
+        all_results.sort(key=rank_result, reverse=True)
+        top_results = all_results[:8]
 
+        # Формируем stext с пометкой официальных источников
         stext = f"🔍 **Искал:** `{user_message}`\n\n📊 Найдено {len(top_results)} наиболее релевантных результатов:\n\n"
         for i, r in enumerate(top_results, 1):
-            stext += f"{i}. **{r['title']}**\n   {r['snippet'][:200]}\n   🔗 {r['link']}\n\n"
+            is_off = is_official_link(r.get('link', ''))
+            mark = " ⭐ (официальный)" if is_off else ""
+            year_note = f" (год: {r['year']})" if r.get('year') else ""
+            stext += f"{i}. **{r['title']}**{mark}{year_note}\n   {r['snippet'][:200]}\n   🔗 {r['link']}\n\n"
 
+        # --- НОВЫЙ СИСТЕМНЫЙ ПРОМПТ ---
         sp = {"role": "system", "content":
-            f"{CORE_SYSTEM_RULE}\nСегодня: {get_current_date()} {get_current_time()}.\n"
-            f'Вопрос пользователя: "{user_message}"\n'
+            f"{CORE_SYSTEM_RULE}\n"
+            f"Сегодня: {get_current_date()} {get_current_time()}.\n"
+            f"Вопрос пользователя: \"{user_message}\"\n"
             f"Контекст профиля: {ctx}\n\n"
-            f"Найденные данные:\n{stext}\n"
-            f"ИНСТРУКЦИЯ:\n"
-            f"1. ОТВЕЧАЙ ТОЛЬКО НА ОСНОВЕ НАЙДЕННЫХ ДАННЫХ.\n"
-            f"2. Если в найденных данных есть конкретная инструкция — дай её пошагово.\n"
-            f"3. Если данных недостаточно для точного ответа — скажи честно, что знаешь только это, и предложи уточнить.\n"
-            f"4. Структурируй ответ: используй заголовки, списки, выделение важного.\n"
-            f"5. В конце укажи источники (ссылки).\n"
-            f"6. Если вопрос требует актуальных данных, а они могут устареть — предупреди."}
+            f"Найденные данные:\n{stext}\n\n"
+            f"ИНСТРУКЦИЯ (ОБЯЗАТЕЛЬНО К ВЫПОЛНЕНИЮ):\n"
+            f"1. ОТВЕЧАЙ ТОЛЬКО НА ОСНОВЕ НАЙДЕННЫХ ДАННЫХ. НИЧЕГО НЕ ВЫДУМЫВАЙ.\n"
+            f"2. Если в найденных данных есть РАЗНЫЕ ДАТЫ или ПРОТИВОРЕЧИЯ – укажи это и отдай предпочтение наиболее свежему и авторитетному источнику (отмечены ⭐).\n"
+            f"3. Для технических вопросов (языки программирования, библиотеки) ПРОВЕРЬ ГОД выпуска и версию. Если данные могут устареть – ПРЕДУПРЕДИ.\n"
+            f"4. ВСЕГДА указывай источник (ссылку) для каждого ключевого факта.\n"
+            f"5. Если среди найденных ссылок есть официальный сайт (отмечен ⭐) – используй его как основной источник.\n"
+            f"6. Если в найденных данных нет точного ответа – скажи честно: «В найденных данных нет точной информации» и предложи уточнить запрос.\n"
+            f"7. Не используй знания модели вне найденных данных – только то, что есть в результатах поиска.\n"
+            f"8. Формат ответа: структурированный, с заголовками, списками и выделением важного.\n"
+            f"9. В конце обязательно перечисли использованные источники (URL)."}
         history.append({"role": "user", "content": user_message})
         ans, err = await ask_deepseek([sp] + history)
         if err: return f"⚠️ {analyze_error(err)}", False, None
+
+        # ===== ПОСТ-ОБРАБОТКА ОТВЕТА: ПРОВЕРКА ГОДА =====
+        year_match = re.search(r'\b(20[2-9][0-9])\b', ans)
+        if year_match:
+            mentioned_year = int(year_match.group(1))
+            if abs(mentioned_year - current_year) > 1:
+                ans = (f"⚠️ Внимание: в ответе упоминается год {mentioned_year}, "
+                       f"который отличается от текущего ({current_year}). "
+                       f"Пожалуйста, проверьте актуальность информации.\n\n{ans}")
+
         return f"🔍 **Искал в интернете:** `{user_message}`\n\n{ans}", True, "🌐 из интернета"
 
     # поиск по дате
@@ -914,7 +964,6 @@ async def check_rate_limit(uid):
         if len(request_count[uid]) >= RATE_LIMIT:
             return False
         request_count[uid].append(now_ts)
-        # Очистка пустых записей (для неактивных пользователей, которые не удалены фоновой задачей)
         for u in list(request_count.keys()):
             if not request_count[u]:
                 del request_count[u]
@@ -922,13 +971,12 @@ async def check_rate_limit(uid):
 
 # ---------- ФОНОВАЯ ОЧИСТКА REQUEST_COUNT ----------
 async def clean_request_count():
-    """Фоновая задача: раз в 6 часов удаляет записи пользователей, неактивных более 10 минут."""
     while True:
-        await asyncio.sleep(21600)  # 6 часов
+        await asyncio.sleep(21600)
         async with rate_lock:
             now_ts = datetime.now().timestamp()
             to_delete = [uid for uid, timestamps in request_count.items()
-                         if not timestamps or now_ts - timestamps[-1] > 600]  # 10 минут
+                         if not timestamps or now_ts - timestamps[-1] > 600]
             for uid in to_delete:
                 del request_count[uid]
             if to_delete:
@@ -936,8 +984,6 @@ async def clean_request_count():
 
 # ---------- АВТОМАТИЧЕСКОЕ ВОССТАНОВЛЕНИЕ ПРИ СТАРТЕ ----------
 async def auto_restore_all_users():
-    """При запуске восстанавливает профиль и память из последних бэкапов для всех пользователей,
-    если основные файлы отсутствуют или пусты."""
     logger.info("🔄 Проверка данных при старте...")
     backup_files = os.listdir(BACKUP_DIR)
     user_ids = set()
@@ -1146,17 +1192,12 @@ async def shutdown_session():
 
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
-    # Создаём один event loop на всё время работы
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Автоматическое восстановление при старте
     loop.run_until_complete(auto_restore_all_users())
-
-    # Запускаем фоновую задачу очистки request_count
     loop.create_task(clean_request_count())
 
-    # Запуск бота
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile_command))
