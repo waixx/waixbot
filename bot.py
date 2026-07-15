@@ -608,11 +608,16 @@ async def check_rate_limit(uid):
 
 async def clean_request_count():
     while True:
-        await asyncio.sleep(21600)
-        async with rate_lock:
-            now_ts=datetime.now().timestamp()
-            to_delete=[uid for uid, timestamps in request_count.items() if not timestamps or now_ts-timestamps[-1]>600]
-            for uid in to_delete: del request_count[uid]
+        try:
+            await asyncio.sleep(21600)
+            async with rate_lock:
+                now_ts=datetime.now().timestamp()
+                to_delete=[uid for uid, timestamps in request_count.items() if not timestamps or now_ts-timestamps[-1]>600]
+                for uid in to_delete: del request_count[uid]
+                if to_delete: logger.debug(f"Очищено {len(to_delete)} неактивных записей")
+        except Exception as e:
+            logger.error(f"Ошибка в clean_request_count: {e}, перезапуск через 60 сек")
+            await asyncio.sleep(60)
 
 async def auto_restore_all_users():
     logger.info("🔄 Проверка данных при старте...")
