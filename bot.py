@@ -70,7 +70,7 @@ def get_current_time():
 def get_current_weekday():
     return now().strftime("%A")
 
-# ---------- МОДЕЛЬ (актуальные имена V4; chat/reasoner выводятся из эксплуатации) ----------
+# ---------- МОДЕЛЬ ----------
 MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-v4-flash")
 MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
@@ -103,7 +103,6 @@ def get_peak_status():
         return "⚠️ Сейчас пиковые часы DeepSeek (9:00–12:00, 14:00–18:00) — стоимость API удвоена."
     return "✅ Сейчас непиковые часы DeepSeek — стандартная стоимость."
 
-# ---------- ПРОВЕРКА КЛЮЧЕЙ ----------
 if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     logger.error("TELEGRAM_TOKEN или DEEPSEEK_API_KEY не заданы")
     sys.exit(1)
@@ -119,7 +118,7 @@ logger.info(f"  💾 Данные — отдельный файл на поль�
 logger.info(f"  🛡 Принцип: не врать, точные ответы, атомарная запись + бэкапы")
 logger.info("=" * 50)
 
-# ---------- ПУТИ (ПО ПОЛЬЗОВАТЕЛЮ) ----------
+# ---------- ПУТИ ----------
 DATA_DIR = "data"
 BACKUP_DIR = "data/backups"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -353,7 +352,7 @@ async def save_memory(uid, history, backup=True, lock_held=False):
     async with get_user_lock(uid):
         return await _save_memory_impl(uid, history, backup)
 
-# ---------- ПОИСК ПО ДАТЕ/ВРЕМЕНИ (по сырой истории) ----------
+# ---------- ПОИСК ПО ДАТЕ/ВРЕМЕНИ ----------
 def parse_time_query(tq):
     try:
         parts = tq.split(":")
@@ -592,7 +591,7 @@ async def generate_response(uid, user_message, analysis, history, profile):
     if err: return f"⚠️ {analyze_error(err)}", False, None
     return ans, True, "🧠 из модели"
 
-# ---------- БЕЗОПАСНЫЙ ОТВЕТ (защита от NoneType) ----------
+# ---------- БЕЗОПАСНЫЙ ОТВЕТ ----------
 async def safe_reply(update: Update, text: str):
     msg = update.effective_message
     if msg is None:
@@ -729,7 +728,7 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 RATE_LIMIT, RATE_WINDOW = 3, 5
 async def check_rate_limit(uid):
     async with rate_lock:
-        now_ts = datetime.now().timestamp()  # UTC для очистки
+        now_ts = datetime.now().timestamp()
         request_count[uid] = [t for t in request_count.get(uid, []) if now_ts - t < RATE_WINDOW]
         if len(request_count[uid]) >= RATE_LIMIT:
             return False
@@ -754,7 +753,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(user_message) > 3500:
         user_message = user_message[:3500] + "... (обрезано)"
 
-    # запоминание (с проверкой сохранения)
+    # ЗАПОМИНАНИЕ (с проверкой сохранения)
     if user_message.lower().startswith("запомни "):
         text = user_message[8:].strip()
         async with get_user_lock(uid):
@@ -764,7 +763,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 k, v = k.strip(), v.strip()
                 p[k] = v
                 if save_profile(uid, p):
-                    await safe_reply(update, f"✅ Запомнил: {k} = {v}")
+                    # Проверяем, что запись действительно сохранилась
+                    check_p = load_profile(uid)
+                    if k in check_p and check_p[k] == v:
+                        await safe_reply(update, f"✅ Запомнил: {k} = {v}")
+                    else:
+                        await safe_reply(update, "❌ Ошибка: запись не сохранилась. Попробуйте позже.")
                 else:
                     await safe_reply(update, "❌ Не удалось сохранить. Проверьте права на запись в папку data/.")
             else:
@@ -775,7 +779,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await safe_reply(update, "❌ Не удалось сохранить факт. Проверьте права на запись.")
         return
 
-    # принудительный поиск
+    # ПРИНУДИТЕЛЬНЫЙ ПОИСК
     force = False
     status_msg = None
     if user_message.lower().startswith("бро "):
@@ -809,7 +813,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_peak_hour() and not answer.startswith("⚠️"):
         answer = f"⏰ Внимание: пиковые часы DeepSeek. Стоимость API удвоена.\n\n{answer}"
 
-    # СНАЧАЛА сохраняем (защита от потери), ПОТОМ отправляем
     if should_save:
         now_str = now().strftime("%Y-%m-%d %H:%M:%S")
         history.append({"role": "user", "content": user_message, "timestamp": now_str})
@@ -818,7 +821,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_reply(update, answer)
 
-# ---------- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ----------
+# ---------- ОБРАБОТЧИК ОШИБОК ----------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Глобальная ошибка: {context.error}")
     import traceback; traceback.print_exc()
