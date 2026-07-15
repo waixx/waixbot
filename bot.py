@@ -2,6 +2,8 @@
 #  BroWaix Bot — максимально защищённая версия
 #  Принципы: не врать, точные ответы, не терять память
 #  + Автоматическое восстановление из бэкапов при старте
+#  + Восстановление в atomic_read при повреждении
+#  + Очистка request_count
 # ============================================================
 import logging
 import os
@@ -174,6 +176,29 @@ def analyze_error(error_text):
         return "⚠️ Не удалось получить ответ после нескольких попыток."
     return f"⚠️ Ошибка: {str(error_text)[:150]}"
 
+# ---------- СИНХРОННОЕ ВОССТАНОВЛЕНИЕ ИЗ БЭКАПА ----------
+def _restore_from_backup_sync(user_id, data_type):
+    """Синхронная версия восстановления из бэкапа для использования в atomic_read."""
+    try:
+        backups = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith(f"{data_type}_{user_id}_"))
+        if not backups:
+            return None
+        latest = backups[-1]
+        with open(os.path.join(BACKUP_DIR, latest), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if data_type == "profile":
+            target = profile_path(user_id)
+        elif data_type == "memory":
+            target = memory_path(user_id)
+        else:
+            return None
+        atomic_write(target, data)
+        logger.info(f"🔄 Восстановлен {data_type} пользователя {user_id} из {latest} (синхронно)")
+        return data
+    except Exception as e:
+        logger.error(f"Ошибка синхронного восстановления {data_type} для {user_id}: {e}")
+        return None
+
 # ---------- АТОМАРНЫЕ ФАЙЛЫ ----------
 def atomic_write(filename, data, as_json=True):
     tmp = filename + ".tmp"
@@ -194,7 +219,8 @@ def atomic_write(filename, data, as_json=True):
             except OSError: pass
         return False
 
-def atomic_read(filename, default=None, as_json=True):
+def atomic_read(filename, default=None, as_json=True, user_id=None, data_type=None):
+    """Читает файл, при ошибке пытается восстановить из бэкапа, если передан user_id и data_type."""
     try:
         with open(filename, 'r', encoding='utf-8') as f:
             return json.load(f) if as_json else f.read()
@@ -202,11 +228,22 @@ def atomic_read(filename, default=None, as_json=True):
         return default
     except (json.JSONDecodeError, OSError) as ex:
         logger.warning(f"Ошибка чтения {filename}: {ex} — пробую восстановить из бэкапа")
+        if user_id is not None and data_type is not None:
+            restored = _restore_from_backup_sync(user_id, data_type)
+            if restored is not None:
+                # Повторно читаем восстановленный файл
+                try:
+                    with open(filename, 'r', encoding='utf-8') as f:
+                        return json.load(f) if as_json else f.read()
+                except Exception:
+                    logger.error(f"Не удалось прочитать восстановленный файл {filename}")
+                    return default
         return default
 
 # ---------- ПРОФИЛЬ / СЧЁТЧИК ----------
 def load_profile(uid):
-    return atomic_read(profile_path(uid), default={})
+    # Передаём user_id и data_type для возможности восстановления
+    return atomic_read(profile_path(uid), default={}, user_id=uid, data_type="profile")
 
 def save_profile(uid, profile, backup=True):
     profile["updated"] = now().strftime("%d.%m.%Y %H:%M:%S")
@@ -223,7 +260,7 @@ def save_counter(uid, count):
     atomic_write(counter_path(uid), {"count": count})
 
 def load_memory_raw(uid):
-    return atomic_read(memory_path(uid), default=[])
+    return atomic_read(memory_path(uid), default=[], user_id=uid, data_type="memory")
 
 # ---------- БЭКАПЫ ----------
 def create_backup(uid, data_type):
@@ -448,31 +485,36 @@ async def analyze_message(user_message):
     return {"action": "memory"}
 
 # ---------- APISERPENT ----------
-async def search_apiserpent_async(query):
+async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
     if not APISERPENT_API_KEY:
         return []
     session = await get_http_session()
     try:
-        logger.info(f"🔍 Поиск ({SEARCH_ENGINE}): {query}")
+        logger.info(f"🔍 Поиск ({SEARCH_ENGINE}, num={num}): {query}")
         async with session.get("https://apiserpent.com/api/search",
-                               params={"q": query, "engine": SEARCH_ENGINE, "num": 5},
+                               params={"q": query, "engine": SEARCH_ENGINE, "num": num},
                                headers={"X-API-Key": APISERPENT_API_KEY}, timeout=30) as r:
             if r.status != 200:
                 logger.error(f"APISerpent HTTP {r.status}")
                 return []
             data = await r.json()
             results = []
-            if isinstance(data.get("results"), dict): results = data["results"].get("organic", [])
-            elif "organic_results" in data: results = data["organic_results"]
-            elif isinstance(data.get("results"), list): results = data["results"]
-            elif "organic" in data: results = data["organic"]
-            elif "items" in data: results = data["items"]
+            if isinstance(data.get("results"), dict):
+                results = data["results"].get("organic", [])
+            elif "organic_results" in data:
+                results = data["organic_results"]
+            elif isinstance(data.get("results"), list):
+                results = data["results"]
+            elif "organic" in data:
+                results = data["organic"]
+            elif "items" in data:
+                results = data["items"]
             if not results and isinstance(data, dict):
                 for k in data:
                     if isinstance(data[k], list) and data[k] and isinstance(data[k][0], dict):
                         results = data[k]; break
             out = []
-            for x in results[:5]:
+            for x in results[:num]:
                 if isinstance(x, dict):
                     out.append({
                         "title": str(x.get("title", x.get("name", "Без названия")))[:150],
@@ -486,6 +528,53 @@ async def search_apiserpent_async(query):
         logger.error("⏰ Таймаут APISerpent"); return []
     except Exception as ex:
         logger.error(f"Ошибка APISerpent: {ex}"); return []
+
+# ---------- ФУНКЦИИ ДЛЯ ПЕРЕФОРМУЛИРОВКИ ЗАПРОСОВ ----------
+async def rephrase_query(query):
+    """Переформулирует запрос для более точного поиска."""
+    prompt = (
+        "Переформулируй этот запрос для поиска в интернете так, чтобы найти максимально точную информацию. "
+        "Убери лишние слова, оставь ключевые термины, добавь уточнения. "
+        "Ответь только переформулированным запросом, без пояснений.\n"
+        f"Оригинал: {query}"
+    )
+    messages = [{"role": "system", "content": "Ты — помощник для оптимизации поисковых запросов."},
+                {"role": "user", "content": prompt}]
+    try:
+        rephrased, err = await ask_deepseek(messages, max_tokens=60, model="deepseek-v4-flash")
+        if err:
+            logger.warning(f"Не удалось переформулировать: {err}")
+            return query
+        if rephrased and len(rephrased) > 5:
+            logger.info(f"🔄 Переформулированный запрос: {rephrased}")
+            return rephrased.strip()
+        return query
+    except Exception as e:
+        logger.error(f"Ошибка переформулировки: {e}")
+        return query
+
+async def simplify_query(query):
+    """Превращает запрос в максимально краткую форму (только ключевые слова)."""
+    prompt = (
+        f"Преврати этот запрос в очень короткий поисковый запрос из 3-5 ключевых слов, "
+        f"убери все лишние слова. Ответь только ключевыми словами через пробел.\n"
+        f"Оригинал: {query}"
+    )
+    messages = [{"role": "system", "content": "Ты — помощник для создания коротких поисковых запросов."},
+                {"role": "user", "content": prompt}]
+    try:
+        short, err = await ask_deepseek(messages, max_tokens=30, model="deepseek-v4-flash")
+        if err:
+            logger.warning(f"Не удалось создать короткий запрос: {err}")
+            words = query.split()[:3]
+            return ' '.join(words)
+        if short and len(short) > 3:
+            logger.info(f"📌 Короткий запрос: {short}")
+            return short.strip()
+        return query
+    except Exception as e:
+        logger.error(f"Ошибка создания короткого запроса: {e}")
+        return query
 
 # ---------- DEEPSEEK ----------
 async def ask_deepseek(messages, retries=3, max_tokens=None, model=None):
@@ -557,12 +646,9 @@ async def generate_response(uid, user_message, analysis, history, profile):
         ctx = build_profile_context(profile)
 
         # --- УТОЧНЕНИЕ КОРОТКИХ/НЕЯСНЫХ ЗАПРОСОВ ---
-        # Если запрос состоит из 1-2 слов или содержит только домен без уточнения — просим уточнить
         words = user_message.split()
-        # Проверяем, есть ли в запросе домен (например, .com, .ru, .org) и мало слов
         has_domain = any(ext in user_message for ext in ['.com', '.ru', '.org', '.net', '.io'])
         if len(words) <= 2 or (has_domain and len(words) <= 3):
-            # Спрашиваем у пользователя, что именно нужно
             return ("🔍 Похоже, вы спрашиваете о конкретном сайте или коротком запросе. "
                     "Уточните, что именно вас интересует: документация, баланс, API-ключ, инструкция или что-то другое? "
                     "Это поможет мне точнее найти информацию."), False, None
@@ -570,11 +656,9 @@ async def generate_response(uid, user_message, analysis, history, profile):
         logger.info(f"🔍 Поиск по оригинальному запросу: {user_message}")
         results_original = await search_apiserpent_async(user_message)
 
-        # Первый поиск: оригинальный запрос
         all_results = results_original[:]
         seen = set(res.get('link') for res in all_results if res.get('link'))
 
-        # Если результатов меньше порога, пробуем второй (оптимизированный) запрос
         if len(all_results) < SEARCH_THRESHOLD:
             logger.info("📭 Мало результатов, пробуем оптимизированный запрос...")
             optimized = await rephrase_query(user_message)
@@ -589,7 +673,6 @@ async def generate_response(uid, user_message, analysis, history, profile):
             else:
                 logger.info("⏭ Переформулировка не дала нового запроса")
 
-        # Если всё ещё меньше порога, пробуем третий (краткий) запрос
         if len(all_results) < SEARCH_THRESHOLD:
             logger.info("📭 Всё ещё мало результатов, пробуем краткий запрос...")
             short = await simplify_query(user_message)
@@ -605,7 +688,6 @@ async def generate_response(uid, user_message, analysis, history, profile):
                 logger.info("⏭ Краткий запрос не отличается, пропускаем")
 
         if not all_results:
-            # Если ничего не найдено — отвечаем из знаний
             sysmsg = {"role": "system", "content":
                 f"{CORE_SYSTEM_RULE}\nСегодня: {get_current_date()} {get_current_time()}. {ctx}\n"
                 f"ВАЖНО: интернет-поиск не дал результатов. "
@@ -618,12 +700,10 @@ async def generate_response(uid, user_message, analysis, history, profile):
                     f"🧠 Ответ из знаний модели:\n{ans}"), True, "🧠 из модели (поиск пуст)"
 
         # --- ОБРАБОТКА РЕЗУЛЬТАТОВ ---
-        # 1. Фильтруем слишком короткие сниппеты (менее 30 символов)
         filtered_results = [r for r in all_results if len(r.get('snippet', '')) > 30]
         if not filtered_results:
-            filtered_results = all_results  # если все короткие — оставляем как есть
+            filtered_results = all_results
 
-        # 2. Ранжируем по релевантности
         keywords = set(user_message.lower().split())
         stop_words = {'как', 'чтобы', 'для', 'при', 'на', 'в', 'и', 'не', 'через', 'vpn', 'бро', 'телеграм'}
         keywords = {w for w in keywords if w not in stop_words and len(w) > 2}
@@ -637,16 +717,12 @@ async def generate_response(uid, user_message, analysis, history, profile):
             return score
 
         filtered_results.sort(key=rank_result, reverse=True)
-
-        # Берём топ-8 результатов (экономия токенов)
         top_results = filtered_results[:8]
 
-        # Формируем текст для модели
         stext = f"🔍 **Искал:** `{user_message}`\n\n📊 Найдено {len(top_results)} наиболее релевантных результатов:\n\n"
         for i, r in enumerate(top_results, 1):
             stext += f"{i}. **{r['title']}**\n   {r['snippet'][:200]}\n   🔗 {r['link']}\n\n"
 
-        # Улучшенный системный промпт
         sp = {"role": "system", "content":
             f"{CORE_SYSTEM_RULE}\nСегодня: {get_current_date()} {get_current_time()}.\n"
             f'Вопрос пользователя: "{user_message}"\n'
@@ -663,6 +739,7 @@ async def generate_response(uid, user_message, analysis, history, profile):
         ans, err = await ask_deepseek([sp] + history)
         if err: return f"⚠️ {analyze_error(err)}", False, None
         return f"🔍 **Искал в интернете:** `{user_message}`\n\n{ans}", True, "🌐 из интернета"
+
     # поиск по дате
     dm = re.search(r'\b(сегодня|вчера|завтра|\d{2}\.\d{2}(\.\d{4})?|\d{4}-\d{2}-\d{2})\b', user_message, re.I)
     if dm:
@@ -837,9 +914,25 @@ async def check_rate_limit(uid):
         if len(request_count[uid]) >= RATE_LIMIT:
             return False
         request_count[uid].append(now_ts)
+        # Очистка пустых записей (для неактивных пользователей, которые не удалены фоновой задачей)
         for u in list(request_count.keys()):
-            if not request_count[u]: del request_count[u]
+            if not request_count[u]:
+                del request_count[u]
         return True
+
+# ---------- ФОНОВАЯ ОЧИСТКА REQUEST_COUNT ----------
+async def clean_request_count():
+    """Фоновая задача: раз в 6 часов удаляет записи пользователей, неактивных более 10 минут."""
+    while True:
+        await asyncio.sleep(21600)  # 6 часов
+        async with rate_lock:
+            now_ts = datetime.now().timestamp()
+            to_delete = [uid for uid, timestamps in request_count.items()
+                         if not timestamps or now_ts - timestamps[-1] > 600]  # 10 минут
+            for uid in to_delete:
+                del request_count[uid]
+            if to_delete:
+                logger.debug(f"Очищено {len(to_delete)} неактивных записей в rate_limit")
 
 # ---------- АВТОМАТИЧЕСКОЕ ВОССТАНОВЛЕНИЕ ПРИ СТАРТЕ ----------
 async def auto_restore_all_users():
@@ -866,11 +959,11 @@ async def auto_restore_all_users():
         prof_path = profile_path(uid)
         need_restore = False
 
-        mem_data = atomic_read(mem_path, default=None)
+        mem_data = atomic_read(mem_path, default=None, user_id=uid, data_type="memory")
         if mem_data is None or (isinstance(mem_data, list) and len(mem_data) == 0):
             need_restore = True
 
-        prof_data = atomic_read(prof_path, default=None)
+        prof_data = atomic_read(prof_path, default=None, user_id=uid, data_type="profile")
         if prof_data is None or (isinstance(prof_data, dict) and len(prof_data) == 0):
             need_restore = True
 
@@ -1059,6 +1152,9 @@ if __name__ == "__main__":
 
     # Автоматическое восстановление при старте
     loop.run_until_complete(auto_restore_all_users())
+
+    # Запускаем фоновую задачу очистки request_count
+    loop.create_task(clean_request_count())
 
     # Запуск бота
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
