@@ -555,6 +555,18 @@ async def generate_response(uid, user_message, analysis, history, profile):
 
     if action == "internet":
         ctx = build_profile_context(profile)
+
+        # --- УТОЧНЕНИЕ КОРОТКИХ/НЕЯСНЫХ ЗАПРОСОВ ---
+        # Если запрос состоит из 1-2 слов или содержит только домен без уточнения — просим уточнить
+        words = user_message.split()
+        # Проверяем, есть ли в запросе домен (например, .com, .ru, .org) и мало слов
+        has_domain = any(ext in user_message for ext in ['.com', '.ru', '.org', '.net', '.io'])
+        if len(words) <= 2 or (has_domain and len(words) <= 3):
+            # Спрашиваем у пользователя, что именно нужно
+            return ("🔍 Похоже, вы спрашиваете о конкретном сайте или коротком запросе. "
+                    "Уточните, что именно вас интересует: документация, баланс, API-ключ, инструкция или что-то другое? "
+                    "Это поможет мне точнее найти информацию."), False, None
+
         logger.info(f"🔍 Поиск по оригинальному запросу: {user_message}")
         results_original = await search_apiserpent_async(user_message)
 
