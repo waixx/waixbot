@@ -18,9 +18,6 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
-# ============================================================
-# НАСТРОЙКА ЛОГИРОВАНИЯ
-# ============================================================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -32,10 +29,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-
-# ============================================================
-# 1. КОНФИГУРАЦИЯ
-# ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -125,17 +118,12 @@ PROFILE_FILE = "data/user_profile.json"
 BACKUP_DIR = "data/backups"
 COUNTER_FILE = "data/counter.json"
 
-# ============================================================
-# 2. БЛОКИРОВКИ И СЕССИИ
-# ============================================================
-
 _http_session = None
 user_locks = {}
 rate_lock = asyncio.Lock()
 request_count = {}
 
 def get_user_lock(user_id):
-    """Атомарное создание замка для пользователя"""
     return user_locks.setdefault(user_id, asyncio.Lock())
 
 async def get_http_session():
@@ -150,10 +138,6 @@ async def get_http_session():
         timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
         _http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     return _http_session
-
-# ============================================================
-# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================================
 
 def analyze_error(error_text):
     error_lower = error_text.lower()
@@ -231,7 +215,6 @@ def load_profile(user_id):
     return data.get(str(user_id), {})
 
 def save_profile(user_id, profile, backup=True):
-    # Вызов должен быть под замком пользователя
     data = atomic_read(PROFILE_FILE, default={})
     profile["updated"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     data[str(user_id)] = profile
@@ -292,10 +275,6 @@ async def restore_backup(user_id, data_type):
             logger.error(f"Ошибка восстановления {data_type}: {e}")
             return False
 
-# ============================================================
-# 4. СЖАТИЕ ДАННЫХ
-# ============================================================
-
 def extract_key_points(text, max_len=30):
     if len(text) <= max_len:
         return text
@@ -313,7 +292,7 @@ def extract_keywords_aggressive(text, max_len=20):
         return text
     important_words = []
     for word in text.split():
-        if len(word) > 3 and word.lower() not in ['это', 'так', 'вот', 'ну']:
+        if len(word) > 3 and word.lower() not in ['это', 'так', 'вот', 'nu']:
             important_words.append(word[:8])
     result = ' '.join(important_words[:5])
     return result[:max_len] + "..."
@@ -323,7 +302,7 @@ def extract_keywords_ultra(text, max_len=12):
         return text
     important_words = []
     for word in text.split():
-        if len(word) > 3 and word.lower() not in ['это', 'так', 'вот', 'ну']:
+        if len(word) > 3 and word.lower() not in ['это', 'так', 'вот', 'nu']:
             important_words.append(word[:5])
     result = ' '.join(important_words[:3])
     return result[:max_len] + "..."
@@ -363,10 +342,6 @@ def load_memory(user_id):
     data = atomic_read(MEMORY_FILE, default={})
     raw_history = data.get(str(user_id), [])
     return compress_history(raw_history)
-
-# ============================================================
-# 5. ОБНОВЛЕНИЕ УРОВНЕЙ ПАМЯТИ (СИНХРОННЫЕ, БЕЗ БЛОКИРОВОК)
-# ============================================================
 
 def update_level_2(user_id, messages):
     profile = load_profile(user_id)
@@ -452,16 +427,9 @@ def update_level_5(user_id, messages):
         profile["level_5"] = profile["level_5"][-LEVEL_5['compress_to']:]
     save_profile(user_id, profile, backup=False)
 
-# ============================================================
-# 6. СОХРАНЕНИЕ ПАМЯТИ (С ПАРАМЕТРОМ lock_held)
-# ============================================================
-
 async def _save_memory_impl(user_id, history, backup):
-    """Реализация сохранения памяти (без захвата замка)"""
     try:
         data = atomic_read(MEMORY_FILE, default={})
-        
-        # Обновление уровней с обработкой ошибок
         try:
             if len(history) > LEVEL_1['max_history']:
                 old_messages = history[:-LEVEL_1['keep_recent']]
@@ -476,21 +444,16 @@ async def _save_memory_impl(user_id, history, backup):
                         update_level_5(user_id, old_messages)
         except Exception as e:
             logger.error(f"Ошибка обновления уровней для {user_id}: {e}")
-            # Продолжаем сохранение основной истории
-        
         data[str(user_id)] = compress_history(history)
         if not atomic_write(MEMORY_FILE, data):
             logger.error(f"Не удалось сохранить memory.json для {user_id}")
             return False
-        
         if backup:
             create_backup(user_id, "memory")
-        
         count = load_counter(user_id) + 1
         save_counter(user_id, count)
         if count % 10 == 0:
             create_backup(user_id, "profile")
-        
         return True
     except Exception as e:
         logger.error(f"Критическая ошибка при сохранении памяти {user_id}: {e}")
@@ -498,16 +461,11 @@ async def _save_memory_impl(user_id, history, backup):
 
 async def save_memory(user_id, history, backup=True, lock_held=False):
     if lock_held:
-        # Замок уже захвачен вызывающей стороной
         return await _save_memory_impl(user_id, history, backup)
     else:
         lock = get_user_lock(user_id)
         async with lock:
             return await _save_memory_impl(user_id, history, backup)
-
-# ============================================================
-# 7. ПОИСК ПО ВРЕМЕНИ И ДАТЕ
-# ============================================================
 
 def parse_time_query(time_query):
     try:
@@ -605,10 +563,6 @@ def search_in_pyramid(user_id, query):
             results.append(f"📗 {item}")
     return results[:15]
 
-# ============================================================
-# 8. АНАЛИЗАТОР СООБЩЕНИЙ
-# ============================================================
-
 async def analyze_message(user_id, user_message):
     q = user_message.lower().strip()
     short_confirm = ['да', 'нет', 'ок', 'хорошо', 'понял', 'поняла', 'ага', 'угу', 'так', 'ясно', 'ладно', 'окей']
@@ -625,6 +579,10 @@ async def analyze_message(user_id, user_message):
     for trigger in memory_triggers:
         if trigger in q:
             return {"type": "memory_query", "action": "memory_search", "needs_search": False, "needs_memory": True}
+    # ===== НОВАЯ ПРОВЕРКА НА ДАТУ/ВРЕМЯ (С КЛЮЧЕВЫМИ СЛОВАМИ) =====
+    date_keywords = ['дата', 'время', 'число', 'который час', 'сколько времени']
+    if any(keyword in q for keyword in date_keywords):
+        return {"type": "date_time", "action": "date_time", "needs_search": False, "needs_memory": False}
     date_time_triggers = [
         'какая дата', 'какое сегодня число', 'сегодняшняя дата', 'какой сегодня день',
         'который час', 'сколько времени', 'текущее время', 'сейчас время',
@@ -660,10 +618,6 @@ async def analyze_message(user_id, user_message):
         if trigger in q:
             return {"type": "instructional", "action": "internet", "needs_search": True, "needs_memory": False}
     return {"type": "static", "action": "memory", "needs_search": False, "needs_memory": True}
-
-# ============================================================
-# 9. ПОИСК В ИНТЕРНЕТЕ (АСИНХРОННЫЙ)
-# ============================================================
 
 async def search_apiserpent_async(query):
     if not APISERPENT_API_KEY:
@@ -718,10 +672,6 @@ async def search_apiserpent_async(query):
     except Exception as e:
         logger.error(f"Ошибка APISerpent: {e}")
         return []
-
-# ============================================================
-# 10. ЗАПРОС К DEEPSEEK
-# ============================================================
 
 async def ask_deepseek(messages, retries=3, max_tokens=None):
     session = await get_http_session()
@@ -780,10 +730,6 @@ async def ask_deepseek(messages, retries=3, max_tokens=None):
                 continue
             return None, f"unknown: {str(e)}"
     return None, "max_retries"
-
-# ============================================================
-# 11. ГЕНЕРАЦИЯ ОТВЕТА
-# ============================================================
 
 async def generate_response(user_id, user_message, analysis_result, history, profile):
     action = analysis_result.get("action", "memory")
@@ -880,7 +826,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         source = "🌐 из интернета"
         return final_answer, True, source
     
-    # Поиск по дате
     date_match = re.search(r'\b(сегодня|вчера|завтра|\d{2}\.\d{2}(\.\d{4})?|\d{4}-\d{2}-\d{2})\b', user_message, re.IGNORECASE)
     if date_match:
         date_query = date_match.group(1)
@@ -897,7 +842,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                     answer += f"\n... и ещё {len(date_results)-10} сообщений"
                 return answer, False, "📂 из памяти (по дате)"
     
-    # Поиск по времени
     time_match = re.search(r'(\d{1,2}:\d{2}(:\d{2})?)', user_message)
     if time_match:
         time_str = time_match.group(1)
@@ -912,7 +856,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
                 answer += f"\n... и ещё {len(time_results)-5} сообщений"
             return answer, False, "📂 из памяти (по времени)"
     
-    # Обычный ответ
     system_parts = []
     for key, value in profile.items():
         if key.startswith("last_check_") or key.startswith("update_history_"):
@@ -939,10 +882,6 @@ async def generate_response(user_id, user_message, analysis_result, history, pro
         return f"⚠️ {analyze_error(err_code)}", False, None
     source = "🧠 из модели"
     return answer, True, source
-
-# ============================================================
-# 12. КОМАНДЫ БОТА
-# ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1124,10 +1063,6 @@ def is_allowed(user_id):
         return True
     return user_id in ALLOWED_USERS_LIST
 
-# ============================================================
-# 13. ОГРАНИЧЕНИЕ ЧАСТОТЫ ЗАПРОСОВ
-# ============================================================
-
 RATE_LIMIT = 3
 RATE_WINDOW = 5
 
@@ -1141,10 +1076,6 @@ async def check_rate_limit(user_id):
             return False
         request_count[user_id].append(now)
         return True
-
-# ============================================================
-# 14. ОБРАБОТЧИК СООБЩЕНИЙ
-# ============================================================
 
 async def send_long_message(update: Update, text: str):
     for attempt in range(3):
@@ -1174,7 +1105,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(user_message) > MAX_MSG_LEN:
         user_message = user_message[:MAX_MSG_LEN] + "... (сообщение обрезано)"
     
-    # Команда "запомни" с блокировкой
     if user_message.lower().startswith("запомни "):
         text = user_message[8:].strip()
         lock = get_user_lock(user_id)
@@ -1195,7 +1125,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"✅ **Запомнил факт:** {text}")
         return
     
-    # Принудительный поиск по команде "бро"
     force_internet = False
     if user_message.lower().startswith("бро "):
         search_query = user_message[4:].strip()
@@ -1208,9 +1137,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         status_msg = None
     
-    # Анализ
     analysis_result = await analyze_message(user_id, user_message)
-    if force_internet:
+    # Исправление: если force_internet и НЕ date_time – принудительно ищем в интернете
+    if force_internet and analysis_result.get("action") != "date_time":
         analysis_result["action"] = "internet"
         analysis_result["needs_search"] = True
     
@@ -1236,13 +1165,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_message_with_date = f"[Сегодня: {get_current_date()} {get_current_time()}]\n\n{user_message}"
         history.append({"role": "user", "content": user_message_with_date, "timestamp": now_str})
         history.append({"role": "assistant", "content": answer, "timestamp": now_str})
-        await save_memory(user_id, history)  # lock_held=False (по умолчанию)
+        await save_memory(user_id, history)
     
     await send_long_message(update, answer)
-
-# ============================================================
-# 15. ОБРАБОТЧИК ОШИБОК
-# ============================================================
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1254,19 +1179,11 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update and update.effective_message:
             await update.effective_message.reply_text(analyze_error(str(e)))
 
-# ============================================================
-# 16. ЗАКРЫТИЕ СЕССИИ
-# ============================================================
-
 async def shutdown_session():
     global _http_session
     if _http_session and not _http_session.closed:
         await _http_session.close()
         logger.info("🔒 HTTP-сессия закрыта")
-
-# ============================================================
-# 17. ЗАПУСК
-# ============================================================
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
