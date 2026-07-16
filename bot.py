@@ -1,12 +1,16 @@
 # ============================================================
-#  BroWaix Bot — финальная версия с максимальной честностью
+#  BroWaix Bot — финальная версия с ограничением времени,
+#  повторными попытками и максимальной стабильностью
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                     handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()])
@@ -33,8 +37,8 @@ SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 SEARCH_RESULTS_NUM = int(os.getenv("SEARCH_RESULTS_NUM", "15"))
 SEARCH_THRESHOLD = int(os.getenv("SEARCH_THRESHOLD", "3"))
 MODEL_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", "0.1"))
+MAX_RETRY_ATTEMPTS = 3  # увеличено с 2 до 3
 
-# ===== ОБНОВЛЁННЫЙ СИСТЕМНЫЙ ПРОМПТ С ОЦЕНКОЙ УВЕРЕННОСТИ =====
 CORE_SYSTEM_RULE = (
     "Ты — честный ассистент. Ты МОЖЕШЬ строить предположения, но ОБЯЗАН указывать, что это предположение.\n"
     "ЖЁСТКИЕ ПРАВИЛА:\n"
@@ -55,7 +59,7 @@ def get_peak_status(): return "⚠️ Сейчас пиковые часы DeepS
 if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     logger.error("Токены не заданы"); sys.exit(1)
 if not APISERPENT_API_KEY:
-    logger.warning("APISERPENT_API_KEY не задан")
+    logger.warning("APISERPENT_API_KEY не задан — поиск будет недоступен")
 
 DATA_DIR, BACKUP_DIR = "data", "data/backups"
 os.makedirs(DATA_DIR, exist_ok=True); os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -302,7 +306,7 @@ async def simplify_query(query):
         return query
     except: return query
 
-# ========== DEEPSEEK API (с поддержкой max_tokens) ==========
+# ========== DEEPSEEK API ==========
 async def ask_deepseek(messages, retries=3, max_tokens=None, model=None):
     session=await get_http_session()
     use_model=model or MODEL_DEFAULT
@@ -342,69 +346,114 @@ def build_profile_context(profile):
     ctx=". ".join(parts)
     return ctx[:800]+"..." if len(ctx)>800 else ctx
 
-# ========== APISERPENT С ЛОГИРОВАНИЕМ ==========
+# ========== APISERPENT С ПОВТОРНЫМИ ПОПЫТКАМИ И УВЕЛИЧЕННЫМ ТАЙМАУТОМ ==========
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
     if not APISERPENT_API_KEY:
         logger.warning("APISERPENT_API_KEY не задан, поиск невозможен.")
         return []
 
     session = await get_http_session()
-    try:
-        logger.info(f"🔍 Поиск ({SEARCH_ENGINE}, num={num}): {query}")
-        async with session.get(
-            "https://apiserpent.com/api/search",
-            params={"q": query, "engine": SEARCH_ENGINE, "num": num},
-            headers={"X-API-Key": APISERPENT_API_KEY},
-            timeout=30
-        ) as r:
-            response_text = await r.text()
-            logger.info(f"APISerpent статус: {r.status}, тело: {response_text[:500]}")
+    for attempt in range(2):  # 2 попытки
+        try:
+            logger.info(f"🔍 Поиск ({SEARCH_ENGINE}, num={num}), попытка {attempt+1}: {query}")
+            async with session.get(
+                "https://apiserpent.com/api/search",
+                params={"q": query, "engine": SEARCH_ENGINE, "num": num},
+                headers={"X-API-Key": APISERPENT_API_KEY},
+                timeout=45  # увеличен таймаут
+            ) as r:
+                response_text = await r.text()
+                logger.info(f"APISerpent статус: {r.status}, тело: {response_text[:500]}")
 
-            if r.status != 200:
-                logger.error(f"APISerpent ошибка {r.status}: {response_text[:300]}")
+                # Обработка критических статусов
+                if r.status == 401:
+                    logger.error("Неверный API ключ APISerpent")
+                    return None  # специальный маркер
+                if r.status == 402:
+                    logger.error("Закончился баланс APISerpent")
+                    return None
+                if r.status != 200:
+                    logger.error(f"APISerpent ошибка {r.status}: {response_text[:300]}")
+                    if attempt == 1:
+                        return []
+                    continue
+
+                data = await r.json()
+                logger.info(f"APISerpent JSON: {json.dumps(data, ensure_ascii=False)[:500]}")
+
+                results = []
+                if isinstance(data.get("results"), dict):
+                    results = data["results"].get("organic", [])
+                elif "organic_results" in data:
+                    results = data["organic_results"]
+                elif isinstance(data.get("results"), list):
+                    results = data["results"]
+                elif "organic" in data:
+                    results = data["organic"]
+                elif "items" in data:
+                    results = data["items"]
+                else:
+                    for key in data:
+                        if isinstance(data[key], list) and data[key] and isinstance(data[key][0], dict):
+                            results = data[key]
+                            logger.info(f"Найдены результаты в ключе '{key}'")
+                            break
+
+                out = []
+                for x in results[:num]:
+                    if isinstance(x, dict):
+                        out.append({
+                            "title": str(x.get("title", x.get("name", "Без названия")))[:150],
+                            "snippet": str(x.get("snippet", x.get("description", x.get("text", "Нет описания"))))[:250],
+                            "link": str(x.get("url", x.get("link", x.get("href", "#"))))[:150],
+                        })
+                logger.info(f"APISerpent вернул {len(out)} результатов")
+                return out
+
+        except asyncio.TimeoutError:
+            logger.error(f"⏰ Таймаут APISerpent (попытка {attempt+1})")
+            if attempt == 1:
                 return []
+            await asyncio.sleep(2)
+        except Exception as ex:
+            logger.error(f"❌ Ошибка APISerpent (попытка {attempt+1}): {ex}")
+            if attempt == 1:
+                return []
+            await asyncio.sleep(2)
+    return []
 
-            data = await r.json()
-            logger.info(f"APISerpent JSON: {json.dumps(data, ensure_ascii=False)[:500]}")
+# ========== ФУНКЦИЯ ДЛЯ ПОДСВЕТКИ ПРОТИВОРЕЧИЙ ==========
+def highlight_contradictions(text):
+    """Находит предложения с противоречивыми маркерами и выделяет их жирным."""
+    markers = ['но', 'однако', 'с другой стороны', 'в то же время', 'хотя', 'несмотря на']
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    highlighted_sentences = []
+    found = False
+    for sent in sentences:
+        if any(marker in sent.lower() for marker in markers):
+            highlighted_sentences.append(f"<b>{sent}</b>")
+            found = True
+        else:
+            highlighted_sentences.append(sent)
+    if found:
+        new_text = ' '.join(highlighted_sentences)
+        return new_text, True
+    return text, False
 
-            results = []
-            if isinstance(data.get("results"), dict):
-                results = data["results"].get("organic", [])
-            elif "organic_results" in data:
-                results = data["organic_results"]
-            elif isinstance(data.get("results"), list):
-                results = data["results"]
-            elif "organic" in data:
-                results = data["organic"]
-            elif "items" in data:
-                results = data["items"]
-            else:
-                for key in data:
-                    if isinstance(data[key], list) and data[key] and isinstance(data[key][0], dict):
-                        results = data[key]
-                        logger.info(f"Найдены результаты в ключе '{key}'")
-                        break
-
-            out = []
-            for x in results[:num]:
-                if isinstance(x, dict):
-                    out.append({
-                        "title": str(x.get("title", x.get("name", "Без названия")))[:150],
-                        "snippet": str(x.get("snippet", x.get("description", x.get("text", "Нет описания"))))[:250],
-                        "link": str(x.get("url", x.get("link", x.get("href", "#"))))[:150],
-                    })
-            logger.info(f"APISerpent вернул {len(out)} результатов")
-            return out
-
+# ========== ГЕНЕРАЦИЯ ОТВЕТА С ОГРАНИЧЕНИЕМ ВРЕМЕНИ ==========
+async def generate_response(uid, user_message, analysis, history, profile, retry_count=0):
+    # Устанавливаем таймаут 50 секунд на всю операцию
+    try:
+        return await asyncio.wait_for(
+            _generate_response_internal(uid, user_message, analysis, history, profile, retry_count),
+            timeout=50
+        )
     except asyncio.TimeoutError:
-        logger.error("⏰ Таймаут APISerpent")
-        return []
-    except Exception as ex:
-        logger.error(f"❌ Ошибка APISerpent: {ex}")
-        return []
+        logger.warning(f"Превышено время ожидания ответа для {uid}")
+        return "⏰ Бот слишком долго думал. Попробуйте повторить запрос позже или переформулируйте его.", False, "need_retry"
 
-# ========== ГЕНЕРАЦИЯ ОТВЕТА С ПОДДЕРЖКОЙ ПРЕДПОЛОЖЕНИЙ И ОЦЕНКОЙ УВЕРЕННОСТИ ==========
-async def generate_response(uid, user_message, analysis, history, profile):
+async def _generate_response_internal(uid, user_message, analysis, history, profile, retry_count):
+    """Внутренняя функция с основной логикой."""
     action=analysis.get("action","memory")
     if action=="confirm": return "✅ Понял! Продолжаем.", False, None
     if action=="greeting":
@@ -422,28 +471,42 @@ async def generate_response(uid, user_message, analysis, history, profile):
             return ("🔍 Короткий запрос. Уточните, что именно интересует: документация, баланс, API-ключ, инструкция?"), False, None
 
         logger.info(f"🔍 Поиск по оригинальному запросу: {user_message}")
-        results_original=await search_apiserpent_async(user_message)
-        all_results=results_original[:]
-        seen=set(res.get('link') for res in all_results if res.get('link'))
+        results_original = await search_apiserpent_async(user_message)
+        # Если вернулся None – критическая ошибка (401, 402)
+        if results_original is None:
+            return ("🔑 Поисковый API недоступен (ошибка авторизации или закончился баланс). Обратитесь к администратору."), False, None
+        all_results = results_original[:] if results_original else []
+        seen = set(res.get('link') for res in all_results if res.get('link'))
 
-        if len(all_results)<SEARCH_THRESHOLD:
-            optimized=await rephrase_query(user_message)
-            if optimized and optimized!=user_message:
-                results_optimized=await search_apiserpent_async(optimized)
+        if len(all_results) < SEARCH_THRESHOLD:
+            optimized = await rephrase_query(user_message)
+            if optimized and optimized != user_message:
+                results_optimized = await search_apiserpent_async(optimized)
+                if results_optimized is None:
+                    # Если ошибка – не продолжаем
+                    return ("🔑 Поисковый API недоступен (ошибка авторизации или закончился баланс). Обратитесь к администратору."), False, None
                 for res in results_optimized:
-                    link=res.get('link')
-                    if link and link not in seen: seen.add(link); all_results.append(res)
-        if len(all_results)<SEARCH_THRESHOLD:
-            short=await simplify_query(user_message)
-            if short and short!=user_message and short!=optimized:
-                results_short=await search_apiserpent_async(short)
+                    link = res.get('link')
+                    if link and link not in seen:
+                        seen.add(link); all_results.append(res)
+        if len(all_results) < SEARCH_THRESHOLD:
+            short = await simplify_query(user_message)
+            if short and short != user_message and short != optimized:
+                results_short = await search_apiserpent_async(short)
+                if results_short is None:
+                    return ("🔑 Поисковый API недоступен (ошибка авторизации или закончился баланс). Обратитесь к администратору."), False, None
                 for res in results_short:
-                    link=res.get('link')
-                    if link and link not in seen: seen.add(link); all_results.append(res)
+                    link = res.get('link')
+                    if link and link not in seen:
+                        seen.add(link); all_results.append(res)
 
         if not all_results:
-            return (f"🔍 **Искал:** `{user_message}`\n\n"
-                    f"❌ Поиск не дал результатов. Попробуйте другие ключевые слова или проверьте подключение."), False, None
+            if retry_count < MAX_RETRY_ATTEMPTS:
+                return (f"🔍 **Искал:** `{user_message}`\n\n"
+                        f"❌ Поиск не дал результатов. Попробовать с другой формулировкой?"), False, "need_retry"
+            else:
+                return (f"🔍 **Искал:** `{user_message}`\n\n"
+                        f"❌ Поиск не дал результатов после {MAX_RETRY_ATTEMPTS} попыток. Попробуйте позже или проверьте запрос."), False, None
 
         # --- Ранжирование с учётом года и официальности ---
         for res in all_results:
@@ -492,23 +555,19 @@ async def generate_response(uid, user_message, analysis, history, profile):
         if err: return f"⚠️ {analyze_error(err)}", False, None
 
         # ===== ПОСТОБРАБОТКА =====
-        # 1. Проверка противоречий (локально)
-        contradictions = ['но', 'однако', 'с другой стороны', 'в то же время']
-        if any(word in ans for word in contradictions):
-            # Упрощённая проверка: если есть противопоставления, добавим предупреждение
-            ans = f"⚠️ В ответе есть возможные противоречия. Проверьте информацию.\n\n{ans}"
+        highlighted_text, has_contradiction = highlight_contradictions(ans)
+        if has_contradiction:
+            ans = highlighted_text
+            ans = f"⚠️ Внимание: в ответе есть возможные противоречия (выделены жирным). Проверьте информацию.\n\n{ans}"
 
-        # 2. Извлечение оценки уверенности
         confidence_match = re.search(r'Уверенность:\s*(\d+)%', ans)
         if confidence_match:
             confidence = int(confidence_match.group(1))
             if confidence < 70:
                 ans = f"⚠️ Модель оценивает свою уверенность в ответе всего на {confidence}%. Будьте внимательны.\n\n{ans}"
         else:
-            # Если модель не поставила оценку – добавляем предупреждение
             ans += "\n\n⚠️ Оценка уверенности не указана. Отнеситесь к ответу критически."
 
-        # 3. Проверка на наличие ссылок
         if 'http' not in ans and len(ans) > 100:
             ans += "\n\n⚠️ В ответе нет ссылок на источники. Убедитесь в достоверности информации."
 
@@ -537,11 +596,10 @@ async def generate_response(uid, user_message, analysis, history, profile):
     ans,err=await ask_deepseek([sysmsg]+history)
     if err: return f"⚠️ {analyze_error(err)}", False, None
 
-    # Постобработка для обычных ответов
-    contradictions = ['но', 'однако', 'с другой стороны', 'в то же время']
-    if any(word in ans for word in contradictions):
-        ans = f"⚠️ В ответе есть возможные противоречия. Проверьте информацию.\n\n{ans}"
-
+    highlighted_text, has_contradiction = highlight_contradictions(ans)
+    if has_contradiction:
+        ans = highlighted_text
+        ans = f"⚠️ Внимание: в ответе есть возможные противоречия (выделены жирным). Проверьте информацию.\n\n{ans}"
     confidence_match = re.search(r'Уверенность:\s*(\d+)%', ans)
     if confidence_match:
         confidence = int(confidence_match.group(1))
@@ -552,12 +610,118 @@ async def generate_response(uid, user_message, analysis, history, profile):
 
     return ans, True, "🧠 из модели"
 
-# ========== ОСТАЛЬНЫЕ ФУНКЦИИ (без изменений) ==========
-async def safe_reply(update: Update, text: str):
-    """Отправляет сообщение с автоматическим форматированием Markdown → HTML."""
-    msg = update.effective_message
-    if msg is None:
+# ========== ОБРАБОТЧИК КНОПОК ==========
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    data = query.data
+
+    if data == "internet_yes":
+        context.user_data["awaiting_internet_confirm"] = False
+        query_text = context.user_data.get("pending_query")
+        analysis = context.user_data.get("pending_analysis")
+        if not query_text or not analysis:
+            await query.edit_message_text("❌ Запрос потерян. Попробуйте заново.")
+            return
+        await query.edit_message_text("🌐 Ищу информацию...")
+        history = load_memory(user_id)
+        profile = load_profile(user_id)
+        answer, should_save, source = await generate_response(user_id, query_text, analysis, history, profile)
+        if source and not answer.startswith(("⚠️", "✅")):
+            answer = f"{source}\n\n{answer}"
+        if is_peak_hour() and not answer.startswith("⚠️"):
+            answer = f"⏰ Внимание: пиковые часы DeepSeek. Стоимость API удвоена.\n\n{answer}"
+        if should_save:
+            now_str = now().strftime("%Y-%m-%d %H:%M:%S")
+            history.append({"role": "user", "content": query_text, "timestamp": now_str})
+            history.append({"role": "assistant", "content": answer, "timestamp": now_str})
+            await save_memory(user_id, history)
+        if source == "need_retry":
+            context.user_data["pending_retry_query"] = query_text
+            keyboard = [[
+                InlineKeyboardButton("✅ Да, переформулировать", callback_data="retry_yes"),
+                InlineKeyboardButton("❌ Нет", callback_data="retry_no")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(answer, reply_markup=reply_markup)
+        else:
+            await query.edit_message_text(answer, parse_mode='HTML')
+        context.user_data.pop("pending_query", None)
+        context.user_data.pop("pending_analysis", None)
         return
+
+    if data == "internet_no":
+        context.user_data["awaiting_internet_confirm"] = False
+        query_text = context.user_data.get("pending_query")
+        analysis = context.user_data.get("pending_analysis")
+        if query_text and analysis:
+            analysis["action"] = "memory"
+            history = load_memory(user_id)
+            profile = load_profile(user_id)
+            answer, should_save, source = await generate_response(user_id, query_text, analysis, history, profile)
+            if source and not answer.startswith(("⚠️", "✅")):
+                answer = f"{source}\n\n{answer}"
+            if is_peak_hour() and not answer.startswith("⚠️"):
+                answer = f"⏰ Внимание: пиковые часы DeepSeek. Стоимость API удвоена.\n\n{answer}"
+            if should_save:
+                now_str = now().strftime("%Y-%m-%d %H:%M:%S")
+                history.append({"role": "user", "content": query_text, "timestamp": now_str})
+                history.append({"role": "assistant", "content": answer, "timestamp": now_str})
+                await save_memory(user_id, history)
+            await query.edit_message_text(answer, parse_mode='HTML')
+        else:
+            await query.edit_message_text("❌ Запрос потерян. Попробуйте заново.")
+        context.user_data.pop("pending_query", None)
+        context.user_data.pop("pending_analysis", None)
+        return
+
+    if data == "retry_yes":
+        original_query = context.user_data.get("pending_retry_query")
+        if not original_query:
+            await query.edit_message_text("❌ Запрос потерян. Попробуйте заново.")
+            return
+        retry_count = context.user_data.get("retry_count", 0) + 1
+        await query.edit_message_text(f"🔄 Переформулирую и ищу заново (попытка {retry_count})...")
+        new_query = await rephrase_query(original_query)
+        history = load_memory(user_id)
+        profile = load_profile(user_id)
+        analysis = {"action": "internet"}
+        answer, should_save, source = await generate_response(user_id, new_query, analysis, history, profile, retry_count)
+        if source and not answer.startswith(("⚠️", "✅")):
+            answer = f"{source}\n\n{answer}"
+        if is_peak_hour() and not answer.startswith("⚠️"):
+            answer = f"⏰ Внимание: пиковые часы DeepSeek. Стоимость API удвоена.\n\n{answer}"
+        if should_save:
+            now_str = now().strftime("%Y-%m-%d %H:%M:%S")
+            history.append({"role": "user", "content": new_query, "timestamp": now_str})
+            history.append({"role": "assistant", "content": answer, "timestamp": now_str})
+            await save_memory(user_id, history)
+        if source == "need_retry" and retry_count < MAX_RETRY_ATTEMPTS:
+            context.user_data["pending_retry_query"] = original_query
+            context.user_data["retry_count"] = retry_count
+            keyboard = [[
+                InlineKeyboardButton("✅ Попробовать ещё раз", callback_data="retry_yes"),
+                InlineKeyboardButton("❌ Нет, хватит", callback_data="retry_no")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(answer, reply_markup=reply_markup)
+        else:
+            await query.edit_message_text(answer, parse_mode='HTML')
+            context.user_data.pop("pending_retry_query", None)
+            context.user_data.pop("retry_count", None)
+        return
+
+    if data == "retry_no":
+        await query.edit_message_text("❌ Хорошо, отменяю повторный поиск.")
+        context.user_data.pop("pending_retry_query", None)
+        context.user_data.pop("retry_count", None)
+        return
+
+# ========== БЕЗОПАСНЫЙ ОТВЕТ С ПОДДЕРЖКОЙ КНОПОК ==========
+async def safe_reply(update: Update, text: str, reply_markup=None):
+    msg = update.effective_message
+    if msg is None: return
 
     def markdown_to_html(t):
         t = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', t)
@@ -581,7 +745,6 @@ async def safe_reply(update: Update, text: str):
                     in_table = False
                 new_lines.append(line)
         t = '\n'.join(new_lines)
-
         emoji_map = {
             'дата': '📅', 'выйдет': '📅', 'релиз': '🚀', 'выход': '📅',
             'производительность': '⚡', 'скорость': '⚡',
@@ -591,7 +754,6 @@ async def safe_reply(update: Update, text: str):
         }
         for word, emoji in emoji_map.items():
             t = re.sub(rf'(?i)({word}\s*:)', f'{emoji} \\1', t)
-
         t = re.sub(r'\n{3,}', '\n\n', t)
         return t.strip()
 
@@ -602,15 +764,15 @@ async def safe_reply(update: Update, text: str):
         try:
             if len(text) > 4096:
                 for i in range(0, len(text), 4096):
-                    await msg.reply_text(text[i:i+4096], parse_mode='HTML')
+                    await msg.reply_text(text[i:i+4096], parse_mode='HTML', reply_markup=reply_markup)
             else:
-                await msg.reply_text(text, parse_mode='HTML')
+                await msg.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
             return
         except Exception as ex:
             if attempt == 2:
                 logger.error(f"safe_reply не смог: {ex}")
                 try:
-                    await msg.reply_text(text)
+                    await msg.reply_text(text, reply_markup=reply_markup)
                 except:
                     pass
             else:
@@ -765,46 +927,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message=update.effective_message.text
     if len(user_message)>3500: user_message=user_message[:3500]+"... (обрезано)"
 
-    if context.user_data.get("awaiting_internet_confirm"):
-        if user_message.lower() in ("да","нет","д","н","yes","no"):
-            if user_message.lower() in ("да","д","yes"):
-                context.user_data["awaiting_internet_confirm"]=False
-                query=context.user_data.get("pending_query")
-                analysis=context.user_data.get("pending_analysis")
-                if query and analysis:
-                    await safe_reply(update,"🌐 Ищу информацию...")
-                    history=load_memory(uid); profile=load_profile(uid)
-                    answer,should_save,source=await generate_response(uid, query, analysis, history, profile)
-                    if source and not answer.startswith(("⚠️","✅")): answer=f"{source}\n\n{answer}"
-                    if is_peak_hour() and not answer.startswith("⚠️"): answer=f"⏰ Внимание: пиковые часы DeepSeek. Стоимость API удвоена.\n\n{answer}"
-                    if should_save:
-                        now_str=now().strftime("%Y-%m-%d %H:%M:%S")
-                        history.append({"role":"user","content":query,"timestamp":now_str})
-                        history.append({"role":"assistant","content":answer,"timestamp":now_str})
-                        await save_memory(uid, history)
-                    await safe_reply(update, answer)
-                else: await safe_reply(update,"❌ Ошибка: запрос потерян.")
-                context.user_data.pop("pending_query",None); context.user_data.pop("pending_analysis",None); return
-            else:
-                context.user_data["awaiting_internet_confirm"]=False
-                query=context.user_data.get("pending_query")
-                analysis=context.user_data.get("pending_analysis")
-                if query and analysis:
-                    analysis["action"]="memory"
-                    history=load_memory(uid); profile=load_profile(uid)
-                    answer,should_save,source=await generate_response(uid, query, analysis, history, profile)
-                    if source and not answer.startswith(("⚠️","✅")): answer=f"{source}\n\n{answer}"
-                    if is_peak_hour() and not answer.startswith("⚠️"): answer=f"⏰ Внимание: пиковые часы DeepSeek. Стоимость API удвоена.\n\n{answer}"
-                    if should_save:
-                        now_str=now().strftime("%Y-%m-%d %H:%M:%S")
-                        history.append({"role":"user","content":query,"timestamp":now_str})
-                        history.append({"role":"assistant","content":answer,"timestamp":now_str})
-                        await save_memory(uid, history)
-                    await safe_reply(update, answer)
-                else: await safe_reply(update,"❌ Ошибка: запрос потерян.")
-                context.user_data.pop("pending_query",None); context.user_data.pop("pending_analysis",None); return
-        else: await safe_reply(update,"❓ Напишите «да» или «нет» — я продолжу."); return
-
+    # Обработка команд и обычных сообщений
     if user_message.lower().startswith("запомни "):
         text=user_message[8:].strip()
         async with get_user_lock(uid):
@@ -843,14 +966,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             history.append({"role":"user","content":user_message,"timestamp":now_str})
             history.append({"role":"assistant","content":answer,"timestamp":now_str})
             await save_memory(uid, history)
-        await safe_reply(update, answer)
+        if source == "need_retry":
+            context.user_data["pending_retry_query"] = user_message
+            keyboard = [[
+                InlineKeyboardButton("✅ Да, переформулировать", callback_data="retry_yes"),
+                InlineKeyboardButton("❌ Нет", callback_data="retry_no")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await safe_reply(update, answer, reply_markup=reply_markup)
+        else:
+            await safe_reply(update, answer)
         return
 
     if analysis.get("action")=="internet":
-        context.user_data["awaiting_internet_confirm"]=True
-        context.user_data["pending_query"]=user_message
-        context.user_data["pending_analysis"]=analysis
-        await safe_reply(update,"🔍 Я могу поискать в интернете. Напишите «да» или «нет».")
+        context.user_data["awaiting_internet_confirm"] = True
+        context.user_data["pending_query"] = user_message
+        context.user_data["pending_analysis"] = analysis
+        keyboard = [[
+            InlineKeyboardButton("✅ Да", callback_data="internet_yes"),
+            InlineKeyboardButton("❌ Нет", callback_data="internet_no")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.effective_message.reply_text(
+            "🔍 Я могу поискать в интернете по вашему запросу. Искать?",
+            reply_markup=reply_markup
+        )
         return
 
     history=load_memory(uid); profile=load_profile(uid)
@@ -885,6 +1025,7 @@ if __name__=="__main__":
     app.add_handler(CommandHandler("forget", forget_command))
     app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
     logger.info("✅ БОТ ГОТОВ К РАБОТЕ.")
     try: app.run_polling()
