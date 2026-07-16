@@ -1,6 +1,7 @@
 # ============================================================
 #  BroWaix Bot — ФИНАЛЬНАЯ ВЕРСИЯ 2026
-#  (999% релевантность, НИКАКОЙ ЛЖИ)
+#  (экспертный уровень, бюджет $7–8/мес, 150 запросов/день)
+#  Улучшения: сравнение источников, плюсы/минусы, фильтр бюджета
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
 from datetime import datetime, timedelta
@@ -44,14 +45,15 @@ MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
-# --- ОПТИМИЗИРОВАННЫЕ ПАРАМЕТРЫ (экономия + качество) ---
-SEARCH_RESULTS_NUM = 10        # достаточно для ранжирования
-SEARCH_VARIANTS_COUNT = 1      # 1 точный запрос вместо 3
+# --- ОПТИМИЗИРОВАННЫЕ ПАРАМЕТРЫ ---
+SEARCH_RESULTS_NUM = 10
+SEARCH_VARIANTS_COUNT = 1
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
-CACHE_TTL = 604800             # 7 дней кэша
-MAX_TOKENS_ANSWER = 1024       # для структурированных ответов
-TOP_RESULTS_SHOW = 5           # только топ-5 ссылок в ответе
+CACHE_TTL = 604800  # 7 дней
+MAX_TOKENS_ANSWER = 2048  # увеличен для структурированных ответов
+MAX_TOKENS_DEEP = 4096    # для /deep
+TOP_RESULTS_SHOW = 6
 
 # ---------- ПАМЯТЬ ----------
 LEVEL_1 = {'max_history': 40, 'keep_recent': 10}
@@ -87,7 +89,7 @@ async def get_http_session():
             )
         return _http_session
 
-# ---------- ФАЙЛЫ (атомарные) ----------
+# ---------- ФАЙЛЫ ----------
 def atomic_write(filename, data, as_json=True):
     tmp = filename + ".tmp"
     try:
@@ -199,7 +201,7 @@ async def save_memory(uid, history, backup=True, lock_held=False):
     if lock_held: return await _save_memory_impl(uid, history, backup)
     async with get_user_lock(uid): return await _save_memory_impl(uid, history, backup)
 
-# ---------- ИНСТРУМЕНТЫ ДЛЯ ФИЛЬТРАЦИИ ----------
+# ---------- УЛУЧШЕННЫЕ ИНСТРУМЕНТЫ ФИЛЬТРАЦИИ ----------
 def extract_year_from_text(text):
     match = re.search(r'\b(20[2-9][0-9])\b', text)
     if match and match.group(1).isdigit():
@@ -214,14 +216,49 @@ def extract_price_from_text(text):
             return int(price_str)
     return None
 
+def extract_models_from_text(text):
+    """Извлекает все упоминания моделей из текста"""
+    model_patterns = [
+        r'(X96Q|X96|H96\s*Max|H96|Tanix\s*TX3|Tanix|Xiaomi\s*Mi\s*Box\s*S|Xiaomi|Vontar\s*X4|Vontar|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Sber|Rombica|Kickpi|TOX|X88)',
+        r'(MacBook\s*Air\s*M[4-6]|MacBook\s*Pro\s*M[4-6]|ASUS\s*Zenbook\s*S\s*\d+|ThinkPad\s*T\d+|Dell\s*XPS\s*\d+)',
+        r'(iPhone\s*\d+\s*Pro\s*(Max)?|Samsung\s*Galaxy\s*S\d+\s*Ultra|Xiaomi\s*\d+\s*Pro|Google\s*Pixel\s*\d+)',
+        r'(H618|H313|S905X4|S905X3|S905|RK3566|M4|M5|Ultra\s*\d+|Ryzen\s*\d+)',
+    ]
+    models = []
+    for pattern in model_patterns:
+        matches = re.findall(pattern, text, re.I)
+        models.extend([m.strip() for m in matches if m.strip()])
+    return list(set(models))
+
+def extract_pros_cons(text):
+    """Извлекает плюсы и минусы из текста"""
+    pros = re.findall(r'(лучш(ий|ая|ее)|преимущество|плюс|отлично|хорош|удобн|мощн|быстр|тих|легк|долг)', text, re.I)
+    cons = re.findall(r'(хуже|недостаток|минус|дорогой|проблема|тяжел|греет|шумн|мало|не хватает|устарел)', text, re.I)
+    return len(pros), len(cons)
+
+def extract_budget_from_query(query):
+    """Извлекает бюджет из запроса пользователя"""
+    match = re.search(r'(?:до|не более|не дороже|max|максимум)\s*([\d\s]+)\s*(?:тыс|руб|₽|р\.)', query, re.I)
+    if match:
+        price_str = re.sub(r'\s', '', match.group(1))
+        if price_str.isdigit():
+            return int(price_str)
+    # Если указано "бюджетный"
+    if re.search(r'бюджетн', query, re.I):
+        return 15000
+    # Если указано "премиальный" или "флагман"
+    if re.search(r'(премиальн|флагман|дорог)', query, re.I):
+        return 80000
+    return None
+
 def is_official_link(link):
     return any(dom in link.lower() for dom in [
         'python.org','docs.python.org','github.com','pypi.org',
-        'wikipedia.org','4pda','habr','ixbt','youtube','review','top','blog'
+        'wikipedia.org','4pda','habr','ixbt','youtube','review','top','blog',
+        'notebookcheck','techradar','gsmarena','dxomark','laptopmag','cnet'
     ])
 
-def assess_relevance(results, query, max_age_days=365):
-    """Жёсткая фильтрация: только релевантные и свежие результаты"""
+def assess_relevance(results, query):
     if not results:
         return []
     
@@ -234,12 +271,15 @@ def assess_relevance(results, query, max_age_days=365):
     keywords = [w.lower() for w in re.sub(r'[^\w\s]', '', query).split() 
                 if w.lower() not in stop_words and len(w) > 3]
     
+    model_names = ['X96','H96','Tanix','Xiaomi','Vontar','Ugoos','Beelink','Minix','WeChip','A95X','Dune','Sber','Rombica','Kickpi','TOX','X88','H618','H313','S905','RK3566','4K','HDR','Dolby','Android','Google TV','MacBook','Air','Pro','ASUS','Zenbook','ThinkPad','Dell','XPS','iPhone','Samsung','Galaxy','Pixel']
+    
     scored = []
     for res in results:
         text = (res.get('title', '') + ' ' + res.get('snippet', '')).lower()
         link = res.get('link', '').lower()
         
         keyword_score = sum(2 for kw in keywords if kw in text)
+        model_score = sum(3 for model in model_names if model.lower() in text)
         
         year = extract_year_from_text(text)
         year_score = 0
@@ -256,18 +296,20 @@ def assess_relevance(results, query, max_age_days=365):
                 year_score = -5
         
         domain_score = 0
-        trusted_domains = ['4pda', 'habr', 'ixbt', 'youtube', 'review', 'top', 'blog']
+        trusted_domains = ['4pda', 'habr', 'ixbt', 'youtube', 'review', 'top', 'blog', 'notebookcheck', 'techradar', 'gsmarena', 'dxomark', 'laptopmag', 'cnet']
         for domain in trusted_domains:
             if domain in link:
                 domain_score += 3
                 break
         
-        # Штраф за маркетплейсы
         if any(x in link for x in ['ozon', 'wildberries', 'aliexpress', 'sbermegamarket']):
             domain_score -= 5
         
-        total_score = keyword_score + year_score + domain_score
-        scored.append({**res, 'score': total_score, 'year': year})
+        pros, cons = extract_pros_cons(text)
+        balance_score = pros - cons
+        
+        total_score = keyword_score + model_score + year_score + domain_score + balance_score
+        scored.append({**res, 'score': total_score, 'year': year, 'price': extract_price_from_text(text)})
     
     scored.sort(key=lambda x: x['score'], reverse=True)
     return [r for r in scored if r['score'] > 0][:TOP_RESULTS_SHOW]
@@ -278,7 +320,6 @@ def normalize_query(query):
     return normalized[:100]
 
 def get_cached(query):
-    # Не кэшируем только запросы про "сейчас" (погода, курс)
     if any(word in query.lower() for word in ['погода', 'курс']):
         return None
     norm_key = normalize_query(query)
@@ -296,81 +337,99 @@ def set_cache(query, data):
         oldest = min(search_cache.keys(), key=lambda k: search_cache[k]['time'])
         del search_cache[oldest]
 
-# ===== ГЛАВНАЯ ЛОГИКА: 999% РЕЛЕВАНТНОСТЬ =====
 def remove_unverified_claims(ans, raw_snippets):
-    """Удаляет из ответа всё, что не подтверждено интернет-данными"""
     if not raw_snippets:
         return ans
-    
-    # Ищем сущности (бренды, модели, технологии)
-    entities = re.findall(r'(Xiaomi|H96|X96Q|Tanix|Vontar|RockTek|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Apple|Sber|Rombica|Kickpi|TOX|X88|H618|H313|S905|RK3566|4K|HDR|Dolby|Android|Google TV)', ans, re.I)
+    entities = re.findall(r'(Xiaomi|H96|X96Q|Tanix|Vontar|RockTek|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Apple|Sber|Rombica|Kickpi|TOX|X88|H618|H313|S905|RK3566|4K|HDR|Dolby|Android|Google TV|MacBook|ASUS|Zenbook|ThinkPad|Dell|XPS|iPhone|Samsung|Galaxy|Pixel)', ans, re.I)
     modified = False
     for entity in set(entities):
         if entity.lower() not in raw_snippets.lower():
             ans = re.sub(rf'\b{re.escape(entity)}\b', '', ans, flags=re.I)
             modified = True
             logger.info(f"🔍 Удалена неподтверждённая сущность: {entity}")
-    
     if modified:
         ans = re.sub(r'\s+', ' ', ans)
         ans = re.sub(r'\s*\.\s*', '. ', ans)
         ans = re.sub(r'\s*,', ',', ans)
         ans = re.sub(r'\.\s*\.', '.', ans)
-    
     return ans
 
 def generate_answer_from_snippets(results, user_message, max_items=5):
-    """Формирует ответ ТОЛЬКО из найденных ссылок"""
     if not results:
         return "❌ В интернете ничего не найдено по вашему запросу."
-    
     answer = f"🔍 **Результаты поиска по запросу:** {user_message[:100]}\n\n"
-    
-    # Фильтруем только релевантные
     relevant = [r for r in results if r.get('score', 0) > 0][:max_items]
-    
     if not relevant:
-        # Если после фильтрации ничего не осталось — показываем сырые ссылки
         links = [r.get('link') for r in results if r.get('link') and r['link'] != '#']
         if links:
-            answer = "🔍 **Найденные ссылки (без релевантного описания):**\n\n"
+            answer = "🔍 **Найденные ссылки:**\n\n"
             for link in links[:max_items]:
                 answer += f"• {link}\n"
-            answer += f"\n📅 Дата: {get_current_date()} (поиск выполнен сегодня)\n"
-            answer += "Уверенность: 70% (на основе найденных данных)"
+            answer += f"\n📅 Дата: {get_current_date()}"
+            answer += "\nУверенность: 70% (на основе найденных данных)"
             return answer
         else:
             return f"Найденные данные:\n\n{str(results)[:1000]}"
-    
     for i, r in enumerate(relevant, 1):
         year_note = f" ({r.get('year')})" if r.get('year') else ""
-        answer += f"{i}. **{r.get('title', 'Без названия')}**{year_note}\n"
+        price_note = f" [{r.get('price')} руб.]" if r.get('price') else ""
+        answer += f"{i}. **{r.get('title', 'Без названия')}**{year_note}{price_note}\n"
         if r.get('snippet'):
             answer += f"   {r['snippet'][:200]}\n"
         if r.get('link') and r['link'] != '#':
             answer += f"   🔗 <a href='{r['link']}'>Источник</a>\n"
         answer += "\n"
-    
-    answer += f"📅 Дата: {get_current_date()} (поиск выполнен сегодня)\n"
-    answer += "Уверенность: 85% (на основе найденных данных)"
+    answer += f"📅 Дата: {get_current_date()}"
+    answer += "\nУверенность: 85% (на основе найденных данных)"
     return answer
 
-# ===== ПРОМПТ =====
+# ===== НОВЫЙ ЭКСПЕРТНЫЙ ПРОМПТ СО СРАВНЕНИЕМ ИСТОЧНИКОВ =====
 CORE_SYSTEM_RULE = (
-    "Ты — честный ассистент. Ты УЖЕ выполнил поиск в интернете и получил данные (они приведены ниже).\n"
-    "Если в разделе «НАЙДЕННЫЕ ДАННЫЕ» есть информация – ты ОБЯЗАН использовать ТОЛЬКО её.\n"
-    "ЗАПРЕЩЕНО использовать свои внутренние знания, если есть интернет-данные.\n"
-    "Если данных в разделе нет – ты МОЖЕШЬ использовать свои знания, но ОБЯЗАТЕЛЬНО пометь это.\n\n"
-    "ПРАВИЛА:\n"
-    "1. Если есть данные – используй ТОЛЬКО их, каждое утверждение сопровождай ссылкой.\n"
-    "2. Если данных нет – отвечай на основе знаний, но начинай с ⚠️ 'Данных в интернете не найдено. Использую свои знания.' и ставь уверенность 20%.\n"
-    "3. НИКОГДА не придумывай факты. Если не знаешь — скажи 'Я не знаю'.\n"
-    "4. В конце всегда указывай: 📅 Дата, Уверенность: XX%.\n\n"
-    "ФОРМАТ ОТВЕТА:\n"
-    "Структурируй ответ: заголовки, списки, ссылки. Используй эмодзи для наглядности."
+    "Ты — экспертный аналитик. Твоя задача — дать ПОЛНЫЙ, СТРУКТУРИРОВАННЫЙ ответ, а не просто ссылки.\n\n"
+    
+    "=== ГЛАВНЫЙ ПРИНЦИП ===\n"
+    "Никогда не оставляй пользователя без ответа. Если данных нет — дай ПРЕДПОЛОЖЕНИЕ на основе знаний и логики, но ЧЁТКО пометь это.\n\n"
+    
+    "=== ТВОЙ АЛГОРИТМ ===\n"
+    "1. Проанализируй найденные данные: что есть?\n"
+    "2. Если источники противоречат друг другу — выдели это отдельно.\n"
+    "3. Если данных мало или они косвенные:\n"
+    "   а) выдели ключевую информацию из того, что есть (бренды, модели, цены, оценки)\n"
+    "   б) сделай логический вывод на основе частоты упоминаний\n"
+    "   в) используй свои общие знания о рынке, чтобы заполнить пробелы\n"
+    "   г) дай СТРУКТУРИРОВАННЫЙ ответ, а не просто ссылки\n"
+    "4. Чётко раздели:\n"
+    "   ✅ Факты из интернета (со ссылками)\n"
+    "   📊 Сравнение источников (кто что сказал)\n"
+    "   ⚠️ Логические выводы (на основе данных)\n"
+    "   🧠 Предположения (на основе знаний модели) — не выше 25%\n\n"
+    
+    "=== СТРУКТУРА ОТВЕТА ===\n"
+    "📌 **Краткий вывод** (1–2 предложения)\n\n"
+    "### 🏆 ТОП-3/5 моделей\n"
+    "| № | Модель | Цена | Характеристики | Оценка |\n"
+    "|---|--------|------|----------------|--------|\n"
+    "| 1 | X      | Y    | Z              | W      |\n\n"
+    "### 📋 Что говорят источники (сравнение)\n"
+    "| Источник | №1 | №2 | №3 | Комментарий |\n"
+    "|----------|----|----|----|-------------|\n"
+    "| Source1  | A  | B  | C  | ...         |\n\n"
+    "### 🎯 По сценариям (моя рекомендация)\n"
+    "| Если вам нужно | Берите | Почему |\n"
+    "|----------------|--------|--------|\n"
+    "| Сценарий X     | Модель Y | причина |\n\n"
+    "### ⚠️ На что обратить внимание\n"
+    "• предостережение 1\n"
+    "• предостережение 2\n\n"
+    "### 🔗 На чём основан ответ\n"
+    "Список источников\n\n"
+    "📅 Дата\n"
+    "🔹 Уверенность в ТОПе: XX%\n"
+    "🔹 Уверенность в ценах: XX%\n"
+    "🔹 Уверенность в рекомендациях: XX%"
 )
 
-# ---------- ПОИСК (приоритет: Google через APISerpent) ----------
+# ---------- ПОИСК ----------
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
     if not APISERPENT_API_KEY: return []
     session = await get_http_session()
@@ -396,8 +455,9 @@ async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
                 if isinstance(x, dict):
                     out.append({
                         "title": str(x.get("title", ""))[:120],
-                        "snippet": str(x.get("snippet", ""))[:300],
-                        "link": str(x.get("url", x.get("link", "#")))[:120]
+                        "snippet": str(x.get("snippet", ""))[:400],
+                        "link": str(x.get("url", x.get("link", "#")))[:120],
+                        "source": str(x.get("source", x.get("domain", "неизвестно")))[:50]
                     })
             return out
     except Exception as e:
@@ -420,126 +480,276 @@ async def search_duckduckgo_async(query):
                 results.append({
                     "title": "DuckDuckGo (факт)",
                     "snippet": data['AbstractText'][:500],
-                    "link": data.get('AbstractURL', '#')
+                    "link": data.get('AbstractURL', '#'),
+                    "source": "duckduckgo"
                 })
             for topic in data.get('RelatedTopics', []):
                 if 'Text' in topic:
                     results.append({
                         "title": "DuckDuckGo",
                         "snippet": topic['Text'][:300],
-                        "link": topic.get('FirstURL', '#')
+                        "link": topic.get('FirstURL', '#'),
+                        "source": "duckduckgo"
                     })
             return results
     except Exception:
         return []
 
 async def search_primary(query):
-    """Сначала Google через APISerpent, если нет — DuckDuckGo"""
     results = await search_apiserpent_async(query)
     if results:
         return results
     logger.info("🔄 APISerpent пуст, пробуем DuckDuckGo")
     return await search_duckduckgo_async(query)
 
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ УВЕРЕННОСТИ ----------
+def calculate_confidence(scored, user_message):
+    if not scored:
+        return 20
+    
+    base = 70
+    has_prices = False
+    has_models = False
+    has_dates = False
+    has_scores = False
+    source_count = min(len(scored), 5)
+    
+    model_names = ['X96','H96','Tanix','Xiaomi','Vontar','Ugoos','Beelink','Minix','WeChip','A95X','Dune','Sber','Rombica','Kickpi','TOX','X88','H618','H313','S905','RK3566','MacBook','ASUS','Zenbook','ThinkPad','Dell','XPS','iPhone','Samsung','Galaxy','Pixel']
+    
+    for r in scored[:5]:
+        text = r.get('title', '') + ' ' + r.get('snippet', '')
+        if r.get('price') or re.search(r'\d{3,5}\s*(руб|₽)', text):
+            has_prices = True
+        if any(model in text for model in model_names):
+            has_models = True
+        if re.search(r'20[2-9][0-9]', text):
+            has_dates = True
+        if re.search(r'\d+\.\d+|\d+/\d+|\d+%\s*$', text):
+            has_scores = True
+    
+    confidence = base
+    if has_prices: confidence += 10
+    if has_models: confidence += 10
+    if has_dates: confidence += 5
+    if has_scores: confidence += 5
+    if source_count >= 3: confidence += 5
+    
+    return min(confidence, 95)
+
+def has_direct_answer(scored, user_message):
+    if not scored:
+        return False
+    
+    keywords = [w.lower() for w in re.sub(r'[^\w\s]', '', user_message).split() 
+                if len(w) > 3 and w.lower() not in STOP_WORDS]
+    
+    for r in scored[:5]:
+        text = (r.get('title', '') + ' ' + r.get('snippet', '')).lower()
+        matches = sum(1 for kw in keywords if kw in text)
+        if matches >= len(keywords) * 0.5:
+            return True
+    
+    model_names = ['X96','H96','Tanix','Xiaomi','Vontar','Ugoos','Beelink','Minix','WeChip','A95X','Dune','Sber','Rombica','Kickpi','TOX','X88','H618','H313','S905','RK3566','MacBook','ASUS','Zenbook','ThinkPad','Dell','XPS','iPhone','Samsung','Galaxy','Pixel']
+    for r in scored[:5]:
+        text = r.get('snippet', '') + ' ' + r.get('title', '')
+        if re.search(r'\d{3,5}\s*(руб|₽)', text):
+            return True
+        if any(model in text for model in model_names):
+            return True
+    
+    return False
+
+def infer_models_from_data(scored, budget_limit, query_year):
+    """Логический вывод моделей на основе имеющихся данных"""
+    if not scored:
+        return []
+    
+    all_models = []
+    for r in scored:
+        text = r.get('title', '') + ' ' + r.get('snippet', '')
+        models = extract_models_from_text(text)
+        all_models.extend(models)
+    
+    if not all_models:
+        return None
+    
+    candidates = []
+    for r in scored:
+        models = extract_models_from_text(r.get('title', '') + ' ' + r.get('snippet', ''))
+        price = r.get('price')
+        if models and price and price <= budget_limit:
+            candidates.append({
+                'model': models[0],
+                'price': price,
+                'snippet': r.get('snippet', '')[:200],
+                'year': r.get('year', 0),
+                'link': r.get('link', ''),
+                'confidence': 60
+            })
+    
+    if candidates:
+        return candidates
+    return None
+
 # ---------- ГЕНЕРАЦИЯ ОТВЕТА ----------
-async def generate_response(uid, user_message, history, profile, retry_count=0):
+async def generate_response(uid, user_message, history, profile, is_deep=False):
     try:
         return await asyncio.wait_for(
-            _generate_response_internal(uid, user_message, history, profile, retry_count),
-            timeout=50
+            _generate_response_internal(uid, user_message, history, profile, is_deep),
+            timeout=60
         )
     except asyncio.TimeoutError:
         return "⏰ Превышено время ожидания. Попробуйте позже.", False
 
-async def _generate_response_internal(uid, user_message, history, profile, retry_count):
+async def _generate_response_internal(uid, user_message, history, profile, is_deep):
     ctx = build_profile_context(profile)
     
-    # Проверяем кэш
+    # Извлекаем бюджет из запроса
+    budget = extract_budget_from_query(user_message)
+    budget_note = f" (бюджет до {budget} руб.)" if budget else ""
+    
     cached = get_cached(user_message)
     if cached:
         all_results = cached
     else:
-        # Генерируем поисковый запрос (1 вариант)
         variants = await generate_search_query(user_message)
         logger.info(f"🔍 Поисковый запрос: {variants[0]}")
-        
-        # Ищем через Google (APISerpent) + резерв DuckDuckGo
         all_results = await search_primary(variants[0])
         logger.info(f"📊 Найдено результатов: {len(all_results)}")
-        
-        # Кэшируем только если нашлось
         if all_results:
             set_cache(user_message, all_results)
     
-    # Если нет результатов — используем локальные знания с чёткой пометкой
     if not all_results:
         return await generate_local_answer(uid, user_message, history, profile, 
             reason="Поиск в интернете не дал результатов")
     
-    # Жёсткая фильтрация релевантности
     scored = assess_relevance(all_results, user_message)
     if not scored:
         return await generate_local_answer(uid, user_message, history, profile,
             reason="Найденные данные нерелевантны запросу")
     
-    # Проверка свежести (если запрос про "этот год" или "2024-2026")
+    # Если данных мало — пробуем логический вывод
+    if not has_direct_answer(scored, user_message):
+        if budget:
+            inferred = infer_models_from_data(scored, budget, now().year)
+            if inferred:
+                return await generate_inferred_answer(uid, user_message, history, profile, 
+                    scored, inferred, budget, is_deep)
+        return await generate_local_answer(uid, user_message, history, profile,
+            reason="Найденные данные не содержат прямого ответа")
+    
     if re.search(r'\b(этот год|202[4-9])\b', user_message.lower()):
         has_fresh = any(r.get('year', 0) >= 2024 for r in scored[:5])
         if not has_fresh:
             return await generate_local_answer(uid, user_message, history, profile,
                 reason="В интернете нет актуальных данных за этот год")
     
-    # ===== ДАННЫЕ ЕСТЬ И ОНИ РЕЛЕВАНТНЫ =====
-    # Формируем сниппеты для промпта
+    # Формируем сниппеты с источниками
     stext = ""
+    sources_text = ""
     for i, r in enumerate(scored[:TOP_RESULTS_SHOW], 1):
         year_note = f" ({r.get('year')} г.)" if r.get('year') else ""
         price_note = f" [{r.get('price')} руб.]" if r.get('price') else ""
+        source = r.get('source', 'неизвестно')
         link_html = f"🔗 <a href=\"{r.get('link')}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
         stext += f"{i}. **{r.get('title', 'Без названия')}**{year_note}{price_note}\n"
-        stext += f"   {r.get('snippet', 'Нет описания')[:300]}\n"
-        stext += f"   {link_html}\n\n"
+        stext += f"   {r.get('snippet', 'Нет описания')[:350]}\n"
+        stext += f"   Источник: {source} | {link_html}\n\n"
+        sources_text += f"• {source} ({r.get('link', 'нет ссылки')})\n"
     
-    # Промпт с жёстким требованием использовать ТОЛЬКО данные
+    max_tokens = MAX_TOKENS_DEEP if is_deep else MAX_TOKENS_ANSWER
+    
     sp = {
         "role": "system",
         "content": (
             f"{CORE_SYSTEM_RULE}\n"
             f"Сегодня: {get_current_date()}.\n"
             f"Контекст: {ctx}\n\n"
-            "НАЙДЕННЫЕ ДАННЫЕ (используй ТОЛЬКО их):\n"
+            f"НАЙДЕННЫЕ ДАННЫЕ (используй их как основу){budget_note}:\n"
             f"{stext}\n\n"
-            "ИНСТРУКЦИЯ ПО ОТВЕТУ:\n"
-            "1. Используй ТОЛЬКО данные выше.\n"
-            "2. Каждый факт должен сопровождаться ссылкой.\n"
-            "3. НЕ используй свои знания, если есть данные.\n"
-            "4. Структурируй: заголовки, списки, эмодзи.\n"
-            "5. Ответ должен быть полезным и конкретным."
+            "ИНСТРУКЦИЯ:\n"
+            "1. Используй найденные данные как основу.\n"
+            "2. Если источники противоречат друг другу — выдели это в таблице сравнения.\n"
+            "3. Сделай логический вывод на основе частоты упоминаний.\n"
+            "4. Дай ПОЛНЫЙ ответ: список моделей, таблицу, рекомендации.\n"
+            "5. Если данных не хватает — дополни своими знаниями, но чётко пометь 'Предположительно'.\n"
+            "6. НЕ оставляй пользователя без ответа."
         )
     }
     
-    ans, err = await ask_deepseek([sp] + history, max_tokens=MAX_TOKENS_ANSWER)
+    ans, err = await ask_deepseek([sp] + history, max_tokens=max_tokens)
     if err:
-        # Если DeepSeek ошибся — показываем сырые данные
         return generate_answer_from_snippets(scored, user_message), True
     
-    # Постобработка: удаляем выдумки
     final_ans = remove_unverified_claims(ans, stext)
     
-    # Проверка: если после удаления ответ пуст — используем генератор из сниппетов
     if len(final_ans) < 50 or 'http' not in final_ans:
         final_ans = generate_answer_from_snippets(scored, user_message)
     else:
-        # Добавляем дату и уверенность
+        confidence = calculate_confidence(scored, user_message)
         if '📅 Дата:' not in final_ans:
-            final_ans += f"\n\n📅 Дата: {get_current_date()} (данные из интернета)"
-        if 'Уверенность:' not in final_ans:
-            final_ans += "\nУверенность: 90% (на основе найденных данных)"
+            final_ans += f"\n\n📅 Дата: {get_current_date()}"
+        if 'Уверенность' not in final_ans:
+            final_ans += f"\n🔹 Уверенность в ТОПе: {confidence}% (на основе найденных данных)"
     
-    return f"🌐 из интернета\n\n{final_ans}", True
+    return f"🌐 из интернета + логика\n\n{final_ans}", True
+
+async def generate_inferred_answer(uid, user_message, history, profile, scored, inferred, budget, is_deep):
+    """Генерирует ответ с логическим выводом на основе данных"""
+    ctx = build_profile_context(profile)
+    
+    stext = ""
+    for i, r in enumerate(scored[:TOP_RESULTS_SHOW], 1):
+        year_note = f" ({r.get('year')} г.)" if r.get('year') else ""
+        source = r.get('source', 'неизвестно')
+        link_html = f"🔗 <a href=\"{r.get('link')}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
+        stext += f"{i}. **{r.get('title', 'Без названия')}**{year_note}\n"
+        stext += f"   {r.get('snippet', 'Нет описания')[:300]}\n"
+        stext += f"   Источник: {source} | {link_html}\n\n"
+    
+    inferred_text = ""
+    if inferred:
+        inferred_text = "**Логический вывод на основе найденных данных (до {budget} руб.):**\n\n"
+        for item in inferred[:5]:
+            price = item.get('price', 'не указана')
+            model = item.get('model', 'Модель не указана')
+            inferred_text += f"• **{model}** — примерно {price} руб.\n"
+        inferred_text += "\n⚠️ Это ЛОГИЧЕСКИЙ ВЫВОД на основе найденных данных, а не прямой факт из интернета.\n"
+    
+    max_tokens = MAX_TOKENS_DEEP if is_deep else MAX_TOKENS_ANSWER
+    
+    sp = {
+        "role": "system",
+        "content": (
+            f"{CORE_SYSTEM_RULE}\n"
+            f"Сегодня: {get_current_date()}.\n"
+            f"Контекст: {ctx}\n\n"
+            f"НАЙДЕННЫЕ ДАННЫЕ (используй их как основу):\n"
+            f"{stext}\n\n"
+            f"{inferred_text}\n\n"
+            "ИНСТРУКЦИЯ:\n"
+            "1. Используй найденные данные как основу.\n"
+            "2. Используй логический вывод, чтобы дополнить ответ.\n"
+            "3. Если данных всё ещё мало — дополни своими знаниями, но чётко пометь 'Предположительно'.\n"
+            "4. Дай ПОЛНЫЙ ответ: список моделей с ценами, таблицу, рекомендацию.\n"
+            "5. НЕ оставляй пользователя без ответа."
+        )
+    }
+    
+    ans, err = await ask_deepseek([sp] + history, max_tokens=max_tokens)
+    if err:
+        return generate_answer_from_snippets(scored, user_message), True
+    
+    final_ans = remove_unverified_claims(ans, stext)
+    
+    if '📅 Дата:' not in final_ans:
+        final_ans += f"\n\n📅 Дата: {get_current_date()}"
+    if 'Уверенность' not in final_ans:
+        final_ans += "\n🔹 Уверенность в ТОПе: 70% (частично на основе интернет-данных + логический вывод)"
+    
+    return f"🌐 из интернета + логика\n\n{final_ans}", True
 
 async def generate_local_answer(uid, user_message, history, profile, reason):
-    """Генерирует ответ из локальных знаний с чёткой маркировкой"""
     ctx = build_profile_context(profile)
     
     sp = {
@@ -554,7 +764,8 @@ async def generate_local_answer(uid, user_message, history, profile, reason):
             "2. Каждое утверждение должно начинаться с 'Предположительно' или 'Возможно'\n"
             "3. Если не уверен — скажи 'Я не знаю'\n"
             "4. Уверенность не выше 25%\n"
-            "5. НЕ придумывай факты"
+            "5. НЕ придумывай факты\n"
+            "6. Постарайся дать структурированный ответ даже на основе предположений"
         )
     }
     
@@ -563,7 +774,6 @@ async def generate_local_answer(uid, user_message, history, profile, reason):
     if err:
         return f"⚠️ Ошибка генерации из базы. {reason}", False
     
-    # Добавляем дату и уверенность, если их нет
     if 'Уверенность:' not in ans:
         ans += f"\n\n📅 Дата: {get_current_date()}"
         ans += "\nУверенность: 20% (основано на знаниях модели, без интернет-данных)"
@@ -571,20 +781,14 @@ async def generate_local_answer(uid, user_message, history, profile, reason):
     return f"🧠 из базы (интернет пуст)\n\n{ans}", True
 
 async def generate_search_query(query):
-    """Генерирует 1 точный поисковый запрос без использования DeepSeek"""
     stop = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про'}
     words = [w for w in re.sub(r'[^\w\s]', '', query).split() 
              if w.lower() not in stop and len(w) > 2]
-    
     if not words:
         return [query]
-    
     base = " ".join(words[:5])
-    
-    # Добавляем год, если его нет
     if not re.search(r'\b20[2-9][0-9]\b', base):
         base += f" {now().year}"
-    
     return [base]
 
 def build_profile_context(profile):
@@ -628,7 +832,7 @@ async def ask_deepseek(messages, retries=2, max_tokens=None, model=MODEL_DEFAULT
 async def start(update, context):
     uid = update.effective_user.id
     if not is_allowed(uid): return
-    await safe_reply(update, "👋 Привет! Я — честный ассистент с доступом в интернет.\n🛡 Принципы: никогда не вру, использую ТОЛЬКО данные из интернета, если они есть. Если данных нет — честно говорю об этом.\n📋 Команды: /profile, /memory, /stats, /forget, /restore")
+    await safe_reply(update, "👋 Привет! Я — экспертный ассистент с доступом в интернет.\n🛡 Принципы: никогда не вру, даю структурированные ответы, сравниваю источники, указываю уверенность.\n📋 Команды: /profile, /memory, /stats, /forget, /restore, /deep [запрос] — для развёрнутого ответа")
 
 async def profile_command(update, context):
     uid = update.effective_user.id
@@ -694,7 +898,7 @@ async def forget_command(update, context):
     uid = update.effective_user.id
     if not is_allowed(uid): return
     async with get_user_lock(uid):
-        save_profile(uid, {})  # очищаем ВСЁ
+        save_profile(uid, {})
         await save_memory(uid, [], backup=True, lock_held=True)
         save_counter(uid, 0)
     await safe_reply(update, "🧹 Я забыл всё, что знал о тебе!")
@@ -726,6 +930,7 @@ async def safe_reply(update: Update, text: str, reply_markup=None):
     def markdown_to_html(t):
         t = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', t)
         t = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', t)
+        t = re.sub(r'^### (.*?)$', r'<b>\1</b>', t, flags=re.M)
         return t.strip()
     if len(text) > 20 and not text.startswith(('/', '❌', '✅')):
         text = markdown_to_html(text)
@@ -750,7 +955,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_rate_limit(uid):
         await safe_reply(update, "⏳ Не пишите так часто.")
         return
+    
     user_message = update.effective_message.text[:1000]
+    is_deep = False
+    
+    if user_message.lower().startswith("/deep "):
+        is_deep = True
+        user_message = user_message[6:].strip()
+        if not user_message:
+            await safe_reply(update, "📝 Напишите запрос после /deep, например: `/deep лучшие ТВ-приставки 2026`")
+            return
 
     if user_message.lower().startswith("запомни "):
         text = user_message[8:].strip()
@@ -777,7 +991,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msg_obj = {"role": "user", "content": user_message, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")}
     history.append(user_msg_obj)
 
-    answer, should_save = await generate_response(uid, user_message, history, profile)
+    answer, should_save = await generate_response(uid, user_message, history, profile, is_deep)
     
     if should_save and isinstance(answer, str) and len(answer) > 10:
         clean_answer = re.sub(r'<[^>]+>', '', answer)
@@ -829,5 +1043,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (999% релевантность, НИКАКОЙ ЛЖИ)")
+    logger.info("✅ БОТ ЗАПУЩЕН (экспертный уровень, бюджет $7–8/мес)")
     app.run_polling()
