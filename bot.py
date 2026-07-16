@@ -1,6 +1,6 @@
 # ============================================================
-#  BroWaix Bot — финальная версия (исправлено: использует данные)
-#  (TOP_RESULTS_SHOW=10, усиленный промпт)
+#  BroWaix Bot — АБСОЛЮТНАЯ ОПОРА НА ИНТЕРНЕТ-ДАННЫЕ
+#  (без локальных знаний, если есть интернет-данные)
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
 from datetime import datetime, timedelta
@@ -44,34 +44,37 @@ MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
-# --- ОПТИМАЛЬНЫЕ ПАРАМЕТРЫ (4+ месяцев) ---
+# --- ПАРАМЕТРЫ ---
 SEARCH_RESULTS_NUM = 10
 SEARCH_VARIANTS_COUNT = 3
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 86400
 MAX_TOKENS_ANSWER = 500
-TOP_RESULTS_SHOW = 10            # УВЕЛИЧЕНО с 5 до 10
+TOP_RESULTS_SHOW = 15
 
-# ---------- УСИЛЕННЫЙ СИСТЕМНЫЙ ПРОМПТ ----------
+# ===== СИСТЕМНЫЙ ПРОМПТ: ОПОРА ТОЛЬКО НА ДАННЫЕ =====
 CORE_SYSTEM_RULE = (
-    "Честный ассистент. Ты получил данные из интернета. Используй их для ответа. "
-    "Не говори, что у тебя нет доступа к интернету – ты уже выполнил поиск.\n\n"
-    "ПРАВИЛА ОТВЕТА:\n"
-    "1. Отвечай строго на основе найденных данных. Если в сниппетах есть модели – включи их в ответ.\n"
-    "2. Если данных нет — скажи «Я не знаю».\n"
-    "3. Если делаешь предположение — начинай с «Предположительно».\n"
-    "4. Включай в ответ модели, цены, бренды из сниппетов.\n"
-    "5. Если в данных нет готового рейтинга, но есть отдельные модели – составь список из них.\n\n"
-    "ОБЯЗАТЕЛЬНО в конце ответа укажи:\n"
-    "- 📅 Дата публикации источников (если неизвестна, напиши «дата не указана»).\n"
-    "- Уверенность: XX% (если данных нет, ставь 0% или 5%).\n"
-    "- Ссылки на источники (если их нет, напиши «ссылки не найдены»).\n\n"
-    "ФОРМАТИРОВАНИЕ (ОБЯЗАТЕЛЬНО):\n"
-    "• Каждый результат оформляй как отдельный блок.\n"
-    "• Используй эмодзи: <b>жирный</b> для названия, 💰 цена, 📟 чипсет/ОС, 💾 память, 📺 особенности.\n"
-    "• Ссылки: 🔗 <a href=\"URL\">Источник</a>\n"
-    "• Разделяй блоки пустой строкой. Не используй таблицы."
+    "Ты — строгий ассистент. Ты ОБЯЗАН отвечать ИСКЛЮЧИТЕЛЬНО на основе данных, полученных из интернета.\n"
+    "Данные приведены ниже в разделе «НАЙДЕННЫЕ ДАННЫЕ».\n\n"
+    "ТВОИ ЖЁСТКИЕ ПРАВИЛА:\n"
+    "1. ИСПОЛЬЗУЙ ТОЛЬКО данные из раздела «НАЙДЕННЫЕ ДАННЫЕ».\n"
+    "2. НЕ ИСПОЛЬЗУЙ свои внутренние знания, даже если они кажутся очевидными.\n"
+    "3. Каждое утверждение ОБЯЗАТЕЛЬНО должно сопровождаться ссылкой на источник из данных.\n"
+    "4. Если в данных нет нужной информации — скажи: «В найденных данных нет информации по вашему запросу».\n"
+    "5. Если в данных есть отдельные модели, цены, характеристики — составь из них список.\n"
+    "6. ЗАПРЕЩЕНО писать фразы: «нет доступа к интернету», «не могу выполнить поиск».\n"
+    "7. В конце ответа укажи: 📅 Дата (если есть), Уверенность: XX% (если данные есть).\n\n"
+    "ФОРМАТ ОТВЕТА:\n"
+    "Каждый результат — отдельный блок с эмодзи:\n"
+    "<b>Название модели</b>\n"
+    "💰 Цена\n"
+    "📟 Чипсет/ОС\n"
+    "💾 Память\n"
+    "📺 Особенности\n"
+    "🔗 <a href='URL'>Источник</a>\n"
+    "Между блоками — пустая строка.\n"
+    "НЕ ИСПОЛЬЗУЙ Markdown-таблицы."
 )
 
 # ---------- ПАМЯТЬ ----------
@@ -164,7 +167,7 @@ async def restore_backup(uid, data_type):
         except Exception:
             return False
 
-# ---------- СЖАТИЕ ПАМЯТИ ----------
+# ---------- СЖАТИЕ ----------
 STOP_WORDS = {'это','так','вот','ну','просто','очень','что','как','где','когда','для','без','по'}
 def extract_key_points(text, max_len=40):
     if len(text) <= max_len: return text
@@ -220,7 +223,7 @@ async def save_memory(uid, history, backup=True, lock_held=False):
     if lock_held: return await _save_memory_impl(uid, history, backup)
     async with get_user_lock(uid): return await _save_memory_impl(uid, history, backup)
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ (БЕЗОПАСНЫЕ) ----------
+# ---------- БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ ----------
 def extract_year_from_text(text):
     match = re.search(r'\b(20[2-9][0-9])\b', text)
     if match and match.group(1).isdigit():
@@ -292,11 +295,29 @@ def highlight_contradictions(text):
             highlighted.append(sent)
     return ' '.join(highlighted), found
 
-def finalize_answer(ans, current_date):
+# ---------- ПОСТОБРАБОТКА: ПРИНУДИТЕЛЬНОЕ ИСПОЛЬЗОВАНИЕ ДАННЫХ ----------
+def finalize_answer(ans, current_date, raw_snippets=None):
+    # Заменяем любые отмазки на честное сообщение
+    forbidden = ['нет доступа', 'не могу выполнить поиск', 'не могу выйти в интернет', 'техническое ограничение']
+    for phrase in forbidden:
+        if phrase in ans.lower():
+            if raw_snippets:
+                ans = f"Я нашёл информацию в интернете:\n\n{raw_snippets}\n\n" + ans.replace(phrase, "я не нашёл точного рейтинга, но вот что удалось обнаружить")
+            else:
+                ans = ans.replace(phrase, "я не нашёл информации по вашему запросу")
+
+    # Проверяем наличие ссылок
+    if 'http' not in ans:
+        if raw_snippets:
+            ans = f"В найденных данных нет готового рейтинга, но вот что удалось найти:\n\n{raw_snippets}\n\n" + ans
+        else:
+            ans += "\n\n🔗 Ссылки: не найдены"
+
     highlighted, has_contradiction = highlight_contradictions(ans)
     if has_contradiction:
         ans = highlighted
         ans = f"⚠️ В ответе есть возможные противоречия (выделены жирным).\n\n{ans}"
+
     if '📅 Дата:' not in ans and 'дата' not in ans.lower():
         ans += f"\n\n📅 Дата: дата не указана (проверьте актуальность на {current_date})"
     if 'Уверенность:' not in ans:
@@ -304,11 +325,10 @@ def finalize_answer(ans, current_date):
             ans += "\n\nУверенность: 0% (данных нет)"
         else:
             ans += "\n\nУверенность: 5% (предположительно)"
-    if 'http' not in ans and 'ссылки' not in ans.lower():
-        ans += "\n\n🔗 Ссылки: не найдены"
+
     return ans
 
-# ---------- ОПТИМИЗАЦИЯ ЗАПРОСА ЧЕРЕЗ LLM ----------
+# ---------- ОПТИМИЗАЦИЯ ЗАПРОСА ----------
 async def optimize_query(query, profile=None):
     context_prompt = ""
     if profile:
@@ -361,7 +381,7 @@ async def fallback_queries(query, base_variants=None):
     variants = list(dict.fromkeys(variants))
     return variants[:SEARCH_VARIANTS_COUNT]
 
-# ---------- ПОИСКОВЫЕ ФУНКЦИИ ----------
+# ---------- ПОИСК ----------
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
     if not APISERPENT_API_KEY: return []
     session = await get_http_session()
@@ -462,7 +482,6 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         logger.info(f"📊 Результатов: {len(all_results)}")
         set_cache(user_message, all_results)
 
-    # Если всё равно нет результатов – fallback
     if not all_results:
         sp_knowledge = {
             "role": "system",
@@ -482,7 +501,7 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         final_ans = finalize_answer(ans, get_current_date())
         return f"🧠 из модели (поиск пуст)\n\n{final_ans}", True
 
-    # Ранжирование результатов
+    # Ранжирование
     keywords = [w for w in user_message.split() if len(w)>3 and w not in STOP_WORDS]
     scored = assess_relevance(all_results, keywords)
     for r in all_results:
@@ -495,7 +514,12 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         sum(1 for kw in keywords if kw in (r.get('title','') + ' ' + r.get('snippet','')).lower())
     ), reverse=True)
 
-    top_results = all_results[:TOP_RESULTS_SHOW]  # теперь 10
+    top_results = all_results[:TOP_RESULTS_SHOW]
+    # Формируем строку с сырыми данными для постобработки (если модель не использует их)
+    raw_snippets = ""
+    for i, r in enumerate(top_results, 1):
+        raw_snippets += f"{i}. {r['title']}\n   {r['snippet'][:180]}\n   🔗 {r['link']}\n\n"
+
     stext = ""
     for i, r in enumerate(top_results, 1):
         is_off = "⭐ " if is_official_link(r.get('link','')) else ""
@@ -504,26 +528,21 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         link_html = f"🔗 <a href=\"{r['link']}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
         stext += f"{i}. {is_off}**{r['title']}**{year_note}{price_note}\n   {r['snippet'][:180]}\n   {link_html}\n\n"
 
-    # Усиленный системный промпт для ответа
+    # Передаём данные в промпт
     sp = {
         "role": "system",
         "content": (
             f"{CORE_SYSTEM_RULE}\n"
             f"Сегодня: {get_current_date()}.\n"
             f"Контекст: {ctx}\n\n"
-            f"Найденные данные из интернета:\n{stext}\n\n"
+            "НАЙДЕННЫЕ ДАННЫЕ (только эти данные используй для ответа):\n"
+            f"{stext}\n\n"
             "ИНСТРУКЦИЯ ПО ОТВЕТУ:\n"
-            "1. Используй эти данные для ответа. Ты уже выполнил поиск в интернете.\n"
-            "2. Если в данных есть модели ТВ-приставок – составь из них список (даже если нет готового рейтинга).\n"
-            "3. Не говори, что у тебя нет доступа к интернету – у тебя есть эти данные.\n"
-            "4. Оформи ответ в виде отдельных блоков с эмодзи:\n"
-            "<b>Название модели</b>\n"
-            "💰 Цена\n"
-            "📟 Чипсет / ОС\n"
-            "💾 Память\n"
-            "📺 Особенности\n"
-            "🔗 <a href=\"ссылка\">Источник</a>\n\n"
-            "5. В конце укажи: 📅 Дата: ... и Уверенность: XX%."
+            "1. Используй ТОЛЬКО данные выше. Они получены из интернета.\n"
+            "2. Каждый факт должен сопровождаться ссылкой.\n"
+            "3. Если в данных есть модели – выведи их как список.\n"
+            "4. ЗАПРЕЩЕНО говорить о «нет доступа» или «не могу искать».\n"
+            "5. Ответ оформляй блоками с эмодзи."
         )
     }
 
@@ -531,7 +550,8 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
     if err:
         return f"⚠️ Ошибка API: {err}", False
 
-    final_ans = finalize_answer(ans, get_current_date())
+    # Постобработка: принудительно вставляем выжимку, если модель не дала ссылок
+    final_ans = finalize_answer(ans, get_current_date(), raw_snippets)
     return f"🌐 из интернета\n\n{final_ans}", True
 
 def build_profile_context(profile):
@@ -724,6 +744,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msg_obj = {"role": "user", "content": user_message, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")}
     history.append(user_msg_obj)
 
+    # Классификация (без LLM)
     simple_patterns = [r'^привет', r'^как дела', r'^спасибо', r'^ты кто', r'^что умеешь', r'^напиши код', r'^напиши стих', r'^помоги']
     needs_search = not any(re.search(pat, user_message.lower()) for pat in simple_patterns)
 
@@ -839,5 +860,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (финальная версия, использует данные, 10 результатов)")
+    logger.info("✅ БОТ ЗАПУЩЕН (АБСОЛЮТНАЯ ОПОРА НА ДАННЫЕ)")
     app.run_polling()
