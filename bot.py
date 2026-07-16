@@ -1,6 +1,6 @@
 # ============================================================
-#  BroWaix Bot — финальная версия (вариант А)
-#  (блочное форматирование, ссылки, источник, экономия)
+#  BroWaix Bot — финальная версия с LLM-оптимизацией запросов
+#  (экономия $10/мес, 4+ месяцев, форматирование А)
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
 from datetime import datetime, timedelta
@@ -13,7 +13,6 @@ from telegram.ext import (
 )
 from logging.handlers import RotatingFileHandler
 
-# ---------- ЛОГИ ----------
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 handler = RotatingFileHandler("bot.log", maxBytes=5*1024*1024, backupCount=2)
@@ -45,28 +44,28 @@ MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
-# --- ОПТИМАЛЬНЫЕ ПАРАМЕТРЫ ДЛЯ 4+ МЕСЯЦЕВ ($40) ---
+# --- ОПТИМАЛЬНЫЕ ПАРАМЕТРЫ (4+ месяцев) ---
 SEARCH_RESULTS_NUM = 10
-SEARCH_VARIANTS_COUNT = 2
+SEARCH_VARIANTS_COUNT = 3          # теперь 3 варианта
 MODEL_TEMPERATURE = 0.1
-MAX_RETRY_ATTEMPTS = 2
+MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 86400
 MAX_TOKENS_ANSWER = 500
 TOP_RESULTS_SHOW = 5
 
-# ---------- УСИЛЕННЫЙ СИСТЕМНЫЙ ПРОМПТ (вариант А + ссылки) ----------
+# ---------- СИСТЕМНЫЙ ПРОМПТ ----------
 CORE_SYSTEM_RULE = (
-    "Честный ассистент. Отвечай строго по данным. Если данных нет — скажи «Я не знаю». "
+    "Честный ассистент. Отвечай строго по данным, если они есть. "
+    "Если данных нет — скажи «Я не знаю». Если делаешь предположение — начинай с «Предположительно». "
     "Указывай ссылки, дату публикации, оценку уверенности (0–100%). "
     "Не выдумывай. Включай в ответ модели, цены, бренды из сниппетов. "
     "Если данные старые — предупреди.\n\n"
     "ФОРМАТИРОВАНИЕ (ОБЯЗАТЕЛЬНО):\n"
     "• Каждый результат оформляй как отдельный блок.\n"
-    "• Используй эмодзи: <b>жирный</b> для названия модели, 💰 для цены, 📟 для чипсета/ОС, 💾 для памяти, 📺 для особенностей.\n"
-    "• Ссылки делай в формате: 🔗 <a href=\"URL\">Источник</a>\n"
-    "• После всех блоков укажи дату публикации и оценку уверенности: «📅 Дата: ...» и «Уверенность: XX%».\n"
-    "• Разделяй блоки пустой строкой.\n"
-    "• Не используй Markdown-таблицы (|)."
+    "• Используй эмодзи: <b>жирный</b> для названия, 💰 цена, 📟 чипсет/ОС, 💾 память, 📺 особенности.\n"
+    "• Ссылки: 🔗 <a href=\"URL\">Источник</a>\n"
+    "• После блоков: 📅 Дата: ... и Уверенность: XX%.\n"
+    "• Разделяй блоки пустой строкой. Не используй таблицы."
 )
 
 # ---------- ПАМЯТЬ ----------
@@ -270,7 +269,6 @@ def set_cache(query, data):
         del search_cache[oldest]
 
 def highlight_contradictions(text):
-    # Оставляем только для предупреждений, не трогаем форматирование
     markers = ['но', 'однако', 'с другой стороны', 'в то же время', 'хотя', 'несмотря на', 'с одной стороны', 'в отличие от']
     sentences = re.split(r'(?<=[.!?])\s+', text)
     highlighted = []
@@ -284,58 +282,52 @@ def highlight_contradictions(text):
     return ' '.join(highlighted), found
 
 def finalize_answer(ans, current_date):
-    """Постобработка: проверяет наличие ссылок, даты, уверенности, противоречий."""
-    # Проверка противоречий (без изменения основного форматирования)
     highlighted, has_contradiction = highlight_contradictions(ans)
     if has_contradiction:
         ans = highlighted
         ans = f"⚠️ В ответе есть возможные противоречия (выделены жирным).\n\n{ans}"
-    
-    # Проверка уверенности
     if 'Уверенность:' not in ans:
         ans += f"\n\n⚠️ Оценка уверенности не указана."
-    
-    # Проверка ссылок
     if 'http' not in ans and len(ans) > 100:
         ans += "\n\n⚠️ Нет ссылок на источники."
-    
-    # Проверка даты
     if '📅 Дата:' not in ans and 'дата' not in ans.lower():
         ans += f"\n\n⚠️ Дата публикации источников не указана. Проверьте актуальность на {current_date}."
-    
     return ans
 
-# ---------- ОПТИМИЗАЦИЯ ЗАПРОСА (ЛОКАЛЬНАЯ) ----------
-def optimize_query_local(query):
-    """Генерирует короткие поисковые запросы с обязательными суффиксами."""
-    stop = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про'}
-    words = [w for w in re.sub(r'[^\w\s]', '', query.lower()).split() if w not in stop and len(w)>2]
-    if not words:
-        return [query]
-    
-    # Базовый запрос (первые 4 значимых слова)
-    main = " ".join(words[:4])
-    
-    # Добавляем год, если его нет
-    if not re.search(r'\b20[2-9][0-9]\b', query):
-        main += f" {now().year}"
-    
-    # Всегда генерируем варианты с суффиксами
-    variants = [
-        main,
-        main + " рейтинг",
-        main + " обзор",
-        main + " сравнение",
+# ---------- ОПТИМИЗАЦИЯ ЗАПРОСА ЧЕРЕЗ LLM ----------
+async def optimize_query(query, profile=None):
+    """Генерирует 3 коротких поисковых запроса через LLM с учётом контекста."""
+    context_prompt = ""
+    if profile:
+        levels = []
+        for level in ['level_2', 'level_3']:
+            if profile.get(level):
+                levels.extend(profile[level][-5:])
+        if levels:
+            context_prompt = "Контекст предыдущего диалога:\n" + "\n".join(levels) + "\n\n"
+
+    prompt = (
+        f"{context_prompt}"
+        "Преврати следующий запрос в 3 КОРОТКИХ ПОИСКОВЫХ ЗАПРОСА (3-5 слов, только ключевые слова). "
+        "Убери все лишние слова: 'найди', 'пожалуйста', 'помоги', 'мне', 'лучшие', 'скажи' и т.п. "
+        "Оставь только суть: объект, характеристика, год (если он важен). "
+        "Если запрос про рейтинг или сравнение – обязательно добавь слова 'рейтинг', 'обзор' или 'сравнение'.\n"
+        "Раздели варианты символом '|'.\n"
+        f"Запрос: {query}"
+    )
+    messages = [
+        {"role": "system", "content": "Ты — эксперт по поисковой оптимизации."},
+        {"role": "user", "content": prompt}
     ]
-    # Дополнительные варианты по ключевым словам
-    if any(w in query.lower() for w in ['цена','стоимость','сколько']):
-        variants.append(main + " цена")
-    if any(w in query.lower() for w in ['лучший','топ','лучшие']):
-        variants.append(main + " топ")
-    
-    # Убираем дубликаты и лишние пробелы
-    variants = list(dict.fromkeys(variants))
-    return variants[:SEARCH_VARIANTS_COUNT]   # теперь берём до 3 вариантов
+    try:
+        result, err = await ask_deepseek(messages, max_tokens=100, model=MODEL_DEFAULT)
+        if err or not result:
+            return [query]
+        variants = [v.strip() for v in result.split('|') if v.strip()]
+        return variants[:3] if len(variants) >= 2 else [query]
+    except Exception as e:
+        logger.warning(f"Ошибка оптимизации запроса: {e}")
+        return [query]
 
 # ---------- ПОИСКОВЫЕ ФУНКЦИИ ----------
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
@@ -414,7 +406,8 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
     if cached:
         all_results = cached
     else:
-        variants = optimize_query_local(user_message)
+        # Генерация запросов через LLM (с учётом контекста)
+        variants = await optimize_query(user_message, profile)
         logger.info(f"🔍 Варианты: {len(variants)}")
         tasks = [search_apiserpent_async(v, SEARCH_RESULTS_NUM) for v in variants]
         results_list = await asyncio.gather(*tasks)
@@ -427,6 +420,7 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
                 if link and link not in seen:
                     seen.add(link)
                     all_results.append(res)
+        # Если APISerpent не дал результатов, пробуем DuckDuckGo
         if not all_results:
             logger.info("🔄 APISerpent пуст, пробуем DuckDuckGo")
             duck_results = await search_duckduckgo_async(variants[0] if variants else user_message)
@@ -439,11 +433,26 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         set_cache(user_message, all_results)
 
     if not all_results:
-        if retry_count < MAX_RETRY_ATTEMPTS:
-            return (f"🔍 **Искал:** `{user_message}`\n\n❌ Поиск не дал результатов. Попробуйте переформулировать запрос."), "need_retry"
-        else:
-            return (f"🔍 **Искал:** `{user_message}`\n\n❌ Поиск не дал результатов после {MAX_RETRY_ATTEMPTS} попыток."), False
+        # Fallback: пробуем ответить из знаний модели
+        sp_knowledge = {
+            "role": "system",
+            "content": (
+                f"{CORE_SYSTEM_RULE}\n"
+                f"Сегодня: {get_current_date()}.\n"
+                f"Контекст: {ctx}\n\n"
+                "Поиск в интернете не дал результатов. "
+                "Если у тебя есть общие знания по теме, дай предположительный ответ с пометкой «Предположительно». "
+                "Укажи, что это не факт, и поставь низкую уверенность (например, 20%). "
+                "Если знаний нет – скажи «Я не знаю»."
+            )
+        }
+        ans, err = await ask_deepseek([sp_knowledge] + history, max_tokens=MAX_TOKENS_ANSWER)
+        if err:
+            return "⚠️ Ошибка API.", False
+        final_ans = finalize_answer(ans, get_current_date())
+        return f"🧠 из модели (поиск пуст)\n\n{final_ans}", True
 
+    # Ранжирование результатов
     keywords = [w for w in user_message.split() if len(w)>3 and w not in STOP_WORDS]
     scored = assess_relevance(all_results, keywords)
     for r in all_results:
@@ -456,14 +465,12 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         sum(1 for kw in keywords if kw in (r.get('title','') + ' ' + r.get('snippet','')).lower())
     ), reverse=True)
 
-    # Берём только топ-5
     top_results = all_results[:TOP_RESULTS_SHOW]
     stext = ""
     for i, r in enumerate(top_results, 1):
         is_off = "⭐ " if is_official_link(r.get('link','')) else ""
         price_note = f" ({r['price']} руб.)" if r.get('price') else ""
         year_note = f" ({r['year']})" if r.get('year') else ""
-        # Добавляем ссылку в виде HTML-ссылки
         link_html = f"🔗 <a href=\"{r['link']}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
         stext += f"{i}. {is_off}**{r['title']}**{year_note}{price_note}\n   {r['snippet'][:180]}\n   {link_html}\n\n"
 
@@ -479,7 +486,7 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
             "<b>Название модели</b>\n"
             "💰 Цена\n"
             "📟 Чипсет / ОС\n"
-            "💾 Память (если есть)\n"
+            "💾 Память\n"
             "📺 Особенности\n"
             "🔗 <a href=\"ссылка\">Источник</a>\n\n"
             "В конце укажи: 📅 Дата: ... и Уверенность: XX%."
@@ -491,7 +498,6 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         return f"⚠️ Ошибка API: {err}", False
 
     final_ans = finalize_answer(ans, get_current_date())
-    # Добавляем префикс источника
     return f"🌐 из интернета\n\n{final_ans}", True
 
 def build_profile_context(profile):
@@ -800,5 +806,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (финальная версия, вариант А)")
+    logger.info("✅ БОТ ЗАПУЩЕН (LLM-оптимизация, 3 варианта)")
     app.run_polling()
