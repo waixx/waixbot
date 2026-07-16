@@ -50,7 +50,7 @@ SEARCH_VARIANTS_COUNT = 1      # 1 точный запрос вместо 3
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 604800             # 7 дней кэша
-MAX_TOKENS_ANSWER = 1024       # оставляем для структурированных ответов
+MAX_TOKENS_ANSWER = 1024       # для структурированных ответов
 TOP_RESULTS_SHOW = 5           # только топ-5 ссылок в ответе
 
 # ---------- ПАМЯТЬ ----------
@@ -655,7 +655,8 @@ async def memory_command(update, context):
     if not is_allowed(uid): return
     if not context.args:
         await safe_reply(update, "🔍 Поиск: `/memory что искать`")
-        return    query = ' '.join(context.args)
+        return
+    query = ' '.join(context.args)
     res = search_in_pyramid(uid, query)
     if not res:
         await safe_reply(update, f"📭 Ничего не найдено: '{query}'")
