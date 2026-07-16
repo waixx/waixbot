@@ -1,6 +1,6 @@
 # ============================================================
-#  BroWaix Bot — финальная версия (исправлена ошибка int())
-#  (LLM-оптимизация, дата/уверенность/ссылки по умолчанию, 3 варианта)
+#  BroWaix Bot — финальная версия (исправлено: использует данные)
+#  (TOP_RESULTS_SHOW=10, усиленный промпт)
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
 from datetime import datetime, timedelta
@@ -46,18 +46,23 @@ SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
 # --- ОПТИМАЛЬНЫЕ ПАРАМЕТРЫ (4+ месяцев) ---
 SEARCH_RESULTS_NUM = 10
-SEARCH_VARIANTS_COUNT = 3          # теперь 3 варианта
+SEARCH_VARIANTS_COUNT = 3
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 86400
 MAX_TOKENS_ANSWER = 500
-TOP_RESULTS_SHOW = 5
+TOP_RESULTS_SHOW = 10            # УВЕЛИЧЕНО с 5 до 10
 
-# ---------- СИСТЕМНЫЙ ПРОМПТ (УСИЛЕННЫЙ) ----------
+# ---------- УСИЛЕННЫЙ СИСТЕМНЫЙ ПРОМПТ ----------
 CORE_SYSTEM_RULE = (
-    "Честный ассистент. Отвечай строго по данным, если они есть. "
-    "Если данных нет — скажи «Я не знаю». Если делаешь предположение — начинай с «Предположительно». "
-    "Не выдумывай. Включай в ответ модели, цены, бренды из сниппетов.\n\n"
+    "Честный ассистент. Ты получил данные из интернета. Используй их для ответа. "
+    "Не говори, что у тебя нет доступа к интернету – ты уже выполнил поиск.\n\n"
+    "ПРАВИЛА ОТВЕТА:\n"
+    "1. Отвечай строго на основе найденных данных. Если в сниппетах есть модели – включи их в ответ.\n"
+    "2. Если данных нет — скажи «Я не знаю».\n"
+    "3. Если делаешь предположение — начинай с «Предположительно».\n"
+    "4. Включай в ответ модели, цены, бренды из сниппетов.\n"
+    "5. Если в данных нет готового рейтинга, но есть отдельные модели – составь список из них.\n\n"
     "ОБЯЗАТЕЛЬНО в конце ответа укажи:\n"
     "- 📅 Дата публикации источников (если неизвестна, напиши «дата не указана»).\n"
     "- Уверенность: XX% (если данных нет, ставь 0% или 5%).\n"
@@ -215,13 +220,11 @@ async def save_memory(uid, history, backup=True, lock_held=False):
     if lock_held: return await _save_memory_impl(uid, history, backup)
     async with get_user_lock(uid): return await _save_memory_impl(uid, history, backup)
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ (ИСПРАВЛЕННЫЕ) ----------
+# ---------- ВСПОМОГАТЕЛЬНЫЕ (БЕЗОПАСНЫЕ) ----------
 def extract_year_from_text(text):
     match = re.search(r'\b(20[2-9][0-9])\b', text)
-    if match:
-        year_str = match.group(1)
-        if year_str.isdigit():
-            return int(year_str)
+    if match and match.group(1).isdigit():
+        return int(match.group(1))
     return None
 
 def extract_price_from_text(text):
@@ -289,7 +292,6 @@ def highlight_contradictions(text):
             highlighted.append(sent)
     return ' '.join(highlighted), found
 
-# ---------- УЛУЧШЕННАЯ POST-ОБРАБОТКА ----------
 def finalize_answer(ans, current_date):
     highlighted, has_contradiction = highlight_contradictions(ans)
     if has_contradiction:
@@ -306,9 +308,8 @@ def finalize_answer(ans, current_date):
         ans += "\n\n🔗 Ссылки: не найдены"
     return ans
 
-# ---------- ОПТИМИЗАЦИЯ ЗАПРОСА ЧЕРЕЗ LLM (С ПАДЕНИЕМ НА ШАБЛОНЫ) ----------
+# ---------- ОПТИМИЗАЦИЯ ЗАПРОСА ЧЕРЕЗ LLM ----------
 async def optimize_query(query, profile=None):
-    """Генерирует 3 коротких поисковых запроса через LLM с учётом контекста."""
     context_prompt = ""
     if profile:
         levels = []
@@ -321,9 +322,8 @@ async def optimize_query(query, profile=None):
     prompt = (
         f"{context_prompt}"
         "Преврати следующий запрос в 3 КОРОТКИХ ПОИСКОВЫХ ЗАПРОСА (3-5 слов, только ключевые слова). "
-        "Убери все лишние слова: 'найди', 'пожалуйста', 'помоги', 'мне', 'лучшие', 'скажи' и т.п. "
-        "Оставь только суть: объект, характеристика, год (если он важен). "
-        "Если запрос про рейтинг или сравнение – обязательно добавь слова 'рейтинг', 'обзор' или 'сравнение'.\n"
+        "Убери все лишние слова. Оставь только суть: объект, характеристика, год. "
+        "Если запрос про рейтинг – добавь слова 'рейтинг', 'обзор' или 'сравнение'.\n"
         "Раздели варианты символом '|'.\n"
         f"Запрос: {query}"
     )
@@ -346,8 +346,6 @@ async def optimize_query(query, profile=None):
         return await fallback_queries(query)
 
 async def fallback_queries(query, base_variants=None):
-    """Генерирует шаблонные запросы на случай сбоя LLM."""
-    # Извлекаем ключевые слова из запроса
     stop = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про','китайские','китайских'}
     words = [w for w in re.sub(r'[^\w\s]', '', query.lower()).split() if w not in stop and len(w)>2]
     if not words:
@@ -356,12 +354,10 @@ async def fallback_queries(query, base_variants=None):
     if not re.search(r'\b20[2-9][0-9]\b', base):
         base += f" {now().year}"
     variants = [base, base + " рейтинг", base + " обзор", base + " сравнение"]
-    # Если есть дополнительные варианты от LLM, добавляем их
     if base_variants:
         for v in base_variants:
             if v not in variants:
                 variants.append(v)
-    # Ограничиваем количество
     variants = list(dict.fromkeys(variants))
     return variants[:SEARCH_VARIANTS_COUNT]
 
@@ -466,6 +462,7 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         logger.info(f"📊 Результатов: {len(all_results)}")
         set_cache(user_message, all_results)
 
+    # Если всё равно нет результатов – fallback
     if not all_results:
         sp_knowledge = {
             "role": "system",
@@ -485,6 +482,7 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         final_ans = finalize_answer(ans, get_current_date())
         return f"🧠 из модели (поиск пуст)\n\n{final_ans}", True
 
+    # Ранжирование результатов
     keywords = [w for w in user_message.split() if len(w)>3 and w not in STOP_WORDS]
     scored = assess_relevance(all_results, keywords)
     for r in all_results:
@@ -497,7 +495,7 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         sum(1 for kw in keywords if kw in (r.get('title','') + ' ' + r.get('snippet','')).lower())
     ), reverse=True)
 
-    top_results = all_results[:TOP_RESULTS_SHOW]
+    top_results = all_results[:TOP_RESULTS_SHOW]  # теперь 10
     stext = ""
     for i, r in enumerate(top_results, 1):
         is_off = "⭐ " if is_official_link(r.get('link','')) else ""
@@ -506,22 +504,26 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         link_html = f"🔗 <a href=\"{r['link']}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
         stext += f"{i}. {is_off}**{r['title']}**{year_note}{price_note}\n   {r['snippet'][:180]}\n   {link_html}\n\n"
 
+    # Усиленный системный промпт для ответа
     sp = {
         "role": "system",
         "content": (
             f"{CORE_SYSTEM_RULE}\n"
             f"Сегодня: {get_current_date()}.\n"
             f"Контекст: {ctx}\n\n"
-            f"Найденные данные:\n{stext}\n"
-            "На основе этих данных дай ответ в виде отдельных блоков с эмодзи.\n"
-            "Каждый результат оформи как:\n"
+            f"Найденные данные из интернета:\n{stext}\n\n"
+            "ИНСТРУКЦИЯ ПО ОТВЕТУ:\n"
+            "1. Используй эти данные для ответа. Ты уже выполнил поиск в интернете.\n"
+            "2. Если в данных есть модели ТВ-приставок – составь из них список (даже если нет готового рейтинга).\n"
+            "3. Не говори, что у тебя нет доступа к интернету – у тебя есть эти данные.\n"
+            "4. Оформи ответ в виде отдельных блоков с эмодзи:\n"
             "<b>Название модели</b>\n"
             "💰 Цена\n"
             "📟 Чипсет / ОС\n"
             "💾 Память\n"
             "📺 Особенности\n"
             "🔗 <a href=\"ссылка\">Источник</a>\n\n"
-            "В конце обязательно укажи: 📅 Дата: ... и Уверенность: XX%."
+            "5. В конце укажи: 📅 Дата: ... и Уверенность: XX%."
         )
     }
 
@@ -837,5 +839,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (финальная версия, без ошибок int())")
+    logger.info("✅ БОТ ЗАПУЩЕН (финальная версия, использует данные, 10 результатов)")
     app.run_polling()
