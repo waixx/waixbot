@@ -1,5 +1,5 @@
 # ============================================================
-#  BroWaix Bot — оптимизированная версия с улучшенным поиском
+#  BroWaix Bot — финальная версия с максимальной честностью
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil
 from datetime import datetime, timedelta
@@ -34,7 +34,18 @@ SEARCH_RESULTS_NUM = int(os.getenv("SEARCH_RESULTS_NUM", "15"))
 SEARCH_THRESHOLD = int(os.getenv("SEARCH_THRESHOLD", "3"))
 MODEL_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", "0.1"))
 
-CORE_SYSTEM_RULE = ("Ты — честный ассистент. НИКОГДА не выдумывай факты. Не знаешь — скажи. Опирайся только на найденные данные. Если данные устарели — предупреди.")
+# ===== ОБНОВЛЁННЫЙ СИСТЕМНЫЙ ПРОМПТ С ОЦЕНКОЙ УВЕРЕННОСТИ =====
+CORE_SYSTEM_RULE = (
+    "Ты — честный ассистент. Ты МОЖЕШЬ строить предположения, но ОБЯЗАН указывать, что это предположение.\n"
+    "ЖЁСТКИЕ ПРАВИЛА:\n"
+    "1. Если в найденных данных нет ответа — скажи честно «Я не знаю» или сделай предположение с пометкой «Предположительно».\n"
+    "2. НИКОГДА не выдавай предположения за уверенные факты. Всегда добавляй: «Это моё предположение», «На основе логики», «Возможно, но не точно».\n"
+    "3. Если цитируешь найденные данные — указывай источник (ссылку).\n"
+    "4. Если есть противоречия — опиши их и не выбирай одну версию как истину без оговорок.\n"
+    "5. Старайся отвечать по существу, но если данных мало — честно скажи об этом и предложи ссылки для самостоятельной проверки.\n"
+    "6. Не используй слова «точно», «гарантированно», «бесспорно» без подтверждения из данных.\n"
+    "7. В КОНЦЕ ОТВЕТА поставь оценку уверенности в процентах (0–100) в формате: «Уверенность: XX%». Если ты делаешь предположения или данных мало — ставь ниже 70%."
+)
 
 LEVEL_1, LEVEL_2, LEVEL_3, LEVEL_4, LEVEL_5 = {'max_history':80,'keep_recent':20}, {'compress_interval':40,'compress_to':50}, {'compress_interval':200,'compress_to':100}, {'compress_interval':1000,'compress_to':200}, {'compress_interval':10000,'compress_to':500}
 PEAK_HOURS = [(9,12),(14,18)]
@@ -241,7 +252,6 @@ def search_in_pyramid(uid, query):
             if q in item.lower(): res.append(f"{em} {item}")
     return res[:15]
 
-# ========== analyze_message с триггерами ==========
 async def analyze_message(user_message):
     q=user_message.lower().strip()
     confirm=['да','нет','ок','хорошо','понял','поняла','ага','угу','ясно','ладно','окей']
@@ -269,7 +279,6 @@ def is_official_link(link):
     link_lower=link.lower()
     return any(dom in link_lower for dom in ['python.org','docs.python.org','peps.python.org','github.com/python','pypi.org'])
 
-# ========== rephrase_query с добавлением года ==========
 async def rephrase_query(query):
     date_keywords=['релиз','выход','дата','release','when','new version','вышла','обновление']
     if any(kw in query.lower() for kw in date_keywords):
@@ -293,14 +302,15 @@ async def simplify_query(query):
         return query
     except: return query
 
-# ========== DEEPSEEK API ==========
+# ========== DEEPSEEK API (с поддержкой max_tokens) ==========
 async def ask_deepseek(messages, retries=3, max_tokens=None, model=None):
     session=await get_http_session()
     use_model=model or MODEL_DEFAULT
     for attempt in range(retries):
         try:
             payload={"model":use_model,"messages":messages,"temperature":MODEL_TEMPERATURE}
-            if max_tokens: payload["max_tokens"]=max_tokens
+            if max_tokens is not None:
+                payload["max_tokens"]=max_tokens
             async with session.post(f"{DEEPSEEK_API_BASE}/chat/completions",
                                     headers={"Authorization":f"Bearer {DEEPSEEK_API_KEY}"},
                                     json=payload) as resp:
@@ -332,7 +342,7 @@ def build_profile_context(profile):
     ctx=". ".join(parts)
     return ctx[:800]+"..." if len(ctx)>800 else ctx
 
-# ========== APISERPENT ==========
+# ========== APISERPENT С ЛОГИРОВАНИЕМ ==========
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
     if not APISERPENT_API_KEY:
         logger.warning("APISERPENT_API_KEY не задан, поиск невозможен.")
@@ -393,7 +403,7 @@ async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
         logger.error(f"❌ Ошибка APISerpent: {ex}")
         return []
 
-# ========== ГЕНЕРАЦИЯ ОТВЕТА ==========
+# ========== ГЕНЕРАЦИЯ ОТВЕТА С ПОДДЕРЖКОЙ ПРЕДПОЛОЖЕНИЙ И ОЦЕНКОЙ УВЕРЕННОСТИ ==========
 async def generate_response(uid, user_message, analysis, history, profile):
     action=analysis.get("action","memory")
     if action=="confirm": return "✅ Понял! Продолжаем.", False, None
@@ -463,34 +473,44 @@ async def generate_response(uid, user_message, analysis, history, profile):
             year_note=f" (год: {r['year']})" if r.get('year') else ""
             stext+=f"{i}. **{r['title']}**{mark}{year_note}\n   {r['snippet'][:200]}\n   🔗 {r['link']}\n\n"
 
+        # Ограничение длины ответа при малом количестве данных
+        total_snippet_len = sum(len(r.get('snippet', '')) for r in all_results)
+        max_tokens_limit = 300 if total_snippet_len < 200 else None
+
         sp={"role":"system","content":
             f"{CORE_SYSTEM_RULE}\nСегодня: {get_current_date()} {get_current_time()}.\n"
             f"Вопрос: \"{user_message}\"\nКонтекст: {ctx}\n\nНайденные данные:\n{stext}\n\n"
-            "ИНСТРУКЦИЯ:\n"
-            "1. Отвечай ТОЛЬКО на основе найденных данных. НЕ ВЫДУМЫВАЙ.\n"
-            "2. Если есть противоречия – укажи и отдай приоритет официальным (⭐).\n"
-            "3. Для технических вопросов проверь год выпуска. Если данные устарели – предупреди.\n"
-            "4. Всегда указывай источники (ссылки).\n"
-            "5. Если точного ответа нет – скажи честно.\n"
-            "6. Структурируй ответ: заголовки, списки.\n"
-            "7. В конце перечисли использованные источники."}
+            "ИНСТРУКЦИЯ ПО ОТВЕТУ:\n"
+            "1. Отвечай ТОЛЬКО на основе найденных данных. Если данных нет — честно скажи об этом.\n"
+            "2. Если ты делаешь предположение — обязательно начинай с фраз: «Предположительно», «На основе логики», «Возможно» и сразу укажи, что это не точный факт.\n"
+            "3. Всегда указывай источники (ссылки) для фактов.\n"
+            "4. Если есть противоречия — опиши их и не выбирай одну версию без оговорок.\n"
+            "5. Структурируй ответ: заголовки, списки, выделение важного.\n"
+            "6. В конце поставь оценку уверенности в процентах (0-100) в формате «Уверенность: XX%»."}
         history.append({"role":"user","content":user_message})
-        ans,err=await ask_deepseek([sp]+history)
+        ans,err=await ask_deepseek([sp]+history, max_tokens=max_tokens_limit)
         if err: return f"⚠️ {analyze_error(err)}", False, None
 
-        # Пост-обработка для исправления типичных ошибок
-        if "PEP 701" in ans or "новый парсер f-строк" in ans:
-            ans="⚠️ Внимание: PEP 701 (новый парсер f-строк) был реализован в Python 3.12, а не в 3.13.\n\n"+ans
-        if "PEP 695" in ans or "type param syntax" in ans or "def func[T]" in ans:
-            ans="⚠️ Внимание: синтаксис type param (PEP 695) реализован в Python 3.12, а не в 3.13.\n\n"+ans
-        if "MutableSequence" in ans and "удалён" in ans:
-            ans="⚠️ Внимание: утверждение об удалении MutableSequence не соответствует действительности.\n\n"+ans
+        # ===== ПОСТОБРАБОТКА =====
+        # 1. Проверка противоречий (локально)
+        contradictions = ['но', 'однако', 'с другой стороны', 'в то же время']
+        if any(word in ans for word in contradictions):
+            # Упрощённая проверка: если есть противопоставления, добавим предупреждение
+            ans = f"⚠️ В ответе есть возможные противоречия. Проверьте информацию.\n\n{ans}"
 
-        year_match=re.search(r'\b(20[2-9][0-9])\b', ans)
-        if year_match:
-            mentioned_year=int(year_match.group(1))
-            if abs(mentioned_year-current_year)>1:
-                ans=f"⚠️ В ответе упоминается год {mentioned_year}, отличается от текущего ({current_year}). Проверьте актуальность.\n\n{ans}"
+        # 2. Извлечение оценки уверенности
+        confidence_match = re.search(r'Уверенность:\s*(\d+)%', ans)
+        if confidence_match:
+            confidence = int(confidence_match.group(1))
+            if confidence < 70:
+                ans = f"⚠️ Модель оценивает свою уверенность в ответе всего на {confidence}%. Будьте внимательны.\n\n{ans}"
+        else:
+            # Если модель не поставила оценку – добавляем предупреждение
+            ans += "\n\n⚠️ Оценка уверенности не указана. Отнеситесь к ответу критически."
+
+        # 3. Проверка на наличие ссылок
+        if 'http' not in ans and len(ans) > 100:
+            ans += "\n\n⚠️ В ответе нет ссылок на источники. Убедитесь в достоверности информации."
 
         return f"🔍 **Искал в интернете:** `{user_message}`\n\n{ans}", True, "🌐 из интернета"
 
@@ -516,9 +536,23 @@ async def generate_response(uid, user_message, analysis, history, profile):
     history.append({"role":"user","content":user_message})
     ans,err=await ask_deepseek([sysmsg]+history)
     if err: return f"⚠️ {analyze_error(err)}", False, None
+
+    # Постобработка для обычных ответов
+    contradictions = ['но', 'однако', 'с другой стороны', 'в то же время']
+    if any(word in ans for word in contradictions):
+        ans = f"⚠️ В ответе есть возможные противоречия. Проверьте информацию.\n\n{ans}"
+
+    confidence_match = re.search(r'Уверенность:\s*(\d+)%', ans)
+    if confidence_match:
+        confidence = int(confidence_match.group(1))
+        if confidence < 70:
+            ans = f"⚠️ Модель оценивает свою уверенность в ответе всего на {confidence}%. Будьте внимательны.\n\n{ans}"
+    else:
+        ans += "\n\n⚠️ Оценка уверенности не указана. Отнеситесь к ответу критически."
+
     return ans, True, "🧠 из модели"
 
-# ========== ОСТАЛЬНЫЕ ФУНКЦИИ ==========
+# ========== ОСТАЛЬНЫЕ ФУНКЦИИ (без изменений) ==========
 async def safe_reply(update: Update, text: str):
     """Отправляет сообщение с автоматическим форматированием Markdown → HTML."""
     msg = update.effective_message
