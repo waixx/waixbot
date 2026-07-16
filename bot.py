@@ -331,34 +331,67 @@ def build_profile_context(profile):
 
 # ========== APISERPENT ==========
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
-    if not APISERPENT_API_KEY: return []
-    session=await get_http_session()
+    if not APISERPENT_API_KEY:
+        logger.warning("APISERPENT_API_KEY не задан, поиск невозможен.")
+        return []
+
+    session = await get_http_session()
     try:
         logger.info(f"🔍 Поиск ({SEARCH_ENGINE}, num={num}): {query}")
-        async with session.get("https://apiserpent.com/api/search",
-                               params={"q":query,"engine":SEARCH_ENGINE,"num":num},
-                               headers={"X-API-Key":APISERPENT_API_KEY}, timeout=30) as r:
-            if r.status!=200: return []
-            data=await r.json()
-            results=[]
-            if isinstance(data.get("results"),dict): results=data["results"].get("organic",[])
-            elif "organic_results" in data: results=data["organic_results"]
-            elif isinstance(data.get("results"),list): results=data["results"]
-            elif "organic" in data: results=data["organic"]
-            elif "items" in data: results=data["items"]
-            if not results and isinstance(data,dict):
-                for k in data:
-                    if isinstance(data[k],list) and data[k] and isinstance(data[k][0],dict):
-                        results=data[k]; break
-            out=[]
+        async with session.get(
+            "https://apiserpent.com/api/search",
+            params={"q": query, "engine": SEARCH_ENGINE, "num": num},
+            headers={"X-API-Key": APISERPENT_API_KEY},
+            timeout=30
+        ) as r:
+            # Логируем статус и тело ответа
+            response_text = await r.text()
+            logger.info(f"APISerpent статус: {r.status}, тело: {response_text[:500]}")
+
+            if r.status != 200:
+                logger.error(f"APISerpent ошибка {r.status}: {response_text[:300]}")
+                return []
+
+            data = await r.json()
+            logger.info(f"APISerpent JSON: {json.dumps(data, ensure_ascii=False)[:500]}")
+
+            # --- Парсинг результатов (универсальный) ---
+            results = []
+            if isinstance(data.get("results"), dict):
+                results = data["results"].get("organic", [])
+            elif "organic_results" in data:
+                results = data["organic_results"]
+            elif isinstance(data.get("results"), list):
+                results = data["results"]
+            elif "organic" in data:
+                results = data["organic"]
+            elif "items" in data:
+                results = data["items"]
+            else:
+                # Если ничего не нашли, пробуем найти первый ключ, содержащий список
+                for key in data:
+                    if isinstance(data[key], list) and data[key] and isinstance(data[key][0], dict):
+                        results = data[key]
+                        logger.info(f"Найдены результаты в ключе '{key}'")
+                        break
+
+            out = []
             for x in results[:num]:
-                if isinstance(x,dict):
-                    out.append({"title":str(x.get("title",x.get("name","Без названия")))[:150],
-                                "snippet":str(x.get("snippet",x.get("description",x.get("text","Нет описания"))))[:250],
-                                "link":str(x.get("url",x.get("link",x.get("href","#"))))[:150]})
+                if isinstance(x, dict):
+                    out.append({
+                        "title": str(x.get("title", x.get("name", "Без названия")))[:150],
+                        "snippet": str(x.get("snippet", x.get("description", x.get("text", "Нет описания"))))[:250],
+                        "link": str(x.get("url", x.get("link", x.get("href", "#"))))[:150],
+                    })
+            logger.info(f"APISerpent вернул {len(out)} результатов")
             return out
-    except asyncio.TimeoutError: logger.error("Таймаут APISerpent"); return []
-    except Exception as ex: logger.error(f"Ошибка APISerpent: {ex}"); return []
+
+    except asyncio.TimeoutError:
+        logger.error("⏰ Таймаут APISerpent")
+        return []
+    except Exception as ex:
+        logger.error(f"❌ Ошибка APISerpent: {ex}")
+        return []
 
 # ========== ГЕНЕРАЦИЯ ОТВЕТА (С УЛУЧШЕННЫМ ПОИСКОМ) ==========
 async def generate_response(uid, user_message, analysis, history, profile):
