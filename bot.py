@@ -42,7 +42,9 @@ def is_peak_hour(): return any(s <= now().hour < e for s,e in PEAK_HOURS)
 def get_peak_status(): return "⚠️ Сейчас пиковые часы DeepSeek (9-12, 14-18) — стоимость удвоена." if is_peak_hour() else "✅ Непиковые часы."
 
 if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY: logger.error("Токены не заданы"); sys.exit(1)
-if not APISERPENT_API_KEY: logger.warning("APISERPENT_API_KEY не задан")
+if not APISERPENT_API_KEY:
+    logger.warning("APISERPENT_API_KEY не задан")
+    return []  # возвращаем пустой список, но в generate_response будет обработано
 
 DATA_DIR, BACKUP_DIR = "data", "data/backups"
 os.makedirs(DATA_DIR, exist_ok=True); os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -431,12 +433,9 @@ async def generate_response(uid, user_message, analysis, history, profile):
                     link=res.get('link')
                     if link and link not in seen: seen.add(link); all_results.append(res)
 
-        if not all_results:
-            sysmsg={"role":"system","content":f"{CORE_SYSTEM_RULE}\nСегодня: {get_current_date()} {get_current_time()}. {ctx}\nПоиск не дал результатов. Скажи честно."}
-            history.append({"role":"user","content":user_message})
-            ans,err=await ask_deepseek([sysmsg]+history)
-            if err: return f"⚠️ {analyze_error(err)}", False, None
-            return f"🔍 **Искал:** `{user_message}`\n\n❌ Ничего не найдено.\n\n🧠 {ans}", True, "🧠 из модели (поиск пуст)"
+if not all_results:
+    return (f"🔍 **Искал:** `{user_message}`\n\n"
+            f"❌ Поиск не дал результатов. Попробуйте другие ключевые слова или проверьте подключение."), False, None
 
         # --- Ранжирование с учётом года и официальности ---
         for res in all_results:
