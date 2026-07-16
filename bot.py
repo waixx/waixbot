@@ -1,6 +1,6 @@
 # ============================================================
-#  BroWaix Bot — УНИВЕРСАЛЬНАЯ ЛОГИКА (принудительное использование данных)
-#  (не привязано к моделям, работает для любых запросов)
+#  BroWaix Bot — АБСОЛЮТНАЯ ОПОРА НА ДАННЫЕ (финальная версия)
+#  (принудительное извлечение, повторные попытки, $20/мес)
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
 from datetime import datetime, timedelta
@@ -15,7 +15,7 @@ from logging.handlers import RotatingFileHandler
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-handler = RotatingFileHandler("bot.log", maxBytes=5*1024*1024, backupCount=2)
+handler = RotatingFileHandler("bot.log", maxBytes=10*1024*1024, backupCount=3)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
@@ -44,31 +44,30 @@ MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
-# --- ПАРАМЕТРЫ (бюджет $10/мес) ---
-SEARCH_RESULTS_NUM = 10
+# --- ПАРАМЕТРЫ (увеличены для качества) ---
+SEARCH_RESULTS_NUM = 15
 SEARCH_VARIANTS_COUNT = 3
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 86400
-MAX_TOKENS_ANSWER = 700
-TOP_RESULTS_SHOW = 15
+MAX_TOKENS_ANSWER = 1024
+TOP_RESULTS_SHOW = 20
 
-# ===== УНИВЕРСАЛЬНЫЙ СИСТЕМНЫЙ ПРОМПТ =====
+# ===== ЖЁСТКИЙ ПРОМПТ =====
 CORE_SYSTEM_RULE = (
     "Ты — честный ассистент. Ты УЖЕ выполнил поиск в интернете и получил данные (они приведены ниже).\n"
     "Ты ОБЯЗАН использовать эти данные для ответа. Если ты проигнорируешь их, это будет нарушением инструкции.\n\n"
     "ЖЁСТКИЕ ПРАВИЛА:\n"
     "1. Используй ТОЛЬКО данные из раздела «НАЙДЕННЫЕ ДАННЫЕ».\n"
-    "2. Если в данных есть конкретная информация (факты, цифры, ссылки) – обязательно включи их в ответ.\n"
-    "3. Каждое утверждение сопровождай ссылкой.\n"
-    "4. ЗАПРЕЩЕНО писать: «нет доступа», «не могу выполнить поиск», «техническое ограничение».\n"
-    "5. Если данных действительно нет – скажи: «В найденных данных нет информации».\n"
-    "6. В конце укажи: 📅 Дата (если есть), Уверенность: XX%.\n\n"
+    "2. Каждое утверждение сопровождай ссылкой.\n"
+    "3. ЗАПРЕЩЕНО писать: «нет доступа», «не могу выполнить поиск», «техническое ограничение».\n"
+    "4. Если данных действительно нет – скажи: «В найденных данных нет информации».\n"
+    "5. В конце укажи: 📅 Дата (если есть), Уверенность: XX%.\n\n"
     "ФОРМАТ ОТВЕТА:\n"
-    "Структурируй ответ: заголовки, списки, ссылки. Используй эмодзи для наглядности. Не используй таблицы."
+    "Структурируй ответ: заголовки, списки, ссылки. Используй эмодзи для наглядности."
 )
 
-# ---------- ПАМЯТЬ (упрощённая) ----------
+# ---------- ПАМЯТЬ ----------
 LEVEL_1 = {'max_history': 40, 'keep_recent': 10}
 LEVEL_2 = {'compress_interval': 20, 'compress_to': 30}
 
@@ -102,7 +101,7 @@ async def get_http_session():
             )
         return _http_session
 
-# ---------- ФАЙЛЫ ----------
+# ---------- ФАЙЛЫ (атомарные) ----------
 def atomic_write(filename, data, as_json=True):
     tmp = filename + ".tmp"
     try:
@@ -140,7 +139,7 @@ def create_backup(uid, data_type):
         if data_type == "profile": atomic_write(fname, load_profile(uid))
         elif data_type == "memory": atomic_write(fname, load_memory_raw(uid))
         backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith(f"{data_type}_{uid}_")])
-        for old in backups[:-3]: os.remove(os.path.join(BACKUP_DIR, old))
+        for old in backups[:-5]: os.remove(os.path.join(BACKUP_DIR, old))
         return True
     except Exception:
         return False
@@ -286,14 +285,13 @@ def highlight_contradictions(text):
             highlighted.append(sent)
     return ' '.join(highlighted), found
 
-# ---------- УНИВЕРСАЛЬНЫЙ ГЕНЕРАТОР ОТВЕТА ИЗ СНИППЕТОВ ----------
+# ===== ГЛАВНЫЙ МЕХАНИЗМ: ИЗВЛЕЧЕНИЕ ДАННЫХ ИЗ СНИППЕТОВ =====
 def generate_answer_from_snippets(raw_snippets, user_message, max_items=10):
-    """Формирует ответ из сырых сниппетов, если модель не дала ответ."""
+    """Формирует ответ из найденных ссылок – даже если модель отказалась."""
     if not raw_snippets:
         return "❌ В интернете ничего не найдено по вашему запросу."
     
     lines = raw_snippets.split('\n')
-    # Собираем уникальные ссылки с заголовками
     items = []
     current_title = None
     current_link = None
@@ -303,20 +301,14 @@ def generate_answer_from_snippets(raw_snippets, user_message, max_items=10):
         line = line.strip()
         if not line:
             continue
-        # Если строка содержит ссылку
-        if 'http' in line and '🔗' not in line:
-            # Извлекаем URL
-            url_match = re.search(r'(https?://[^\s]+)', line)
-            if url_match:
-                current_link = url_match.group(1)
-                # Заголовок ищем в предыдущих строках
-        elif line.startswith('http') or '🔗' in line:
-            continue
-        elif line and not current_title and len(line) < 120:
+        url_match = re.search(r'(https?://[^\s]+)', line)
+        if url_match:
+            current_link = url_match.group(1)
+        elif not current_title and len(line) < 120 and not line.startswith('•'):
             current_title = line
-        elif line and not current_snippet and len(line) > 20:
+        elif len(line) > 30 and not current_snippet:
             current_snippet = line
-        # Если есть всё, добавляем
+            
         if current_title and current_link:
             items.append({
                 'title': current_title[:100],
@@ -330,39 +322,51 @@ def generate_answer_from_snippets(raw_snippets, user_message, max_items=10):
                 break
     
     if not items:
-        # Если не удалось разобрать, возвращаем сырые сниппеты
-        return f"Найденные результаты (прямые ссылки):\n\n{raw_snippets[:1000]}"
+        links = re.findall(r'(https?://[^\s]+)', raw_snippets)
+        if links:
+            answer = "🔍 **Найденные результаты (прямые ссылки):**\n\n"
+            for link in links[:max_items]:
+                answer += f"• {link}\n"
+            answer += f"\n📅 Дата: {get_current_date()} (поиск выполнен сегодня)\n"
+            answer += "Уверенность: 70% (на основе найденных данных)"
+            return answer
+        else:
+            return f"Найденные данные:\n\n{raw_snippets[:1000]}"
     
-    # Формируем ответ
     answer = f"🔍 **Результаты поиска по запросу:** {user_message[:100]}\n\n"
     for i, item in enumerate(items, 1):
         answer += f"{i}. <b>{item['title']}</b>\n"
-        if item['snippet']:
+        if item['snippet'] and item['snippet'] != "Нет описания":
             answer += f"   {item['snippet']}\n"
         answer += f"   🔗 <a href='{item['link']}'>Источник</a>\n\n"
     
     answer += f"📅 Дата: {get_current_date()} (поиск выполнен сегодня)\n"
     answer += "Уверенность: 70% (на основе найденных данных)"
-    
     return answer
 
-# ---------- ПОСТОБРАБОТКА С ЗАМЕНОЙ ОТВЕТА ----------
+def is_useful_answer(ans):
+    """Проверяет, содержит ли ответ реальные данные из интернета."""
+    if not ans or len(ans) < 50:
+        return False
+    has_links = 'http' in ans
+    has_numbers = bool(re.search(r'\d+', ans))
+    has_models = bool(re.search(r'(Xiaomi|H96|X96Q|Tanix|Vontar|RockTek|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Apple|Sber|Rombica|Kickpi|TOX|X88|H618|H313|S905|RK3566)', ans, re.I))
+    empty_phrases = ['я не знаю', 'нет данных', 'не нашел', 'не указаны', 'нет прямого списка', 'нет информации']
+    has_empty_phrase = any(phrase in ans.lower() for phrase in empty_phrases)
+    
+    return (has_links or has_numbers or has_models) and not has_empty_phrase
+
 def finalize_answer(ans, current_date, raw_snippets=None, user_message=None):
-    # Проверяем, содержит ли ответ полезную информацию (не пустой и не "я не знаю")
-    is_empty = (len(ans) < 50 or "я не знаю" in ans.lower() or "нет данных" in ans.lower() or "не нашел" in ans.lower())
+    # Если ответ бесполезен – заменяем на сгенерированный из сниппетов
+    if not is_useful_answer(ans) and raw_snippets:
+        return generate_answer_from_snippets(raw_snippets, user_message)
     
-    # Если ответ пустой или модель отмазалась, и есть сырые данные – генерируем ответ сами
-    if is_empty and raw_snippets:
-        ans = generate_answer_from_snippets(raw_snippets, user_message)
-        return ans  # возвращаем сгенерированный ответ без дополнительной постобработки
-    
-    # Если модель всё же дала ответ, но в нём есть запрещённые фразы – заменяем их
+    # Замена запрещённых фраз
     forbidden = ['нет доступа', 'не могу выполнить поиск', 'не могу выйти в интернет', 'техническое ограничение']
     for phrase in forbidden:
         if phrase in ans.lower():
             ans = ans.replace(phrase, "я не нашёл готового рейтинга, но вот что удалось обнаружить")
     
-    # Проверяем наличие ссылок
     if 'http' not in ans and raw_snippets:
         ans = f"Я нашёл информацию в интернете:\n\n{raw_snippets[:1500]}\n\n" + ans
     
@@ -407,11 +411,9 @@ async def optimize_query(query, profile=None):
     try:
         result, err = await ask_deepseek(messages, max_tokens=100, model=MODEL_DEFAULT)
         if err or not result:
-            logger.warning("LLM не вернул варианты, используем шаблоны")
             return await fallback_queries(query)
         variants = [v.strip() for v in result.split('|') if v.strip()]
         if len(variants) < 2:
-            logger.warning("LLM вернул менее 2 вариантов, дополняем шаблонами")
             return await fallback_queries(query, base_variants=variants)
         return variants[:SEARCH_VARIANTS_COUNT]
     except Exception as e:
@@ -495,12 +497,12 @@ async def search_duckduckgo_async(query):
     except Exception:
         return []
 
-# ---------- ГЕНЕРАЦИЯ ОТВЕТА ----------
+# ---------- ГЕНЕРАЦИЯ ОТВЕТА С ПОВТОРНОЙ ПОПЫТКОЙ ----------
 async def generate_response(uid, user_message, history, profile, retry_count=0):
     try:
         return await asyncio.wait_for(
             _generate_response_internal(uid, user_message, history, profile, retry_count),
-            timeout=40
+            timeout=50
         )
     except asyncio.TimeoutError:
         return "⏰ Превышено время ожидания. Попробуйте позже.", False
@@ -535,7 +537,6 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         logger.info(f"📊 Результатов: {len(all_results)}")
         set_cache(user_message, all_results)
 
-    # Если нет результатов – fallback на знания модели
     if not all_results:
         sp_knowledge = {
             "role": "system",
@@ -568,12 +569,10 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
     ), reverse=True)
 
     top_results = all_results[:TOP_RESULTS_SHOW]
-    # Формируем сырые сниппеты
     raw_snippets = ""
     for i, r in enumerate(top_results, 1):
         raw_snippets += f"{i}. {r['title']}\n   {r['snippet'][:180]}\n   🔗 {r['link']}\n\n"
 
-    # Формируем красивый stext для модели
     stext = ""
     for i, r in enumerate(top_results, 1):
         is_off = "⭐ " if is_official_link(r.get('link','')) else ""
@@ -582,6 +581,7 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         link_html = f"🔗 <a href=\"{r['link']}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
         stext += f"{i}. {is_off}**{r['title']}**{year_note}{price_note}\n   {r['snippet'][:180]}\n   {link_html}\n\n"
 
+    # Первая попытка
     sp = {
         "role": "system",
         "content": (
@@ -592,10 +592,9 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
             f"{stext}\n\n"
             "ИНСТРУКЦИЯ ПО ОТВЕТУ:\n"
             "1. Используй ТОЛЬКО данные выше.\n"
-            "2. Если в данных есть факты, цифры, ссылки – обязательно включи их в ответ.\n"
-            "3. Каждый факт должен сопровождаться ссылкой.\n"
-            "4. ЗАПРЕЩЕНО говорить о «нет доступа».\n"
-            "5. Ответ структурируй: заголовки, списки, эмодзи."
+            "2. Каждый факт должен сопровождаться ссылкой.\n"
+            "3. ЗАПРЕЩЕНО говорить о «нет доступа».\n"
+            "4. Ответ структурируй: заголовки, списки, эмодзи."
         )
     }
 
@@ -603,8 +602,38 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
     if err:
         return f"⚠️ Ошибка API: {err}", False
 
-    final_ans = finalize_answer(ans, get_current_date(), raw_snippets, user_message)
-    return f"🌐 из интернета\n\n{final_ans}", True
+    if is_useful_answer(ans):
+        final_ans = finalize_answer(ans, get_current_date(), raw_snippets, user_message)
+        return f"🌐 из интернета\n\n{final_ans}", True
+
+    # Вторая попытка (усиленный промпт)
+    logger.info("🔄 Первый ответ бесполезен, пробуем второй раз")
+    sp2 = {
+        "role": "system",
+        "content": (
+            f"{CORE_SYSTEM_RULE}\n"
+            f"Сегодня: {get_current_date()}.\n"
+            f"Контекст: {ctx}\n\n"
+            "Ты проигнорировал данные в прошлый раз. Это недопустимо.\n"
+            "Ты ОБЯЗАН ответить на основе данных ниже. НЕ пиши «я не знаю».\n"
+            "Используй эти данные и дай развёрнутый ответ с ссылками.\n\n"
+            "НАЙДЕННЫЕ ДАННЫЕ (ТОЛЬКО ИХ ИСПОЛЬЗУЙ):\n"
+            f"{stext}\n\n"
+            "ОТВЕТЬ ПРЯМО СЕЙЧАС, ИСПОЛЬЗУЯ ЭТИ ДАННЫЕ."
+        )
+    }
+    ans2, err2 = await ask_deepseek([sp2] + history, max_tokens=MAX_TOKENS_ANSWER)
+    if err2:
+        return f"⚠️ Ошибка API: {err2}", False
+
+    if is_useful_answer(ans2):
+        final_ans = finalize_answer(ans2, get_current_date(), raw_snippets, user_message)
+        return f"🌐 из интернета (повторная попытка)\n\n{final_ans}", True
+
+    # Если всё равно бесполезно – генерируем из сниппетов
+    logger.info("⚠️ Вторая попытка тоже бесполезна, генерируем из сниппетов")
+    fallback_ans = generate_answer_from_snippets(raw_snippets, user_message)
+    return f"🌐 из интернета (автоматическая генерация)\n\n{fallback_ans}", True
 
 def build_profile_context(profile):
     parts = []
@@ -643,11 +672,11 @@ async def ask_deepseek(messages, retries=2, max_tokens=None, model=MODEL_DEFAULT
             await asyncio.sleep(1)
     return None, "max_retries"
 
-# ---------- КОМАНДЫ ----------
+# ---------- КОМАНДЫ (сокращённо) ----------
 async def start(update, context):
     uid = update.effective_user.id
     if not is_allowed(uid): return
-    await safe_reply(update, "👋 Привет! Я — честный ассистент с доступом в интернет. Задавай вопросы!\n\n🛡 Принципы: не врать, указывать источники, дату и уверенность.\n📋 Команды: /profile, /memory, /stats, /forget, /restore")
+    await safe_reply(update, "👋 Привет! Я — честный ассистент с доступом в интернет.\n🛡 Принципы: не врать, указывать источники, дату и уверенность.\n📋 Команды: /profile, /memory, /stats, /forget, /restore")
 
 async def profile_command(update, context):
     uid = update.effective_user.id
@@ -911,5 +940,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (универсальная логика, принудительное использование данных)")
+    logger.info("✅ БОТ ЗАПУЩЕН (финальная версия – принудительное извлечение данных)")
     app.run_polling()
