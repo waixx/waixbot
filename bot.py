@@ -41,10 +41,10 @@ PEAK_HOURS = [(9,12),(14,18)]
 def is_peak_hour(): return any(s <= now().hour < e for s,e in PEAK_HOURS)
 def get_peak_status(): return "⚠️ Сейчас пиковые часы DeepSeek (9-12, 14-18) — стоимость удвоена." if is_peak_hour() else "✅ Непиковые часы."
 
-if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY: logger.error("Токены не заданы"); sys.exit(1)
+if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
+    logger.error("Токены не заданы"); sys.exit(1)
 if not APISERPENT_API_KEY:
     logger.warning("APISERPENT_API_KEY не задан")
-    return []  # возвращаем пустой список, но в generate_response будет обработано
 
 DATA_DIR, BACKUP_DIR = "data", "data/backups"
 os.makedirs(DATA_DIR, exist_ok=True); os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -79,9 +79,10 @@ def atomic_write(filename, data, as_json=True):
             else: f.write(data)
             f.flush(); os.fsync(f.fileno())
         shutil.move(tmp,filename); return True
-    except Exception as ex: logger.error(f"Ошибка записи {filename}: {ex}"); 
-    if os.path.exists(tmp): os.remove(tmp)
-    return False
+    except Exception as ex:
+        logger.error(f"Ошибка записи {filename}: {ex}")
+        if os.path.exists(tmp): os.remove(tmp)
+        return False
 
 def atomic_read(filename, default=None, as_json=True):
     try:
@@ -240,7 +241,7 @@ def search_in_pyramid(uid, query):
             if q in item.lower(): res.append(f"{em} {item}")
     return res[:15]
 
-# ========== НОВАЯ ВЕРСИЯ analyze_message с триггерами ==========
+# ========== analyze_message с триггерами ==========
 async def analyze_message(user_message):
     q=user_message.lower().strip()
     confirm=['да','нет','ок','хорошо','понял','поняла','ага','угу','ясно','ладно','окей']
@@ -255,7 +256,7 @@ async def analyze_message(user_message):
     if any(ind in q for ind in date_indicators) or re.search(r'\d{2}\.\d{2}(\.\d{4})?', q): return {"action":"internet"}
     dyn=['погод','температур','прогноз','осадк','курс валют','курс доллар','курс евро','курс юан','биткоин','котировк',
          'последние новости','свежие новости','что произошло сегодня',
-         'релиз','вышла','новая версия','обновление','python','выпущена']   # добавлены триггеры
+         'релиз','вышла','новая версия','обновление','python','выпущена']
     if any(t in q for t in dyn): return {"action":"internet"}
     return {"action":"memory"}
 
@@ -268,7 +269,7 @@ def is_official_link(link):
     link_lower=link.lower()
     return any(dom in link_lower for dom in ['python.org','docs.python.org','peps.python.org','github.com/python','pypi.org'])
 
-# ========== НОВАЯ rephrase_query с добавлением года ==========
+# ========== rephrase_query с добавлением года ==========
 async def rephrase_query(query):
     date_keywords=['релиз','выход','дата','release','when','new version','вышла','обновление']
     if any(kw in query.lower() for kw in date_keywords):
@@ -346,7 +347,6 @@ async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
             headers={"X-API-Key": APISERPENT_API_KEY},
             timeout=30
         ) as r:
-            # Логируем статус и тело ответа
             response_text = await r.text()
             logger.info(f"APISerpent статус: {r.status}, тело: {response_text[:500]}")
 
@@ -357,7 +357,6 @@ async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
             data = await r.json()
             logger.info(f"APISerpent JSON: {json.dumps(data, ensure_ascii=False)[:500]}")
 
-            # --- Парсинг результатов (универсальный) ---
             results = []
             if isinstance(data.get("results"), dict):
                 results = data["results"].get("organic", [])
@@ -370,7 +369,6 @@ async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
             elif "items" in data:
                 results = data["items"]
             else:
-                # Если ничего не нашли, пробуем найти первый ключ, содержащий список
                 for key in data:
                     if isinstance(data[key], list) and data[key] and isinstance(data[key][0], dict):
                         results = data[key]
@@ -395,7 +393,7 @@ async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
         logger.error(f"❌ Ошибка APISerpent: {ex}")
         return []
 
-# ========== ГЕНЕРАЦИЯ ОТВЕТА (С УЛУЧШЕННЫМ ПОИСКОМ) ==========
+# ========== ГЕНЕРАЦИЯ ОТВЕТА ==========
 async def generate_response(uid, user_message, analysis, history, profile):
     action=analysis.get("action","memory")
     if action=="confirm": return "✅ Понял! Продолжаем.", False, None
@@ -433,9 +431,9 @@ async def generate_response(uid, user_message, analysis, history, profile):
                     link=res.get('link')
                     if link and link not in seen: seen.add(link); all_results.append(res)
 
-if not all_results:
-    return (f"🔍 **Искал:** `{user_message}`\n\n"
-            f"❌ Поиск не дал результатов. Попробуйте другие ключевые слова или проверьте подключение."), False, None
+        if not all_results:
+            return (f"🔍 **Искал:** `{user_message}`\n\n"
+                    f"❌ Поиск не дал результатов. Попробуйте другие ключевые слова или проверьте подключение."), False, None
 
         # --- Ранжирование с учётом года и официальности ---
         for res in all_results:
@@ -520,28 +518,20 @@ if not all_results:
     if err: return f"⚠️ {analyze_error(err)}", False, None
     return ans, True, "🧠 из модели"
 
-# ========== ОСТАЛЬНЫЕ ФУНКЦИИ (без изменений) ==========
+# ========== ОСТАЛЬНЫЕ ФУНКЦИИ ==========
 async def safe_reply(update: Update, text: str):
     """Отправляет сообщение с автоматическим форматированием Markdown → HTML."""
     msg = update.effective_message
     if msg is None:
         return
 
-    # Преобразуем Markdown-разметку в HTML
     def markdown_to_html(t):
-        # 1. Жирный: **текст** → <b>текст</b>
         t = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', t)
-        # 2. Курсив: __текст__ → <i>текст</i>
         t = re.sub(r'\_\_([^_]+)\_\_', r'<i>\1</i>', t)
-        # 3. Ссылки: [текст](url) → <a href="url">текст</a>
         t = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', t)
-        # 4. Заголовки вида "### текст" → "📌 <b>текст</b>"
         t = re.sub(r'^#{1,3}\s+(.+)$', r'📌 <b>\1</b>', t, flags=re.MULTILINE)
-        # 5. Списки: строки, начинающиеся с "- " или "* " → "• "
         t = re.sub(r'^[-*]\s+(.+)', r'• \1', t, flags=re.MULTILINE)
-        # 6. Цифровые списки: "1. текст" → "• текст"
         t = re.sub(r'^\d+\.\s+(.+)', r'• \1', t, flags=re.MULTILINE)
-        # 7. Убираем Markdown-таблицы: строки с "|" заменяем на списки
         lines = t.split('\n')
         new_lines = []
         in_table = False
@@ -558,7 +548,6 @@ async def safe_reply(update: Update, text: str):
                 new_lines.append(line)
         t = '\n'.join(new_lines)
 
-        # 8. Добавляем эмодзи перед ключевыми словами
         emoji_map = {
             'дата': '📅', 'выйдет': '📅', 'релиз': '🚀', 'выход': '📅',
             'производительность': '⚡', 'скорость': '⚡',
@@ -569,15 +558,12 @@ async def safe_reply(update: Update, text: str):
         for word, emoji in emoji_map.items():
             t = re.sub(rf'(?i)({word}\s*:)', f'{emoji} \\1', t)
 
-        # 9. Убираем лишние пустые строки
         t = re.sub(r'\n{3,}', '\n\n', t)
         return t.strip()
 
-    # Если текст не слишком короткий и не содержит служебных команд – форматируем
     if len(text) > 20 and not text.startswith(('/', '❌', '✅', '⏰', '📅')):
         text = markdown_to_html(text)
 
-    # Отправляем с HTML-парсингом
     for attempt in range(3):
         try:
             if len(text) > 4096:
@@ -590,7 +576,7 @@ async def safe_reply(update: Update, text: str):
             if attempt == 2:
                 logger.error(f"safe_reply не смог: {ex}")
                 try:
-                    await msg.reply_text(text)  # fallback без парсинга
+                    await msg.reply_text(text)
                 except:
                     pass
             else:
