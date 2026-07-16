@@ -1,6 +1,6 @@
 # ============================================================
-#  BroWaix Bot — МАКСИМАЛЬНОЕ ИЗВЛЕЧЕНИЕ ДАННЫХ
-#  (жёсткий промпт, принудительное извлечение моделей, экономия)
+#  BroWaix Bot — УНИВЕРСАЛЬНАЯ ЛОГИКА (принудительное использование данных)
+#  (не привязано к моделям, работает для любых запросов)
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
 from datetime import datetime, timedelta
@@ -25,7 +25,7 @@ logger.addHandler(console)
 
 load_dotenv()
 
-# ---------- ПЕРЕМЕННЫЕ (экономичные) ----------
+# ---------- ПЕРЕМЕННЫЕ ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 APISERPENT_API_KEY = os.getenv("APISERPENT_API_KEY")
@@ -44,40 +44,31 @@ MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
-# --- ОПТИМАЛЬНЫЕ ПАРАМЕТРЫ ДЛЯ БЮДЖЕТА $10/МЕС ---
-SEARCH_RESULTS_NUM = 10          # 10 результатов на запрос
-SEARCH_VARIANTS_COUNT = 3        # 3 варианта (баланс)
+# --- ПАРАМЕТРЫ (бюджет $10/мес) ---
+SEARCH_RESULTS_NUM = 10
+SEARCH_VARIANTS_COUNT = 3
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
-CACHE_TTL = 86400                # 24 часа
-MAX_TOKENS_ANSWER = 500          # лимит ответа
-TOP_RESULTS_SHOW = 15            # показываем 15 сниппетов (больше шансов найти модели)
+CACHE_TTL = 86400
+MAX_TOKENS_ANSWER = 700
+TOP_RESULTS_SHOW = 15
 
-# ===== ЖЁСТКИЙ ПРОМПТ С ТРЕБОВАНИЕМ ИЗВЛЕКАТЬ МОДЕЛИ =====
+# ===== УНИВЕРСАЛЬНЫЙ СИСТЕМНЫЙ ПРОМПТ =====
 CORE_SYSTEM_RULE = (
     "Ты — честный ассистент. Ты УЖЕ выполнил поиск в интернете и получил данные (они приведены ниже).\n"
-    "Твоя задача — использовать эти данные для ответа.\n\n"
+    "Ты ОБЯЗАН использовать эти данные для ответа. Если ты проигнорируешь их, это будет нарушением инструкции.\n\n"
     "ЖЁСТКИЕ ПРАВИЛА:\n"
     "1. Используй ТОЛЬКО данные из раздела «НАЙДЕННЫЕ ДАННЫЕ».\n"
-    "2. Если в данных есть упоминания конкретных моделей (Xiaomi, H96, X96Q, Tanix и т.п.) – обязательно включи их в ответ.\n"
-    "3. Даже если нет готового рейтинга, ты можешь составить список моделей из упоминаний в разных статьях.\n"
-    "4. Каждое утверждение должно сопровождаться ссылкой на источник.\n"
-    "5. ЗАПРЕЩЕНО говорить: «нет доступа», «не могу выполнить поиск», «техническое ограничение».\n"
-    "6. Если данных нет – скажи: «В найденных данных нет информации».\n"
-    "7. В конце укажи: 📅 Дата (если есть), Уверенность: XX% (если данные есть).\n\n"
-    "ФОРМАТ ОТВЕТА (ОБЯЗАТЕЛЬНО):\n"
-    "Каждый результат — отдельный блок с эмодзи:\n"
-    "<b>Название модели</b>\n"
-    "💰 Цена\n"
-    "📟 Чипсет/ОС\n"
-    "💾 Память\n"
-    "📺 Особенности\n"
-    "🔗 <a href='URL'>Источник</a>\n"
-    "Между блоками — пустая строка.\n"
-    "НЕ используй Markdown-таблицы."
+    "2. Если в данных есть конкретная информация (факты, цифры, ссылки) – обязательно включи их в ответ.\n"
+    "3. Каждое утверждение сопровождай ссылкой.\n"
+    "4. ЗАПРЕЩЕНО писать: «нет доступа», «не могу выполнить поиск», «техническое ограничение».\n"
+    "5. Если данных действительно нет – скажи: «В найденных данных нет информации».\n"
+    "6. В конце укажи: 📅 Дата (если есть), Уверенность: XX%.\n\n"
+    "ФОРМАТ ОТВЕТА:\n"
+    "Структурируй ответ: заголовки, списки, ссылки. Используй эмодзи для наглядности. Не используй таблицы."
 )
 
-# ---------- ПАМЯТЬ ----------
+# ---------- ПАМЯТЬ (упрощённая) ----------
 LEVEL_1 = {'max_history': 40, 'keep_recent': 10}
 LEVEL_2 = {'compress_interval': 20, 'compress_to': 30}
 
@@ -295,58 +286,91 @@ def highlight_contradictions(text):
             highlighted.append(sent)
     return ' '.join(highlighted), found
 
-# ---------- ПОСТОБРАБОТКА С ПРИНУДИТЕЛЬНЫМ ИЗВЛЕЧЕНИЕМ МОДЕЛЕЙ ----------
-def extract_models_from_snippets(raw_snippets):
-    """Ищет в сырых сниппетах названия моделей (Xiaomi, H96, X96Q, Tanix и т.д.)"""
+# ---------- УНИВЕРСАЛЬНЫЙ ГЕНЕРАТОР ОТВЕТА ИЗ СНИППЕТОВ ----------
+def generate_answer_from_snippets(raw_snippets, user_message, max_items=10):
+    """Формирует ответ из сырых сниппетов, если модель не дала ответ."""
     if not raw_snippets:
-        return []
-    # Список известных брендов и моделей (можно расширить)
-    known_models = ['Xiaomi', 'H96', 'X96Q', 'X96', 'Tanix', 'Vontar', 'RockTek', 'Ugoos', 'Beelink', 'Minix', 'WeChip', 'A95X', 'H618', 'H313', 'S905X3', 'S905Y4', 'RK3566']
-    found = []
-    for model in known_models:
-        if model.lower() in raw_snippets.lower():
-            # Ищем контекст (цену, характеристики) – упрощённо
-            context = ""
-            lines = raw_snippets.split('\n')
-            for line in lines:
-                if model.lower() in line.lower():
-                    context = line.strip()[:200]
-                    break
-            found.append((model, context))
-    # Убираем дубликаты
-    unique = []
-    seen = set()
-    for m, c in found:
-        if m not in seen:
-            seen.add(m)
-            unique.append((m, c))
-    return unique
+        return "❌ В интернете ничего не найдено по вашему запросу."
+    
+    lines = raw_snippets.split('\n')
+    # Собираем уникальные ссылки с заголовками
+    items = []
+    current_title = None
+    current_link = None
+    current_snippet = ""
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # Если строка содержит ссылку
+        if 'http' in line and '🔗' not in line:
+            # Извлекаем URL
+            url_match = re.search(r'(https?://[^\s]+)', line)
+            if url_match:
+                current_link = url_match.group(1)
+                # Заголовок ищем в предыдущих строках
+        elif line.startswith('http') or '🔗' in line:
+            continue
+        elif line and not current_title and len(line) < 120:
+            current_title = line
+        elif line and not current_snippet and len(line) > 20:
+            current_snippet = line
+        # Если есть всё, добавляем
+        if current_title and current_link:
+            items.append({
+                'title': current_title[:100],
+                'snippet': current_snippet[:200] if current_snippet else "Нет описания",
+                'link': current_link
+            })
+            current_title = None
+            current_link = None
+            current_snippet = ""
+            if len(items) >= max_items:
+                break
+    
+    if not items:
+        # Если не удалось разобрать, возвращаем сырые сниппеты
+        return f"Найденные результаты (прямые ссылки):\n\n{raw_snippets[:1000]}"
+    
+    # Формируем ответ
+    answer = f"🔍 **Результаты поиска по запросу:** {user_message[:100]}\n\n"
+    for i, item in enumerate(items, 1):
+        answer += f"{i}. <b>{item['title']}</b>\n"
+        if item['snippet']:
+            answer += f"   {item['snippet']}\n"
+        answer += f"   🔗 <a href='{item['link']}'>Источник</a>\n\n"
+    
+    answer += f"📅 Дата: {get_current_date()} (поиск выполнен сегодня)\n"
+    answer += "Уверенность: 70% (на основе найденных данных)"
+    
+    return answer
 
+# ---------- ПОСТОБРАБОТКА С ЗАМЕНОЙ ОТВЕТА ----------
 def finalize_answer(ans, current_date, raw_snippets=None, user_message=None):
-    # Если в ответе нет ссылок и есть сырые данные – вставляем их
-    if 'http' not in ans and raw_snippets:
-        ans = f"Я нашёл информацию в интернете:\n\n{raw_snippets}\n\n" + ans
-
-    # Если в ответе нет моделей, но они есть в сырых данных – добавляем их
-    if raw_snippets and not re.search(r'(Xiaomi|H96|X96Q|Tanix|Vontar|RockTek|Ugoos|Beelink|Minix|WeChip|A95X)', ans, re.I):
-        models = extract_models_from_snippets(raw_snippets)
-        if models:
-            models_text = "\n\n📌 **Модели, упомянутые в найденных статьях:**\n"
-            for model, context in models[:5]:  # не больше 5
-                models_text += f"• {model}: {context[:100]}...\n"
-            ans = models_text + "\n" + ans
-
-    # Замена отмазок
+    # Проверяем, содержит ли ответ полезную информацию (не пустой и не "я не знаю")
+    is_empty = (len(ans) < 50 or "я не знаю" in ans.lower() or "нет данных" in ans.lower() or "не нашел" in ans.lower())
+    
+    # Если ответ пустой или модель отмазалась, и есть сырые данные – генерируем ответ сами
+    if is_empty and raw_snippets:
+        ans = generate_answer_from_snippets(raw_snippets, user_message)
+        return ans  # возвращаем сгенерированный ответ без дополнительной постобработки
+    
+    # Если модель всё же дала ответ, но в нём есть запрещённые фразы – заменяем их
     forbidden = ['нет доступа', 'не могу выполнить поиск', 'не могу выйти в интернет', 'техническое ограничение']
     for phrase in forbidden:
         if phrase in ans.lower():
             ans = ans.replace(phrase, "я не нашёл готового рейтинга, но вот что удалось обнаружить")
-
+    
+    # Проверяем наличие ссылок
+    if 'http' not in ans and raw_snippets:
+        ans = f"Я нашёл информацию в интернете:\n\n{raw_snippets[:1500]}\n\n" + ans
+    
     highlighted, has_contradiction = highlight_contradictions(ans)
     if has_contradiction:
         ans = highlighted
         ans = f"⚠️ В ответе есть возможные противоречия (выделены жирным).\n\n{ans}"
-
+    
     if '📅 Дата:' not in ans and 'дата' not in ans.lower():
         ans += f"\n\n📅 Дата: дата не указана (проверьте актуальность на {current_date})"
     if 'Уверенность:' not in ans:
@@ -354,7 +378,7 @@ def finalize_answer(ans, current_date, raw_snippets=None, user_message=None):
             ans += "\n\nУверенность: 0% (данных нет)"
         else:
             ans += "\n\nУверенность: 5% (предположительно)"
-
+    
     return ans
 
 # ---------- ОПТИМИЗАЦИЯ ЗАПРОСА ----------
@@ -511,6 +535,7 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         logger.info(f"📊 Результатов: {len(all_results)}")
         set_cache(user_message, all_results)
 
+    # Если нет результатов – fallback на знания модели
     if not all_results:
         sp_knowledge = {
             "role": "system",
@@ -543,11 +568,12 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
     ), reverse=True)
 
     top_results = all_results[:TOP_RESULTS_SHOW]
-    # Формируем сырые сниппеты для постобработки
+    # Формируем сырые сниппеты
     raw_snippets = ""
     for i, r in enumerate(top_results, 1):
         raw_snippets += f"{i}. {r['title']}\n   {r['snippet'][:180]}\n   🔗 {r['link']}\n\n"
 
+    # Формируем красивый stext для модели
     stext = ""
     for i, r in enumerate(top_results, 1):
         is_off = "⭐ " if is_official_link(r.get('link','')) else ""
@@ -566,10 +592,10 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
             f"{stext}\n\n"
             "ИНСТРУКЦИЯ ПО ОТВЕТУ:\n"
             "1. Используй ТОЛЬКО данные выше.\n"
-            "2. Если в данных есть модели – обязательно выведи их как список.\n"
+            "2. Если в данных есть факты, цифры, ссылки – обязательно включи их в ответ.\n"
             "3. Каждый факт должен сопровождаться ссылкой.\n"
             "4. ЗАПРЕЩЕНО говорить о «нет доступа».\n"
-            "5. Ответ оформляй блоками с эмодзи."
+            "5. Ответ структурируй: заголовки, списки, эмодзи."
         )
     }
 
@@ -885,5 +911,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (максимальное извлечение данных, бюджет $10/мес)")
+    logger.info("✅ БОТ ЗАПУЩЕН (универсальная логика, принудительное использование данных)")
     app.run_polling()
