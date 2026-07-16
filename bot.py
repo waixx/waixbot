@@ -307,24 +307,35 @@ def finalize_answer(ans, current_date):
 
 # ---------- ОПТИМИЗАЦИЯ ЗАПРОСА (ЛОКАЛЬНАЯ) ----------
 def optimize_query_local(query):
+    """Генерирует короткие поисковые запросы с обязательными суффиксами."""
     stop = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про'}
     words = [w for w in re.sub(r'[^\w\s]', '', query.lower()).split() if w not in stop and len(w)>2]
     if not words:
         return [query]
-    main_query = " ".join(words[:5])
-    variants = [main_query]
-    if any(w in query.lower() for w in ['цена','стоимость','сколько']):
-        variants.append(main_query + " цена")
-    if any(w in query.lower() for w in ['рейтинг','лучший','топ','лучшие']):
-        variants.append(main_query + " рейтинг")
-    if any(w in query.lower() for w in ['сравнение','vs','или']):
-        variants.append(main_query + " сравнение")
-    if any(w in query.lower() for w in ['отзывы','обзор','характеристики']):
-        variants.append(main_query + " обзор")
+    
+    # Базовый запрос (первые 4 значимых слова)
+    main = " ".join(words[:4])
+    
+    # Добавляем год, если его нет
     if not re.search(r'\b20[2-9][0-9]\b', query):
-        variants.append(main_query + f" {now().year}")
+        main += f" {now().year}"
+    
+    # Всегда генерируем варианты с суффиксами
+    variants = [
+        main,
+        main + " рейтинг",
+        main + " обзор",
+        main + " сравнение",
+    ]
+    # Дополнительные варианты по ключевым словам
+    if any(w in query.lower() for w in ['цена','стоимость','сколько']):
+        variants.append(main + " цена")
+    if any(w in query.lower() for w in ['лучший','топ','лучшие']):
+        variants.append(main + " топ")
+    
+    # Убираем дубликаты и лишние пробелы
     variants = list(dict.fromkeys(variants))
-    return variants[:SEARCH_VARIANTS_COUNT]
+    return variants[:SEARCH_VARIANTS_COUNT]   # теперь берём до 3 вариантов
 
 # ---------- ПОИСКОВЫЕ ФУНКЦИИ ----------
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
