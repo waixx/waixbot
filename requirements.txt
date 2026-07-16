@@ -1,5 +1,4 @@
-aiohttp==3.9.1
-python-telegram-bot==20.7
-requests==2.31.0
-python-dotenv==1.0.0
-duckduckgo-search==7.5.3
+python-telegram-bot[job-queue]>=20.7
+aiohttp>=3.9.0
+python-dotenv>=1.0.0
+zoneinfo>=0.1.0
