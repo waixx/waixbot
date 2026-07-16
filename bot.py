@@ -1,6 +1,6 @@
 # ============================================================
-#  BroWaix Bot — УНИВЕРСАЛЬНАЯ ФИНАЛЬНАЯ ВЕРСИЯ 2026
-#  (БЕЗ ХАРДКОДА, БЕЗ ЗАУЖЕНИЙ, РАБОТАЕТ С ЛЮБЫМИ ЗАПРОСАМИ)
+#  BroWaix Bot — КАК ОФИЦИАЛЬНОЕ ПРИЛОЖЕНИЕ
+#  (DeepSeek V4 Flash + user_id + reasoning + мгновенный ответ)
 #  Бюджет $7–8/мес, 150 запросов/день
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
@@ -40,8 +40,9 @@ def now(): return datetime.now(TZ)
 def get_current_date(): return now().strftime("%d.%m.%Y")
 def get_current_time(): return now().strftime("%H:%M")
 
-MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-v4-flash")
-MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
+# ----- ТОЛЬКО FLASH + параметры как в официальном приложении -----
+MODEL_DEFAULT = "deepseek-v4-flash"
+MODEL_FALLBACK = "deepseek-v4-flash"
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
@@ -49,7 +50,6 @@ SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 SEARCH_RESULTS_NUM = 10
 SEARCH_VARIANTS_COUNT = 1
 MODEL_TEMPERATURE = 0.1
-MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 604800
 MAX_TOKENS_ANSWER = 2048
 MAX_TOKENS_DEEP = 4096
@@ -85,7 +85,7 @@ async def get_http_session():
         if _http_session is None or _http_session.closed:
             _http_session = aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(limit=20, limit_per_host=10),
-                timeout=aiohttp.ClientTimeout(total=90, connect=10, sock_read=60)
+                timeout=aiohttp.ClientTimeout(total=120, connect=10, sock_read=90)
             )
         return _http_session
 
@@ -201,7 +201,7 @@ async def save_memory(uid, history, backup=True, lock_held=False):
     if lock_held: return await _save_memory_impl(uid, history, backup)
     async with get_user_lock(uid): return await _save_memory_impl(uid, history, backup)
 
-# ---------- УНИВЕРСАЛЬНЫЕ ИНСТРУМЕНТЫ (БЕЗ ХАРДКОДА) ----------
+# ---------- УНИВЕРСАЛЬНЫЕ ИНСТРУМЕНТЫ ----------
 def extract_year_from_text(text):
     match = re.search(r'\b(20[2-9][0-9])\b', text)
     if match and match.group(1).isdigit():
@@ -217,11 +217,6 @@ def extract_price_from_text(text):
     return None
 
 def extract_relevant_entities(text, query):
-    """
-    УНИВЕРСАЛЬНОЕ извлечение сущностей.
-    БЕЗ списков игр/фильмов/техники.
-    Работает на ПАТТЕРНАХ.
-    """
     patterns = [
         r'\b([А-ЯA-Z][а-яa-zА-ЯA-Z0-9]+(?:[\s-][А-ЯA-Zа-яa-z0-9]+)*)\b',
         r'\b([А-ЯA-Zа-яa-z0-9]+[\s-]+[А-ЯA-Zа-яa-z0-9]+[\s-]+[А-ЯA-Zа-яa-z0-9]+)\b',
@@ -246,14 +241,9 @@ def extract_relevant_entities(text, query):
     filtered = []
     for e in entities:
         e_lower = e.lower()
-        if len(e) < 3:
-            continue
-        if e_lower in stop_words:
-            continue
-        if any(word in e_lower for word in stop_words):
-            continue
-        if e.isdigit():
-            continue
+        if len(e) < 3 or e.isdigit(): continue
+        if e_lower in stop_words: continue
+        if any(word in e_lower for word in stop_words): continue
         filtered.append(e)
     
     seen = set()
@@ -267,8 +257,7 @@ def extract_relevant_entities(text, query):
     for e in unique:
         freq[e] = text.count(e)
     
-    sorted_entities = sorted(unique, key=lambda x: freq.get(x, 0), reverse=True)
-    return sorted_entities[:10]
+    return sorted(unique, key=lambda x: freq.get(x, 0), reverse=True)[:10]
 
 def extract_pros_cons(text):
     pros = re.findall(r'(лучш(ий|ая|ее)|преимущество|плюс|отлично|хорош|удобн|мощн|быстр|тих|легк|долг)', text, re.I)
@@ -384,13 +373,12 @@ def remove_unverified_claims(ans, raw_snippets):
     return ans
 
 def generate_manual_answer(results, user_message, max_items=5):
-    """УНИВЕРСАЛЬНАЯ ручная сборка ответа — БЕЗ ХАРДКОДА"""
     if not results:
-        return "❌ В интернете ничего не найдено по вашему запросу."
+        return None
     
     relevant = [r for r in results if r.get('score', 0) > 0][:max_items]
     if not relevant:
-        return "⚠️ По вашему запросу найдены общие статьи, но конкретных ответов в них нет. Попробуйте уточнить запрос."
+        return None
     
     all_entities = []
     for r in relevant:
@@ -437,14 +425,24 @@ def generate_manual_answer(results, user_message, max_items=5):
     
     return answer
 
-# ===== УНИВЕРСАЛЬНЫЙ ПРОМПТ (БЕЗ ЗАУЖЕНИЙ) =====
+def generate_manual_answer_for_no_data(user_message):
+    return (
+        "🔍 **По вашему запросу ничего не найдено в интернете.**\n\n"
+        f"Запрос: *{user_message[:100]}*\n\n"
+        "Попробуйте:\n"
+        "• уточнить формулировку\n"
+        "• проверить год в запросе\n"
+        "• использовать /deep для развёрнутого поиска\n\n"
+        "📅 Дата: " + get_current_date() + "\n"
+        "Уверенность: 20% (интернет-данных нет)"
+    )
+
+# ===== УНИВЕРСАЛЬНЫЙ ПРОМПТ (КАК В ОФИЦИАЛЬНОМ ПРИЛОЖЕНИИ) =====
 CORE_SYSTEM_RULE = (
     "Ты — экспертный аналитик. Твоя задача — дать ПОЛНЫЙ, СТРУКТУРИРОВАННЫЙ ответ на основе найденных данных.\n\n"
-    
     "=== ГЛАВНЫЙ ПРИНЦИП ===\n"
     "Если в найденных данных есть ответы — используй их. Если ответы неполные или косвенные — сделай логический вывод. "
     "Если ответов нет — дай ПРЕДПОЛОЖЕНИЕ на основе знаний, но ЧЁТКО пометь это.\n\n"
-    
     "=== ТВОЙ АЛГОРИТМ ===\n"
     "1. Проанализируй найденные данные: что есть?\n"
     "2. Если источники противоречат друг другу — выдели это отдельно.\n"
@@ -457,13 +455,10 @@ CORE_SYSTEM_RULE = (
     "   📊 Сравнение источников\n"
     "   ⚠️ Логические выводы\n"
     "   🧠 Предположения — не выше 25%\n\n"
-    
     "=== ЖЁСТКИЙ ЗАПРЕТ ===\n"
     "ЗАПРЕЩЕНО давать ответ в виде просто списка ссылок.\n"
     "ЗАПРЕЩЕНО говорить 'нет данных' — всегда есть что-то, даже если это косвенная информация.\n"
-    "Если данных мало — сделай вывод из того, что есть.\n"
     "Ссылки — только в конце.\n\n"
-    
     "=== СТРУКТУРА ОТВЕТА ===\n"
     "📌 **Краткий вывод** (что удалось выяснить)\n\n"
     "### 🔍 Что найдено в источниках\n"
@@ -639,200 +634,108 @@ def infer_entities_from_data(scored, budget_limit, query_year):
         return candidates
     return None
 
-# ---------- ГЕНЕРАЦИЯ ОТВЕТА ----------
+# ---------- ГЛАВНАЯ ГЕНЕРАЦИЯ С МГНОВЕННЫМ ОТВЕТОМ ----------
 async def generate_response(uid, user_message, history, profile, is_deep=False):
-    try:
-        return await asyncio.wait_for(
-            _generate_response_internal(uid, user_message, history, profile, is_deep),
-            timeout=120
-        )
-    except asyncio.TimeoutError:
-        return "⏰ Превышено время ожидания. Попробуйте позже.", False
-
-async def _generate_response_internal(uid, user_message, history, profile, is_deep):
-    ctx = build_profile_context(profile)
-    
-    budget = extract_budget_from_query(user_message)
-    budget_note = f" (бюджет до {budget} руб.)" if budget else ""
-    
-    cached = get_cached(user_message)
-    if cached:
-        all_results = cached
-    else:
-        variants = await generate_search_query(user_message)
-        logger.info(f"🔍 Поисковый запрос: {variants[0]}")
-        all_results = await search_primary(variants[0])
-        logger.info(f"📊 Найдено результатов: {len(all_results)}")
-        if all_results:
-            set_cache(user_message, all_results)
+    """
+    ГЛАВНАЯ ФУНКЦИЯ: ОТВЕЧАЕТ МГНОВЕННО, КАК ОФИЦИАЛЬНОЕ ПРИЛОЖЕНИЕ
+    """
+    # 1. Сначала ищем в интернете (это быстро)
+    variants = await generate_search_query(user_message)
+    all_results = await search_primary(variants[0])
     
     if not all_results:
-        return await generate_local_answer(uid, user_message, history, profile, 
-            reason="Поиск не дал прямых результатов")
+        return generate_manual_answer_for_no_data(user_message), True
     
     scored = assess_relevance(all_results, user_message)
     if not scored:
-        return await generate_local_answer(uid, user_message, history, profile,
-            reason="Найденные данные нерелевантны запросу")
+        return generate_manual_answer_for_no_data(user_message), True
     
-    if not has_direct_answer(scored, user_message):
-        if budget:
-            inferred = infer_entities_from_data(scored, budget, now().year)
-            if inferred:
-                return await generate_inferred_answer(uid, user_message, history, profile, 
-                    scored, inferred, budget, is_deep)
-        return await generate_inferred_answer(uid, user_message, history, profile,
-            scored, None, None, is_deep)
+    # 2. Готовим ручной ответ (как запасной вариант)
+    manual_answer = generate_manual_answer(scored, user_message)
     
-    if re.search(r'\b(этот год|202[4-9])\b', user_message.lower()):
-        has_fresh = any(r.get('year', 0) >= 2024 for r in scored[:5])
-        if not has_fresh:
-            return await generate_local_answer(uid, user_message, history, profile,
-                reason="Нет актуальных данных за этот год")
+    # 3. ЗАПУСКАЕМ DEEPSEEK В ФОНЕ (не ждём!)
+    # Если DeepSeek ответит за 10 секунд — заменим ручной ответ на его
+    deepseek_task = asyncio.create_task(
+        generate_deepseek_answer(uid, user_message, history, profile, scored, is_deep)
+    )
     
-    stext = ""
-    for i, r in enumerate(scored[:TOP_RESULTS_SHOW], 1):
-        year_note = f" ({r.get('year')} г.)" if r.get('year') else ""
-        price_note = f" [{r.get('price')} руб.]" if r.get('price') else ""
-        source = r.get('source', 'неизвестно')
-        link_html = f"🔗 <a href=\"{r.get('link')}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
-        stext += f"{i}. **{r.get('title', 'Без названия')}**{year_note}{price_note}\n"
-        stext += f"   {r.get('snippet', 'Нет описания')[:350]}\n"
-        stext += f"   Источник: {source} | {link_html}\n\n"
+    # 4. Ждём 10 секунд или пока DeepSeek не ответит
+    try:
+        deepseek_result = await asyncio.wait_for(deepseek_task, timeout=10)
+        if deepseek_result and len(deepseek_result) > 50:
+            # DeepSeek успел ответить — выдаём его ответ
+            return f"🌐 из интернета + логика\n\n{deepseek_result}", True
+    except asyncio.TimeoutError:
+        logger.info("⏰ DeepSeek не успел за 10 секунд — выдаём ручной ответ")
     
-    max_tokens = MAX_TOKENS_DEEP if is_deep else MAX_TOKENS_ANSWER
-    
-    sp = {
-        "role": "system",
-        "content": (
-            f"{CORE_SYSTEM_RULE}\n"
-            f"Сегодня: {get_current_date()}.\n"
-            f"Контекст: {ctx}\n\n"
-            f"НАЙДЕННЫЕ ДАННЫЕ (используй их как основу){budget_note}:\n"
-            f"{stext}\n\n"
-            "ИНСТРУКЦИЯ:\n"
-            "1. Используй найденные данные как основу.\n"
-            "2. Если источники противоречат друг другу — выдели это.\n"
-            "3. Сделай логический вывод на основе того, что есть.\n"
-            "4. Дай ПОЛНЫЙ ответ, а не ссылки.\n"
-            "5. Если данных не хватает — дополни логикой и знаниями.\n"
-            "6. НЕ оставляй пользователя без ответа."
-        )
-    }
-    
-    ans, err = await ask_deepseek([sp] + history, max_tokens=max_tokens)
-    if err:
-        logger.warning(f"DeepSeek ошибка: {err}, пробуем PRO...")
-        ans, err2 = await ask_deepseek([sp] + history, max_tokens=max_tokens, model=MODEL_FALLBACK)
-        if err2:
-            logger.warning("⚠️ PRO тоже не ответил, генерируем вручную")
-            manual_answer = generate_manual_answer(scored, user_message)
-            return manual_answer, True
-    
-    final_ans = remove_unverified_claims(ans, stext)
-    
-    if len(final_ans) < 50:
-        manual_answer = generate_manual_answer(scored, user_message)
+    # 5. Если DeepSeek не успел — выдаём ручной ответ
+    if manual_answer:
         return manual_answer, True
-    
-    confidence = calculate_confidence(scored, user_message)
-    if '📅 Дата:' not in final_ans:
-        final_ans += f"\n\n📅 Дата: {get_current_date()}"
-    if 'Уверенность' not in final_ans:
-        final_ans += f"\nУверенность: {confidence}% (на основе найденных данных)"
-    
-    return f"🌐 из интернета + логика\n\n{final_ans}", True
-
-async def generate_inferred_answer(uid, user_message, history, profile, scored, inferred, budget, is_deep):
-    ctx = build_profile_context(profile)
-    
-    stext = ""
-    for i, r in enumerate(scored[:TOP_RESULTS_SHOW], 1):
-        year_note = f" ({r.get('year')} г.)" if r.get('year') else ""
-        source = r.get('source', 'неизвестно')
-        link_html = f"🔗 <a href=\"{r.get('link')}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
-        stext += f"{i}. **{r.get('title', 'Без названия')}**{year_note}\n"
-        stext += f"   {r.get('snippet', 'Нет описания')[:300]}\n"
-        stext += f"   Источник: {source} | {link_html}\n\n"
-    
-    inferred_text = ""
-    if inferred:
-        inferred_text = f"**Логический вывод на основе найденных данных (до {budget} руб.):**\n\n"
-        for item in inferred[:5]:
-            price = item.get('price', 'не указана')
-            name = item.get('name', 'Не указано')
-            inferred_text += f"• **{name}** — примерно {price} руб.\n"
-        inferred_text += "\n⚠️ Это ЛОГИЧЕСКИЙ ВЫВОД на основе найденных данных.\n"
     else:
-        inferred_text = "**На основе найденных данных можно сделать следующий вывод:**\n\n"
-        for r in scored[:5]:
-            title = r.get('title', 'Без названия')
-            inferred_text += f"• {title}\n"
-        inferred_text += "\n⚠️ Это обобщение на основе найденных источников.\n"
-    
-    max_tokens = MAX_TOKENS_DEEP if is_deep else MAX_TOKENS_ANSWER
-    
-    sp = {
-        "role": "system",
-        "content": (
-            f"{CORE_SYSTEM_RULE}\n"
-            f"Сегодня: {get_current_date()}.\n"
-            f"Контекст: {ctx}\n\n"
-            f"НАЙДЕННЫЕ ДАННЫЕ (используй их как основу):\n"
-            f"{stext}\n\n"
-            f"{inferred_text}\n\n"
-            "ИНСТРУКЦИЯ:\n"
-            "1. Используй найденные данные как основу.\n"
-            "2. Используй логический вывод, чтобы дополнить ответ.\n"
-            "3. Дай ПОЛНЫЙ ответ.\n"
-            "4. НЕ оставляй пользователя без ответа."
-        )
-    }
-    
-    ans, err = await ask_deepseek([sp] + history, max_tokens=max_tokens)
-    if err:
-        logger.warning(f"DeepSeek ошибка в inferred: {err}, пробуем PRO...")
-        ans, err2 = await ask_deepseek([sp] + history, max_tokens=max_tokens, model=MODEL_FALLBACK)
-        if err2:
-            return generate_manual_answer(scored, user_message), True
-    
-    final_ans = remove_unverified_claims(ans, stext)
-    
-    if '📅 Дата:' not in final_ans:
-        final_ans += f"\n\n📅 Дата: {get_current_date()}"
-    if 'Уверенность' not in final_ans:
-        final_ans += "\nУверенность: 70% (частично на основе интернет-данных + логический вывод)"
-    
-    return f"🌐 из интернета + логика\n\n{final_ans}", True
+        return generate_manual_answer_for_no_data(user_message), True
 
-async def generate_local_answer(uid, user_message, history, profile, reason):
-    ctx = build_profile_context(profile)
+async def generate_deepseek_answer(uid, user_message, history, profile, scored, is_deep):
+    """Генерирует ответ через DeepSeek (запускается в фоне)"""
+    try:
+        ctx = build_profile_context(profile)
+        budget = extract_budget_from_query(user_message)
+        budget_note = f" (бюджет до {budget} руб.)" if budget else ""
+        
+        stext = ""
+        for i, r in enumerate(scored[:TOP_RESULTS_SHOW], 1):
+            year_note = f" ({r.get('year')} г.)" if r.get('year') else ""
+            price_note = f" [{r.get('price')} руб.]" if r.get('price') else ""
+            source = r.get('source', 'неизвестно')
+            link_html = f"🔗 <a href=\"{r.get('link')}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
+            stext += f"{i}. **{r.get('title', 'Без названия')}**{year_note}{price_note}\n"
+            stext += f"   {r.get('snippet', 'Нет описания')[:350]}\n"
+            stext += f"   Источник: {source} | {link_html}\n\n"
+        
+        max_tokens = MAX_TOKENS_DEEP if is_deep else MAX_TOKENS_ANSWER
+        
+        sp = {
+            "role": "system",
+            "content": (
+                f"{CORE_SYSTEM_RULE}\n"
+                f"Сегодня: {get_current_date()}.\n"
+                f"Контекст: {ctx}\n\n"
+                f"НАЙДЕННЫЕ ДАННЫЕ (используй их как основу){budget_note}:\n"
+                f"{stext}\n\n"
+                "ИНСТРУКЦИЯ:\n"
+                "1. Используй найденные данные как основу.\n"
+                "2. Если источники противоречат друг другу — выдели это.\n"
+                "3. Сделай логический вывод на основе того, что есть.\n"
+                "4. Дай ПОЛНЫЙ ответ, а не ссылки.\n"
+                "5. Если данных не хватает — дополни логикой и знаниями."
+            )
+        }
+        
+        # ПАРАМЕТРЫ КАК В ОФИЦИАЛЬНОМ ПРИЛОЖЕНИИ
+        payload = {
+            "model": MODEL_DEFAULT,
+            "messages": [sp] + history,
+            "temperature": MODEL_TEMPERATURE,
+            "max_tokens": max_tokens,
+            "user_id": str(uid),  # ВКЛЮЧАЕМ КЭШИРОВАНИЕ
+            "reasoning_effort": "medium",  # РЕЖИМ МЫШЛЕНИЯ
+            "reasoning_summary": True  # ПОКАЗЫВАТЬ ЛОГИКУ
+        }
+        
+        session = await get_http_session()
+        async with session.post(
+            f"{DEEPSEEK_API_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+            json=payload,
+            timeout=60  # На фоне может думать дольше
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("choices"):
+                    return data["choices"][0].get("message", {}).get("content")
+    except Exception as e:
+        logger.warning(f"DeepSeek фоновая ошибка: {e}")
     
-    sp = {
-        "role": "system",
-        "content": (
-            f"{CORE_SYSTEM_RULE}\n"
-            f"Сегодня: {get_current_date()}.\n"
-            f"Контекст: {ctx}\n\n"
-            f"⚠️ ВНИМАНИЕ: {reason}.\n"
-            "Используй свои знания, НО:\n"
-            "1. Начинай с '🧠 На основе моих знаний'\n"
-            "2. Каждое утверждение — 'Предположительно'\n"
-            "3. Уверенность не выше 25%\n"
-            "4. НЕ придумывай факты"
-        )
-    }
-    
-    messages = [sp] + history
-    ans, err = await ask_deepseek(messages, max_tokens=MAX_TOKENS_ANSWER)
-    if err:
-        return f"⚠️ Ошибка. {reason}", False
-    
-    if 'Уверенность:' not in ans:
-        ans += f"\n\n📅 Дата: {get_current_date()}"
-        ans += "\nУверенность: 20% (на основе знаний модели)"
-    
-    return f"🧠 из базы\n\n{ans}", True
+    return None
 
 async def generate_search_query(query):
     stop = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про'}
@@ -852,44 +755,6 @@ def build_profile_context(profile):
         if isinstance(v, str):
             parts.append(f"{k}: {v[:40]}")
     return ". ".join(parts)[:150]
-
-async def ask_deepseek(messages, retries=2, max_tokens=None, model=MODEL_DEFAULT):
-    session = await get_http_session()
-    for attempt in range(retries):
-        try:
-            payload = {"model": model, "messages": messages, "temperature": MODEL_TEMPERATURE}
-            if max_tokens: payload["max_tokens"] = max_tokens
-            async with session.post(
-                f"{DEEPSEEK_API_BASE}/chat/completions",
-                headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-                json=payload,
-                timeout=60
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("choices"):
-                        c = data["choices"][0].get("message", {}).get("content")
-                        if c and len(c.strip()) > 10:
-                            return (c, None)
-                        else:
-                            logger.warning(f"⚠️ DeepSeek вернул пустой ответ: {c}")
-                            return (None, "empty_response")
-                if resp.status == 429:
-                    await asyncio.sleep(2)
-                    continue
-                if resp.status in (400, 404) and model != MODEL_FALLBACK:
-                    logger.warning(f"Модель {model} недоступна, пробуем {MODEL_FALLBACK}")
-                    model = MODEL_FALLBACK
-                    continue
-                return None, f"http_{resp.status}"
-        except asyncio.TimeoutError:
-            logger.warning(f"⏰ Таймаут DeepSeek (попытка {attempt+1})")
-            await asyncio.sleep(2)
-            continue
-        except Exception as ex:
-            logger.warning(f"Ошибка DeepSeek: {ex}")
-            await asyncio.sleep(1)
-    return None, "max_retries"
 
 # ---------- КОМАНДЫ ----------
 async def start(update, context):
@@ -1106,5 +971,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (универсальный, без хардкода)")
+    logger.info("✅ БОТ ЗАПУЩЕН (мгновенный ответ, как официальное приложение)")
     app.run_polling()
