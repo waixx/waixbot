@@ -1,6 +1,6 @@
 # ============================================================
-#  BroWaix Bot — АБСОЛЮТНЫЙ КОНТРОЛЬ С МАРКИРОВКОЙ ПРЕДПОЛОЖЕНИЙ
-#  (принудительное использование данных, маркировка выдумок, честность)
+#  BroWaix Bot — ФИНАЛЬНАЯ ВЕРСИЯ
+#  (локальные знания ТОЛЬКО при отсутствии интернет-данных)
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
 from datetime import datetime, timedelta
@@ -53,18 +53,17 @@ CACHE_TTL = 86400
 MAX_TOKENS_ANSWER = 1024
 TOP_RESULTS_SHOW = 20
 
-# ===== ПРОМПТ С ЗАПРЕТОМ ВЫДУМЫВАТЬ, НО РАЗРЕШЕНИЕМ НА ПРЕДПОЛОЖЕНИЯ С ПОМЕТКОЙ =====
+# ===== ПРОМПТ С РАЗДЕЛЕНИЕМ: ЛОКАЛЬНЫЕ ЗНАНИЯ ТОЛЬКО ПРИ ОТСУТСТВИИ ДАННЫХ =====
 CORE_SYSTEM_RULE = (
     "Ты — честный ассистент. Ты УЖЕ выполнил поиск в интернете и получил данные (они приведены ниже).\n"
-    "Ты ОБЯЗАН использовать эти данные для ответа.\n"
-    "Если ты не уверен в чём-то, можешь сделать предположение, но ОБЯЗАТЕЛЬНО укажи это: «Предположительно», «Возможно».\n"
-    "ЗАПРЕЩЕНО писать фразы: «нет доступа», «не могу выполнить поиск», «техническое ограничение».\n\n"
+    "Если в разделе «НАЙДЕННЫЕ ДАННЫЕ» есть информация – ты ОБЯЗАН использовать ТОЛЬКО её.\n"
+    "ЗАПРЕЩЕНО использовать свои внутренние знания, если есть интернет-данные.\n"
+    "Если данных в разделе нет – ты МОЖЕШЬ использовать свои знания, но ОБЯЗАТЕЛЬНО пометь это «Предположительно».\n\n"
     "ПРАВИЛА:\n"
-    "1. Используй данные из раздела «НАЙДЕННЫЕ ДАННЫЕ» как основу.\n"
-    "2. Каждое утверждение, взятое из данных, сопровождай ссылкой.\n"
-    "3. Если ты добавляешь что-то от себя (из своих знаний) – обязательно помечай это словами: «Предположительно» или «На основе моих знаний».\n"
-    "4. Если данных действительно нет – скажи: «В найденных данных нет информации» и предложи уточнить запрос.\n"
-    "5. В конце укажи: 📅 Дата (если есть), Уверенность: XX% (снижай уверенность, если есть предположения).\n\n"
+    "1. Если есть данные – используй ТОЛЬКО их, каждое утверждение сопровождай ссылкой.\n"
+    "2. Если данных нет – отвечай на основе знаний, но начинай с «Предположительно» и ставь низкую уверенность.\n"
+    "3. НЕ пиши фразы: «нет доступа», «не могу выполнить поиск», «техническое ограничение».\n"
+    "4. В конце укажи: 📅 Дата (если есть), Уверенность: XX%.\n\n"
     "ФОРМАТ ОТВЕТА:\n"
     "Структурируй ответ: заголовки, списки, ссылки. Используй эмодзи для наглядности."
 )
@@ -292,24 +291,34 @@ def highlight_contradictions(text):
             highlighted.append(sent)
     return ' '.join(highlighted), found
 
-# ===== МАРКИРОВКА ПРЕДПОЛОЖЕНИЙ (вместо удаления) =====
-def mark_unverified_claims(ans, raw_snippets):
-    """Помечает утверждения, не подтверждённые данными, как предположительные."""
+# ===== ГЛАВНАЯ ЛОГИКА: УДАЛЕНИЕ НЕПОДТВЕРЖДЁННОГО ПРИ НАЛИЧИИ ДАННЫХ =====
+def remove_unverified_claims(ans, raw_snippets):
+    """Удаляет из ответа все утверждения, не подтверждённые интернет-данными."""
     if not raw_snippets:
-        return ans, False
+        return ans
     
+    # Ищем потенциальные сущности (бренды, модели, технологии)
     known_entities = re.findall(r'(Xiaomi|H96|X96Q|Tanix|Vontar|RockTek|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Apple|Sber|Rombica|Kickpi|TOX|X88|H618|H313|S905|RK3566|4K|HDR|Dolby|Android|Google TV)', ans, re.I)
     modified = False
     for entity in set(known_entities):
         if entity.lower() not in raw_snippets.lower():
-            if not re.search(rf'{re.escape(entity)}\s*\(предположительно\)', ans, re.I):
-                ans = re.sub(rf'\b{re.escape(entity)}\b', f'{entity} (предположительно)', ans, flags=re.I)
-                modified = True
-                logger.info(f"🔍 Помечена неподтверждённая сущность: {entity}")
-    return ans, modified
+            # Удаляем упоминание
+            ans = re.sub(rf'\b{re.escape(entity)}\b', '', ans, flags=re.I)
+            modified = True
+            logger.info(f"🔍 Удалена неподтверждённая сущность: {entity}")
+    
+    # Удаляем лишние пробелы и артефакты
+    if modified:
+        ans = re.sub(r'\s+', ' ', ans)
+        ans = re.sub(r'\s*\.\s*', '. ', ans)
+        ans = re.sub(r'\s*,', ',', ans)
+        # Удаляем двойные точки и скобки
+        ans = re.sub(r'\.\s*\.', '.', ans)
+    
+    return ans
 
 def generate_answer_from_snippets(raw_snippets, user_message, max_items=10):
-    """Формирует ответ из найденных ссылок – даже если модель отказалась."""
+    """Формирует ответ из найденных ссылок – когда модель не дала полезного ответа."""
     if not raw_snippets:
         return "❌ В интернете ничего не найдено по вашему запросу."
     
@@ -379,47 +388,39 @@ def is_useful_answer(ans):
     return (has_links or has_numbers or has_models) and not has_empty_phrase
 
 def finalize_answer(ans, current_date, raw_snippets=None, user_message=None):
-    # Если ответ бесполезен – заменяем
-    if not is_useful_answer(ans) and raw_snippets:
-        return generate_answer_from_snippets(raw_snippets, user_message)
-    
-    # Маркируем неподтверждённые сущности
+    # Если есть интернет-данные – жёстко удаляем всё, что не подтверждено
     if raw_snippets:
-        ans, modified = mark_unverified_claims(ans, raw_snippets)
-        if modified:
-            # Если есть предположения, снижаем уверенность, если она не указана
-            if 'Уверенность:' in ans:
-                # Понижаем уверенность на 20 пунктов
-                conf_match = re.search(r'Уверенность:\s*(\d+)%', ans)
-                if conf_match:
-                    new_conf = max(0, int(conf_match.group(1)) - 20)
-                    ans = re.sub(r'Уверенность:\s*\d+%', f'Уверенность: {new_conf}% (с учётом предположений)', ans)
-            else:
-                ans += "\n\nУверенность: 30% (предположительно)"
+        # Удаляем неподтверждённые сущности
+        ans = remove_unverified_claims(ans, raw_snippets)
+        
+        # Если после удаления ответ стал пустым или слишком коротким – генерируем из сниппетов
+        if len(ans) < 50 or 'http' not in ans:
+            return generate_answer_from_snippets(raw_snippets, user_message)
+        
+        # Проверяем, остались ли ссылки в ответе
+        if 'http' not in ans:
+            ans = f"Я нашёл информацию в интернете:\n\n{raw_snippets[:1500]}\n\n" + ans
+        
+        # Добавляем дату и уверенность, если их нет
+        if '📅 Дата:' not in ans and 'дата' not in ans.lower():
+            ans += f"\n\n📅 Дата: дата не указана (проверьте актуальность на {current_date})"
+        if 'Уверенность:' not in ans:
+            ans += "\n\nУверенность: 70% (на основе найденных данных)"
+        
+        return ans
     
-    # Замена запрещённых фраз
-    forbidden = ['нет доступа', 'не могу выполнить поиск', 'не могу выйти в интернет', 'техническое ограничение']
-    for phrase in forbidden:
-        if phrase in ans.lower():
-            ans = ans.replace(phrase, "я не нашёл готового рейтинга, но вот что удалось обнаружить")
-    
-    if 'http' not in ans and raw_snippets:
-        ans = f"Я нашёл информацию в интернете:\n\n{raw_snippets[:1500]}\n\n" + ans
-    
-    highlighted, has_contradiction = highlight_contradictions(ans)
-    if has_contradiction:
-        ans = highlighted
-        ans = f"⚠️ В ответе есть возможные противоречия (выделены жирным).\n\n{ans}"
-    
-    if '📅 Дата:' not in ans and 'дата' not in ans.lower():
-        ans += f"\n\n📅 Дата: дата не указана (проверьте актуальность на {current_date})"
-    if 'Уверенность:' not in ans:
-        if 'Я не знаю' in ans or 'не нашел' in ans:
-            ans += "\n\nУверенность: 0% (данных нет)"
-        else:
-            ans += "\n\nУверенность: 5% (предположительно)"
-    
-    return ans
+    # Если данных нет – разрешаем локальные знания с маркировкой
+    else:
+        # Если ответ не содержит маркеров предположений – добавляем
+        if not re.search(r'(Предположительно|Возможно|На основе моих знаний)', ans):
+            ans = "⚠️ Данных в интернете не найдено. Ниже – ответ на основе моих общих знаний (может быть неточным).\n\n" + ans
+        # Добавляем уверенность, если её нет
+        if 'Уверенность:' not in ans:
+            ans += "\n\nУверенность: 20% (основано на знаниях модели)"
+        # Добавляем дату
+        if '📅 Дата:' not in ans and 'дата' not in ans.lower():
+            ans += f"\n\n📅 Дата: дата не указана (проверьте актуальность на {current_date})"
+        return ans
 
 # ---------- ОПТИМИЗАЦИЯ ЗАПРОСА ----------
 async def optimize_query(query, profile=None):
@@ -457,7 +458,7 @@ async def optimize_query(query, profile=None):
         return await fallback_queries(query)
 
 async def fallback_queries(query, base_variants=None):
-    stop = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про','китайские','китайских'}
+    stop = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про','китайские',' китайских'}
     words = [w for w in re.sub(r'[^\w\s]', '', query.lower()).split() if w not in stop and len(w)>2]
     if not words:
         return [query]
@@ -573,6 +574,7 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         logger.info(f"📊 Результатов: {len(all_results)}")
         set_cache(user_message, all_results)
 
+    # Если нет результатов – fallback на знания модели (разрешено)
     if not all_results:
         sp_knowledge = {
             "role": "system",
@@ -581,8 +583,7 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
                 f"Сегодня: {get_current_date()}.\n"
                 f"Контекст: {ctx}\n\n"
                 "Поиск в интернете не дал результатов. "
-                "Если у тебя есть общие знания по теме, дай предположительный ответ с пометкой «Предположительно». "
-                "Если знаний нет – скажи «Я не знаю»."
+                "Ты можешь использовать свои знания, но обязательно помечай ответ как «Предположительно» и ставь низкую уверенность."
             )
         }
         ans, err = await ask_deepseek([sp_knowledge] + history, max_tokens=MAX_TOKENS_ANSWER)
@@ -617,20 +618,20 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         link_html = f"🔗 <a href=\"{r['link']}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
         stext += f"{i}. {is_off}**{r['title']}**{year_note}{price_note}\n   {r['snippet'][:180]}\n   {link_html}\n\n"
 
+    # Первая попытка с жёстким промптом
     sp = {
         "role": "system",
         "content": (
             f"{CORE_SYSTEM_RULE}\n"
             f"Сегодня: {get_current_date()}.\n"
             f"Контекст: {ctx}\n\n"
-            "НАЙДЕННЫЕ ДАННЫЕ (используй их для ответа):\n"
+            "НАЙДЕННЫЕ ДАННЫЕ (используй ТОЛЬКО их):\n"
             f"{stext}\n\n"
             "ИНСТРУКЦИЯ ПО ОТВЕТУ:\n"
             "1. Используй ТОЛЬКО данные выше.\n"
             "2. Каждый факт должен сопровождаться ссылкой.\n"
-            "3. ЗАПРЕЩЕНО говорить о «нет доступа».\n"
-            "4. Если делаешь предположение – обязательно помечай его словами «Предположительно» или «Возможно».\n"
-            "5. Ответ структурируй: заголовки, списки, эмодзи."
+            "3. ЗАПРЕЩЕНО использовать свои знания, если есть данные.\n"
+            "4. Ответ структурируй: заголовки, списки, эмодзи."
         )
     }
 
@@ -638,39 +639,9 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
     if err:
         return f"⚠️ Ошибка API: {err}", False
 
-    if is_useful_answer(ans):
-        final_ans = finalize_answer(ans, get_current_date(), raw_snippets, user_message)
-        return f"🌐 из интернета\n\n{final_ans}", True
-
-    # Вторая попытка (усиленный промпт)
-    logger.info("🔄 Первый ответ бесполезен, пробуем второй раз")
-    sp2 = {
-        "role": "system",
-        "content": (
-            f"{CORE_SYSTEM_RULE}\n"
-            f"Сегодня: {get_current_date()}.\n"
-            f"Контекст: {ctx}\n\n"
-            "Ты проигнорировал данные в прошлый раз. Это недопустимо.\n"
-            "Ты ОБЯЗАН ответить на основе данных ниже. НЕ пиши «я не знаю».\n"
-            "Используй эти данные и дай развёрнутый ответ с ссылками.\n"
-            "Если данных не хватает, можешь добавить предположения с пометкой «Предположительно».\n\n"
-            "НАЙДЕННЫЕ ДАННЫЕ (ТОЛЬКО ИХ ИСПОЛЬЗУЙ):\n"
-            f"{stext}\n\n"
-            "ОТВЕТЬ ПРЯМО СЕЙЧАС, ИСПОЛЬЗУЯ ЭТИ ДАННЫЕ."
-        )
-    }
-    ans2, err2 = await ask_deepseek([sp2] + history, max_tokens=MAX_TOKENS_ANSWER)
-    if err2:
-        return f"⚠️ Ошибка API: {err2}", False
-
-    if is_useful_answer(ans2):
-        final_ans = finalize_answer(ans2, get_current_date(), raw_snippets, user_message)
-        return f"🌐 из интернета (повторная попытка)\n\n{final_ans}", True
-
-    # Если всё равно бесполезно – генерируем из сниппетов
-    logger.info("⚠️ Вторая попытка тоже бесполезна, генерируем из сниппетов")
-    fallback_ans = generate_answer_from_snippets(raw_snippets, user_message)
-    return f"🌐 из интернета (автоматическая генерация)\n\n{fallback_ans}", True
+    # Постобработка (удаление неподтверждённого)
+    final_ans = finalize_answer(ans, get_current_date(), raw_snippets, user_message)
+    return f"🌐 из интернета\n\n{final_ans}", True
 
 def build_profile_context(profile):
     parts = []
@@ -964,5 +935,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (с маркировкой предположений, честность)")
+    logger.info("✅ БОТ ЗАПУЩЕН (финальная версия – локальные знания только при отсутствии данных)")
     app.run_polling()
