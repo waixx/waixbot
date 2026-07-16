@@ -1,7 +1,6 @@
 # ============================================================
-#  BroWaix Bot — финальная гибридная версия ($10/месяц, 4+ месяцев)
-#  (2 варианта × 10 результатов, топ-5 сниппетов, 500 токенов)
-#  Все принципы сохранены: честность, даты, ссылки, уверенность
+#  BroWaix Bot — финальная версия (вариант А)
+#  (блочное форматирование, ссылки, источник, экономия)
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
 from datetime import datetime, timedelta
@@ -14,6 +13,7 @@ from telegram.ext import (
 )
 from logging.handlers import RotatingFileHandler
 
+# ---------- ЛОГИ ----------
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 handler = RotatingFileHandler("bot.log", maxBytes=5*1024*1024, backupCount=2)
@@ -26,7 +26,7 @@ logger.addHandler(console)
 
 load_dotenv()
 
-# ---------- ПЕРЕМЕННЫЕ (ОПТИМИЗИРОВАННЫЕ) ----------
+# ---------- ПЕРЕМЕННЫЕ ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 APISERPENT_API_KEY = os.getenv("APISERPENT_API_KEY")
@@ -45,23 +45,31 @@ MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
-# --- ОПТИМИЗИРОВАННЫЕ ПАРАМЕТРЫ ДЛЯ 4+ МЕСЯЦЕВ ($40) ---
-SEARCH_RESULTS_NUM = 10          # 10 результатов на запрос
-SEARCH_VARIANTS_COUNT = 2        # 2 поисковых запроса
+# --- ОПТИМАЛЬНЫЕ ПАРАМЕТРЫ ДЛЯ 4+ МЕСЯЦЕВ ($40) ---
+SEARCH_RESULTS_NUM = 10
+SEARCH_VARIANTS_COUNT = 2
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 2
-CACHE_TTL = 86400                # 24 часа
-MAX_TOKENS_ANSWER = 500          # ограничение ответа
-TOP_RESULTS_SHOW = 5             # показывать топ-5 сниппетов
+CACHE_TTL = 86400
+MAX_TOKENS_ANSWER = 500
+TOP_RESULTS_SHOW = 5
 
+# ---------- УСИЛЕННЫЙ СИСТЕМНЫЙ ПРОМПТ (вариант А + ссылки) ----------
 CORE_SYSTEM_RULE = (
     "Честный ассистент. Отвечай строго по данным. Если данных нет — скажи «Я не знаю». "
     "Указывай ссылки, дату публикации, оценку уверенности (0–100%). "
     "Не выдумывай. Включай в ответ модели, цены, бренды из сниппетов. "
-    "Если данные старые — предупреди."
+    "Если данные старые — предупреди.\n\n"
+    "ФОРМАТИРОВАНИЕ (ОБЯЗАТЕЛЬНО):\n"
+    "• Каждый результат оформляй как отдельный блок.\n"
+    "• Используй эмодзи: <b>жирный</b> для названия модели, 💰 для цены, 📟 для чипсета/ОС, 💾 для памяти, 📺 для особенностей.\n"
+    "• Ссылки делай в формате: 🔗 <a href=\"URL\">Источник</a>\n"
+    "• После всех блоков укажи дату публикации и оценку уверенности: «📅 Дата: ...» и «Уверенность: XX%».\n"
+    "• Разделяй блоки пустой строкой.\n"
+    "• Не используй Markdown-таблицы (|)."
 )
 
-# ---------- ПАМЯТЬ (2 уровня) ----------
+# ---------- ПАМЯТЬ ----------
 LEVEL_1 = {'max_history': 40, 'keep_recent': 10}
 LEVEL_2 = {'compress_interval': 20, 'compress_to': 30}
 
@@ -207,7 +215,7 @@ async def save_memory(uid, history, backup=True, lock_held=False):
     if lock_held: return await _save_memory_impl(uid, history, backup)
     async with get_user_lock(uid): return await _save_memory_impl(uid, history, backup)
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
 def extract_year_from_text(text):
     m = re.search(r'\b(20[2-9][0-9])\b', text)
     return int(m.group(1)) if m else None
@@ -262,6 +270,7 @@ def set_cache(query, data):
         del search_cache[oldest]
 
 def highlight_contradictions(text):
+    # Оставляем только для предупреждений, не трогаем форматирование
     markers = ['но', 'однако', 'с другой стороны', 'в то же время', 'хотя', 'несмотря на', 'с одной стороны', 'в отличие от']
     sentences = re.split(r'(?<=[.!?])\s+', text)
     highlighted = []
@@ -275,20 +284,25 @@ def highlight_contradictions(text):
     return ' '.join(highlighted), found
 
 def finalize_answer(ans, current_date):
+    """Постобработка: проверяет наличие ссылок, даты, уверенности, противоречий."""
+    # Проверка противоречий (без изменения основного форматирования)
     highlighted, has_contradiction = highlight_contradictions(ans)
     if has_contradiction:
         ans = highlighted
         ans = f"⚠️ В ответе есть возможные противоречия (выделены жирным).\n\n{ans}"
-    conf = re.search(r'Уверенность:\s*(\d+)%', ans)
-    if conf:
-        if int(conf.group(1)) < 70:
-            ans = f"⚠️ Модель оценивает уверенность всего на {conf.group(1)}%.\n\n{ans}"
-    else:
-        ans += "\n\n⚠️ Оценка уверенности не указана."
+    
+    # Проверка уверенности
+    if 'Уверенность:' not in ans:
+        ans += f"\n\n⚠️ Оценка уверенности не указана."
+    
+    # Проверка ссылок
     if 'http' not in ans and len(ans) > 100:
         ans += "\n\n⚠️ Нет ссылок на источники."
-    if 'дата' not in ans.lower() and 'уверенность' not in ans.lower():
+    
+    # Проверка даты
+    if '📅 Дата:' not in ans and 'дата' not in ans.lower():
         ans += f"\n\n⚠️ Дата публикации источников не указана. Проверьте актуальность на {current_date}."
+    
     return ans
 
 # ---------- ОПТИМИЗАЦИЯ ЗАПРОСА (ЛОКАЛЬНАЯ) ----------
@@ -431,14 +445,16 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         sum(1 for kw in keywords if kw in (r.get('title','') + ' ' + r.get('snippet','')).lower())
     ), reverse=True)
 
-    # ---------- БЕРЁМ ТОЛЬКО ТОП-5 ----------
+    # Берём только топ-5
     top_results = all_results[:TOP_RESULTS_SHOW]
     stext = ""
     for i, r in enumerate(top_results, 1):
         is_off = "⭐ " if is_official_link(r.get('link','')) else ""
         price_note = f" ({r['price']} руб.)" if r.get('price') else ""
         year_note = f" ({r['year']})" if r.get('year') else ""
-        stext += f"{i}. {is_off}**{r['title']}**{year_note}{price_note}\n   {r['snippet'][:180]}\n   🔗 {r['link']}\n\n"
+        # Добавляем ссылку в виде HTML-ссылки
+        link_html = f"🔗 <a href=\"{r['link']}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
+        stext += f"{i}. {is_off}**{r['title']}**{year_note}{price_note}\n   {r['snippet'][:180]}\n   {link_html}\n\n"
 
     sp = {
         "role": "system",
@@ -447,7 +463,15 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
             f"Сегодня: {get_current_date()}.\n"
             f"Контекст: {ctx}\n\n"
             f"Найденные данные:\n{stext}\n"
-            "Ответь информативно (300-600 слов), укажи ссылки и уверенность в конце."
+            "На основе этих данных дай ответ в виде отдельных блоков с эмодзи.\n"
+            "Каждый результат оформи как:\n"
+            "<b>Название модели</b>\n"
+            "💰 Цена\n"
+            "📟 Чипсет / ОС\n"
+            "💾 Память (если есть)\n"
+            "📺 Особенности\n"
+            "🔗 <a href=\"ссылка\">Источник</a>\n\n"
+            "В конце укажи: 📅 Дата: ... и Уверенность: XX%."
         )
     }
 
@@ -456,7 +480,8 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         return f"⚠️ Ошибка API: {err}", False
 
     final_ans = finalize_answer(ans, get_current_date())
-    return final_ans, True
+    # Добавляем префикс источника
+    return f"🌐 из интернета\n\n{final_ans}", True
 
 def build_profile_context(profile):
     parts = []
@@ -659,7 +684,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             final_ans = finalize_answer(ans, get_current_date())
             history.append({"role": "assistant", "content": ans, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")})
             await save_memory(uid, history)
-            await safe_reply(update, final_ans)
+            await safe_reply(update, f"🧠 из модели\n\n{final_ans}")
         else:
             await safe_reply(update, "⚠️ Ошибка при ответе.")
     else:
@@ -764,5 +789,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (оптимизация $10/мес, 4+ месяцев)")
+    logger.info("✅ БОТ ЗАПУЩЕН (финальная версия, вариант А)")
     app.run_polling()
