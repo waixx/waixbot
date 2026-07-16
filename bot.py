@@ -1,6 +1,6 @@
 # ============================================================
-#  BroWaix Bot — финальная версия с последними правками
-#  (без дедлоков, чистая память, корректный retry)
+#  BroWaix Bot — финальная усиленная версия
+#  (увеличенные лимиты, бонус за списки, точный поиск)
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref
 from datetime import datetime, timedelta
@@ -44,8 +44,8 @@ MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-v4-flash")
 MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
-SEARCH_RESULTS_NUM = int(os.getenv("SEARCH_RESULTS_NUM", "25"))
-SEARCH_VARIANTS_COUNT = int(os.getenv("SEARCH_VARIANTS_COUNT", "2"))
+SEARCH_RESULTS_NUM = int(os.getenv("SEARCH_RESULTS_NUM", "40"))   # увеличено
+SEARCH_VARIANTS_COUNT = int(os.getenv("SEARCH_VARIANTS_COUNT", "5")) # увеличено
 SEARCH_THRESHOLD = int(os.getenv("SEARCH_THRESHOLD", "3"))
 MODEL_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", "0.1"))
 MAX_RETRY_ATTEMPTS = 3
@@ -93,7 +93,6 @@ def get_user_lock(uid): return user_locks.setdefault(uid, asyncio.Lock())
 
 async def get_http_session():
     global _http_session
-    # Убираем лишнюю блокировку – ClientSession потокобезопасен
     if _http_session is None or _http_session.closed:
         _http_session = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=50, limit_per_host=20, keepalive_timeout=30),
@@ -315,6 +314,9 @@ def assess_relevance(results, keywords):
             score += 3
         if extract_year_from_text(text):
             score += 2
+        # Бонус за наличие нумерованного списка (признак рейтинга)
+        if re.search(r'\d+\.\s+', text):
+            score += 3
         scored.append({**res, 'score': score})
     scored.sort(key=lambda x: x['score'], reverse=True)
     return scored
@@ -382,6 +384,7 @@ async def optimize_query(query, profile=None):
         if levels:
             context_prompt = "Контекст:\n" + "\n".join(levels) + "\n\n"
 
+    # Удаляем разговорные слова
     stop_words = ['найди', 'пожалуйста', 'помоги', 'мне', 'лучшие', 'скажи', 'расскажи', 'покажи', 'найти']
     for word in stop_words:
         query = query.replace(word, '').strip()
@@ -389,8 +392,10 @@ async def optimize_query(query, profile=None):
 
     prompt = (
         f"{context_prompt}"
-        "Преврати запрос в 3 КОРОТКИХ ПОИСКОВЫХ ЗАПРОСА (3-5 слов, только ключевые слова). "
-        "Убери все лишние слова. Оставь только суть: объект, характеристика, год (если он явно указан пользователем).\n"
+        "Преврати запрос в 5 КОРОТКИХ ПОИСКОВЫХ ЗАПРОСОВ (3-5 слов, только ключевые слова). "
+        "Убери все лишние слова. Оставь только суть: объект, характеристика, год (если он явно указан пользователем). "
+        "Если запрос про рейтинг, сравнение или обзор — обязательно добавь слова 'рейтинг', 'обзор', 'сравнение' или 'ТОП'.\n"
+        "Раздели варианты символом '|'.\n"
         f"Запрос: {query}"
     )
     messages = [
@@ -398,11 +403,11 @@ async def optimize_query(query, profile=None):
         {"role": "user", "content": prompt}
     ]
     try:
-        result, err = await ask_deepseek(messages, max_tokens=100, model=MODEL_DEFAULT)
+        result, err = await ask_deepseek(messages, max_tokens=120, model=MODEL_DEFAULT)
         if err or not result:
             return [query]
         variants = [v.strip() for v in result.split('|') if v.strip()]
-        return variants[:3] if len(variants) >= 2 else [query]
+        return variants[:5] if len(variants) >= 2 else [query]
     except:
         return [query]
 
@@ -933,7 +938,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_query = new_query[0]
         history = load_memory(user_id)
 
-        # Заменяем последнее сообщение пользователя на новый запрос (вместо дублирования)
         if history and history[-1]["role"] == "user":
             history[-1]["content"] = new_query
             history[-1]["timestamp"] = now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1004,7 +1008,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = load_memory(uid)
     profile = load_profile(uid)
 
-    # Добавляем исходный запрос в историю с временной меткой
     user_msg_obj = {"role": "user", "content": user_message, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")}
     history.append(user_msg_obj)
 
@@ -1014,7 +1017,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_reply(update, "❌ Напиши, что искать.")
             return
 
-        # Очищаем историю от префикса "бро"
         history[-1]["content"] = sq
 
         status_msg = await update.effective_message.reply_text("🌐 Ищу информацию...")
@@ -1039,7 +1041,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_reply(update, final_answer)
         return
 
-    # Умный диспетчер поиска
     decision_prompt = [
         {"role": "system", "content": "Диспетчер поиска. Ответь YES (нужен интернет) или NO (только знания)."},
         {"role": "user", "content": f"Запрос: {user_message}"}
