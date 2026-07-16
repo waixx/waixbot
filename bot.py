@@ -1,7 +1,7 @@
 # ============================================================
-#  BroWaix Bot — ФИНАЛЬНАЯ ВЕРСИЯ 2026
-#  (экспертный уровень, бюджет $7–8/мес, 150 запросов/день)
-#  Улучшения: сравнение источников, плюсы/минусы, фильтр бюджета
+#  BroWaix Bot — ФИНАЛЬНАЯ ВЕРСИЯ 2026 (БЕЗ ССЫЛОК В ОТВЕТЕ)
+#  экспертный уровень, бюджет $7–8/мес, 150 запросов/день
+#  Жёсткий запрет на выдачу голых ссылок
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
 from datetime import datetime, timedelta
@@ -51,8 +51,8 @@ SEARCH_VARIANTS_COUNT = 1
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 604800  # 7 дней
-MAX_TOKENS_ANSWER = 2048  # увеличен для структурированных ответов
-MAX_TOKENS_DEEP = 4096    # для /deep
+MAX_TOKENS_ANSWER = 2048
+MAX_TOKENS_DEEP = 4096
 TOP_RESULTS_SHOW = 6
 
 # ---------- ПАМЯТЬ ----------
@@ -201,7 +201,7 @@ async def save_memory(uid, history, backup=True, lock_held=False):
     if lock_held: return await _save_memory_impl(uid, history, backup)
     async with get_user_lock(uid): return await _save_memory_impl(uid, history, backup)
 
-# ---------- УЛУЧШЕННЫЕ ИНСТРУМЕНТЫ ФИЛЬТРАЦИИ ----------
+# ---------- ИНСТРУМЕНТЫ ФИЛЬТРАЦИИ ----------
 def extract_year_from_text(text):
     match = re.search(r'\b(20[2-9][0-9])\b', text)
     if match and match.group(1).isdigit():
@@ -217,7 +217,6 @@ def extract_price_from_text(text):
     return None
 
 def extract_models_from_text(text):
-    """Извлекает все упоминания моделей из текста"""
     model_patterns = [
         r'(X96Q|X96|H96\s*Max|H96|Tanix\s*TX3|Tanix|Xiaomi\s*Mi\s*Box\s*S|Xiaomi|Vontar\s*X4|Vontar|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Sber|Rombica|Kickpi|TOX|X88)',
         r'(MacBook\s*Air\s*M[4-6]|MacBook\s*Pro\s*M[4-6]|ASUS\s*Zenbook\s*S\s*\d+|ThinkPad\s*T\d+|Dell\s*XPS\s*\d+)',
@@ -231,22 +230,18 @@ def extract_models_from_text(text):
     return list(set(models))
 
 def extract_pros_cons(text):
-    """Извлекает плюсы и минусы из текста"""
     pros = re.findall(r'(лучш(ий|ая|ее)|преимущество|плюс|отлично|хорош|удобн|мощн|быстр|тих|легк|долг)', text, re.I)
     cons = re.findall(r'(хуже|недостаток|минус|дорогой|проблема|тяжел|греет|шумн|мало|не хватает|устарел)', text, re.I)
     return len(pros), len(cons)
 
 def extract_budget_from_query(query):
-    """Извлекает бюджет из запроса пользователя"""
     match = re.search(r'(?:до|не более|не дороже|max|максимум)\s*([\d\s]+)\s*(?:тыс|руб|₽|р\.)', query, re.I)
     if match:
         price_str = re.sub(r'\s', '', match.group(1))
         if price_str.isdigit():
             return int(price_str)
-    # Если указано "бюджетный"
     if re.search(r'бюджетн', query, re.I):
         return 15000
-    # Если указано "премиальный" или "флагман"
     if re.search(r'(премиальн|флагман|дорог)', query, re.I):
         return 80000
     return None
@@ -354,36 +349,74 @@ def remove_unverified_claims(ans, raw_snippets):
         ans = re.sub(r'\.\s*\.', '.', ans)
     return ans
 
-def generate_answer_from_snippets(results, user_message, max_items=5):
+# ===== НОВАЯ ФУНКЦИЯ — РУЧНАЯ СБОРКА ОТВЕТА (БЕЗ DEEPSEEK) =====
+def generate_manual_answer(results, user_message, max_items=5):
+    """Ручная сборка ответа (без DeepSeek) — только модели, цены, вывод"""
     if not results:
         return "❌ В интернете ничего не найдено по вашему запросу."
-    answer = f"🔍 **Результаты поиска по запросу:** {user_message[:100]}\n\n"
+    
+    # Фильтруем только релевантное
     relevant = [r for r in results if r.get('score', 0) > 0][:max_items]
     if not relevant:
-        links = [r.get('link') for r in results if r.get('link') and r['link'] != '#']
-        if links:
-            answer = "🔍 **Найденные ссылки:**\n\n"
-            for link in links[:max_items]:
-                answer += f"• {link}\n"
-            answer += f"\n📅 Дата: {get_current_date()}"
-            answer += "\nУверенность: 70% (на основе найденных данных)"
-            return answer
-        else:
-            return f"Найденные данные:\n\n{str(results)[:1000]}"
-    for i, r in enumerate(relevant, 1):
-        year_note = f" ({r.get('year')})" if r.get('year') else ""
-        price_note = f" [{r.get('price')} руб.]" if r.get('price') else ""
-        answer += f"{i}. **{r.get('title', 'Без названия')}**{year_note}{price_note}\n"
-        if r.get('snippet'):
-            answer += f"   {r['snippet'][:200]}\n"
-        if r.get('link') and r['link'] != '#':
-            answer += f"   🔗 <a href='{r['link']}'>Источник</a>\n"
+        return "⚠️ По вашему запросу найдены общие статьи, но конкретных моделей в них нет. Попробуйте уточнить запрос."
+    
+    answer = "📌 **Краткий вывод**\n\n"
+    answer += f"Я проанализировал {len(relevant)} источников. Вот модели, которые чаще всего упоминаются:\n\n"
+    
+    # Собираем модели
+    models = []
+    for r in relevant:
+        title = r.get('title', '')
+        snippet = r.get('snippet', '')
+        price = r.get('price')
+        year = r.get('year')
+        link = r.get('link', '#')
+        
+        # Ищем название модели в заголовке или сниппете
+        model_match = re.search(r'(X96Q|X96|H96\s*Max|H96|Tanix\s*TX3|Tanix|Xiaomi\s*Mi\s*Box\s*S|Xiaomi|Vontar\s*X4|Vontar|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Sber|Rombica|Kickpi|TOX|X88)', title + ' ' + snippet, re.I)
+        model = model_match.group(1) if model_match else "Модель не указана"
+        
+        # Извлекаем цену
+        if not price:
+            price_match = re.search(r'(\d{3,5})\s*(?:руб|₽)', snippet, re.I)
+            price = int(price_match.group(1)) if price_match else None
+        
+        models.append({
+            'name': model,
+            'price': price,
+            'year': year,
+            'link': link,
+            'snippet': snippet[:150]
+        })
+    
+    # Сортируем по цене (если есть)
+    models_with_price = [m for m in models if m['price']]
+    models_with_price.sort(key=lambda x: x['price'])
+    models_without_price = [m for m in models if not m['price']]
+    models = models_with_price + models_without_price
+    
+    # Формируем ТОП
+    answer += "### 🏆 ТОП моделей (на основе найденных данных)\n\n"
+    for i, m in enumerate(models[:5], 1):
+        price_str = f"{m['price']} руб." if m['price'] else "цена не указана"
+        answer += f"{i}. **{m['name']}** — {price_str}\n"
+        if m.get('snippet'):
+            answer += f"   {m['snippet']}\n"
         answer += "\n"
-    answer += f"📅 Дата: {get_current_date()}"
-    answer += "\nУверенность: 85% (на основе найденных данных)"
+    
+    # Вывод
+    answer += "### ✅ Рекомендация\n\n"
+    if models_with_price:
+        cheapest = models_with_price[0]
+        answer += f"Если бюджет ограничен — обратите внимание на **{cheapest['name']}** (около {cheapest['price']} руб.).\n"
+    answer += "Для точного выбора рекомендую открыть источники и сравнить характеристики.\n\n"
+    
+    answer += f"📅 Дата: {get_current_date()}\n"
+    answer += "Уверенность: 70% (на основе найденных данных, без обработки DeepSeek)"
+    
     return answer
 
-# ===== НОВЫЙ ЭКСПЕРТНЫЙ ПРОМПТ СО СРАВНЕНИЕМ ИСТОЧНИКОВ =====
+# ===== НОВЫЙ ЭКСПЕРТНЫЙ ПРОМПТ (С ЖЁСТКИМ ЗАПРЕТОМ НА ССЫЛКИ) =====
 CORE_SYSTEM_RULE = (
     "Ты — экспертный аналитик. Твоя задача — дать ПОЛНЫЙ, СТРУКТУРИРОВАННЫЙ ответ, а не просто ссылки.\n\n"
     
@@ -404,6 +437,12 @@ CORE_SYSTEM_RULE = (
     "   ⚠️ Логические выводы (на основе данных)\n"
     "   🧠 Предположения (на основе знаний модели) — не выше 25%\n\n"
     
+    "=== ЖЁСТКИЙ ЗАПРЕТ ===\n"
+    "ЗАПРЕЩЕНО давать ответ в виде просто списка ссылок.\n"
+    "Если у вас нет данных по конкретным моделям — вы должны сделать ЛОГИЧЕСКИЙ ВЫВОД на основе того, что есть, и дать структурированный ответ.\n"
+    "Ссылки можно указывать ТОЛЬКО в блоке «Источники» в конце.\n"
+    "Если вы не можете дать ответ без ссылок — используйте свои знания и чётко пометьте это как 'Предположительно'.\n\n"
+    
     "=== СТРУКТУРА ОТВЕТА ===\n"
     "📌 **Краткий вывод** (1–2 предложения)\n\n"
     "### 🏆 ТОП-3/5 моделей\n"
@@ -422,7 +461,7 @@ CORE_SYSTEM_RULE = (
     "• предостережение 1\n"
     "• предостережение 2\n\n"
     "### 🔗 На чём основан ответ\n"
-    "Список источников\n\n"
+    "Список источников (только тут!)\n\n"
     "📅 Дата\n"
     "🔹 Уверенность в ТОПе: XX%\n"
     "🔹 Уверенность в ценах: XX%\n"
@@ -560,7 +599,6 @@ def has_direct_answer(scored, user_message):
     return False
 
 def infer_models_from_data(scored, budget_limit, query_year):
-    """Логический вывод моделей на основе имеющихся данных"""
     if not scored:
         return []
     
@@ -596,15 +634,13 @@ async def generate_response(uid, user_message, history, profile, is_deep=False):
     try:
         return await asyncio.wait_for(
             _generate_response_internal(uid, user_message, history, profile, is_deep),
-            timeout=60
-        )
+            timeout=60        )
     except asyncio.TimeoutError:
         return "⏰ Превышено время ожидания. Попробуйте позже.", False
 
 async def _generate_response_internal(uid, user_message, history, profile, is_deep):
     ctx = build_profile_context(profile)
     
-    # Извлекаем бюджет из запроса
     budget = extract_budget_from_query(user_message)
     budget_note = f" (бюджет до {budget} руб.)" if budget else ""
     
@@ -628,7 +664,6 @@ async def _generate_response_internal(uid, user_message, history, profile, is_de
         return await generate_local_answer(uid, user_message, history, profile,
             reason="Найденные данные нерелевантны запросу")
     
-    # Если данных мало — пробуем логический вывод
     if not has_direct_answer(scored, user_message):
         if budget:
             inferred = infer_models_from_data(scored, budget, now().year)
@@ -644,7 +679,6 @@ async def _generate_response_internal(uid, user_message, history, profile, is_de
             return await generate_local_answer(uid, user_message, history, profile,
                 reason="В интернете нет актуальных данных за этот год")
     
-    # Формируем сниппеты с источниками
     stext = ""
     sources_text = ""
     for i, r in enumerate(scored[:TOP_RESULTS_SHOW], 1):
@@ -673,18 +707,24 @@ async def _generate_response_internal(uid, user_message, history, profile, is_de
             "3. Сделай логический вывод на основе частоты упоминаний.\n"
             "4. Дай ПОЛНЫЙ ответ: список моделей, таблицу, рекомендации.\n"
             "5. Если данных не хватает — дополни своими знаниями, но чётко пометь 'Предположительно'.\n"
-            "6. НЕ оставляй пользователя без ответа."
+            "6. НЕ оставляй пользователя без ответа.\n"
+            "7. ЗАПРЕЩЕНО выдавать ответ в виде списка ссылок. Дай структурированный ответ с моделями."
         )
     }
     
     ans, err = await ask_deepseek([sp] + history, max_tokens=max_tokens)
     if err:
-        return generate_answer_from_snippets(scored, user_message), True
+        # Если DeepSeek ошибся — делаем ОДИН повтор с моделью PRO
+        logger.warning(f"DeepSeek ошибка: {err}, пробуем PRO...")
+        ans, err2 = await ask_deepseek([sp] + history, max_tokens=max_tokens, model=MODEL_FALLBACK)
+        if err2:
+            # Если и PRO не помог — генерируем ответ САМИ (без ссылок)
+            return generate_manual_answer(scored, user_message), True
     
     final_ans = remove_unverified_claims(ans, stext)
     
     if len(final_ans) < 50 or 'http' not in final_ans:
-        final_ans = generate_answer_from_snippets(scored, user_message)
+        final_ans = generate_manual_answer(scored, user_message)
     else:
         confidence = calculate_confidence(scored, user_message)
         if '📅 Дата:' not in final_ans:
@@ -695,7 +735,6 @@ async def _generate_response_internal(uid, user_message, history, profile, is_de
     return f"🌐 из интернета + логика\n\n{final_ans}", True
 
 async def generate_inferred_answer(uid, user_message, history, profile, scored, inferred, budget, is_deep):
-    """Генерирует ответ с логическим выводом на основе данных"""
     ctx = build_profile_context(profile)
     
     stext = ""
@@ -709,7 +748,7 @@ async def generate_inferred_answer(uid, user_message, history, profile, scored, 
     
     inferred_text = ""
     if inferred:
-        inferred_text = "**Логический вывод на основе найденных данных (до {budget} руб.):**\n\n"
+        inferred_text = f"**Логический вывод на основе найденных данных (до {budget} руб.):**\n\n"
         for item in inferred[:5]:
             price = item.get('price', 'не указана')
             model = item.get('model', 'Модель не указана')
@@ -732,13 +771,17 @@ async def generate_inferred_answer(uid, user_message, history, profile, scored, 
             "2. Используй логический вывод, чтобы дополнить ответ.\n"
             "3. Если данных всё ещё мало — дополни своими знаниями, но чётко пометь 'Предположительно'.\n"
             "4. Дай ПОЛНЫЙ ответ: список моделей с ценами, таблицу, рекомендацию.\n"
-            "5. НЕ оставляй пользователя без ответа."
+            "5. НЕ оставляй пользователя без ответа.\n"
+            "6. ЗАПРЕЩЕНО выдавать ответ в виде списка ссылок."
         )
     }
     
     ans, err = await ask_deepseek([sp] + history, max_tokens=max_tokens)
     if err:
-        return generate_answer_from_snippets(scored, user_message), True
+        logger.warning(f"DeepSeek ошибка в inferred: {err}, пробуем PRO...")
+        ans, err2 = await ask_deepseek([sp] + history, max_tokens=max_tokens, model=MODEL_FALLBACK)
+        if err2:
+            return generate_manual_answer(scored, user_message), True
     
     final_ans = remove_unverified_claims(ans, stext)
     
@@ -814,7 +857,11 @@ async def ask_deepseek(messages, retries=2, max_tokens=None, model=MODEL_DEFAULT
                     data = await resp.json()
                     if data.get("choices"):
                         c = data["choices"][0].get("message", {}).get("content")
-                        return (c, None) if c is not None else (None, "empty")
+                        if c and len(c.strip()) > 10:
+                            return (c, None)
+                        else:
+                            logger.warning(f"⚠️ DeepSeek вернул пустой ответ: {c}")
+                            return (None, "empty_response")
                 if resp.status == 429:
                     await asyncio.sleep(2)
                     continue
@@ -1043,5 +1090,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (экспертный уровень, бюджет $7–8/мес)")
+    logger.info("✅ БОТ ЗАПУЩЕН (экспертный уровень, запрет на ссылки)")
     app.run_polling()
