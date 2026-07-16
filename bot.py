@@ -1,6 +1,6 @@
 # ============================================================
-#  BroWaix Bot — АБСОЛЮТНАЯ ОПОРА НА ДАННЫЕ (финальная версия)
-#  (принудительное извлечение, повторные попытки, $20/мес)
+#  BroWaix Bot — АБСОЛЮТНЫЙ КОНТРОЛЬ МОДЕЛИ
+#  (принудительное использование данных, удаление выдумок)
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
 from datetime import datetime, timedelta
@@ -53,14 +53,16 @@ CACHE_TTL = 86400
 MAX_TOKENS_ANSWER = 1024
 TOP_RESULTS_SHOW = 20
 
-# ===== ЖЁСТКИЙ ПРОМПТ =====
+# ===== ЖЁСТКИЙ ПРОМПТ С ЗАПРЕТОМ ИСПОЛЬЗОВАТЬ СВОИ ЗНАНИЯ =====
 CORE_SYSTEM_RULE = (
     "Ты — честный ассистент. Ты УЖЕ выполнил поиск в интернете и получил данные (они приведены ниже).\n"
-    "Ты ОБЯЗАН использовать эти данные для ответа. Если ты проигнорируешь их, это будет нарушением инструкции.\n\n"
+    "Ты ОБЯЗАН использовать ТОЛЬКО эти данные для ответа.\n"
+    "ЗАПРЕЩЕНО использовать свои внутренние знания, даже если они кажутся тебе более точными.\n"
+    "Если ты добавишь что-то от себя, это будет считаться ошибкой.\n\n"
     "ЖЁСТКИЕ ПРАВИЛА:\n"
     "1. Используй ТОЛЬКО данные из раздела «НАЙДЕННЫЕ ДАННЫЕ».\n"
-    "2. Каждое утверждение сопровождай ссылкой.\n"
-    "3. ЗАПРЕЩЕНО писать: «нет доступа», «не могу выполнить поиск», «техническое ограничение».\n"
+    "2. Каждое утверждение должно сопровождаться ссылкой из данных.\n"
+    "3. НЕ пиши фразы: «нет доступа», «не могу выполнить поиск», «техническое ограничение».\n"
     "4. Если данных действительно нет – скажи: «В найденных данных нет информации».\n"
     "5. В конце укажи: 📅 Дата (если есть), Уверенность: XX%.\n\n"
     "ФОРМАТ ОТВЕТА:\n"
@@ -251,6 +253,9 @@ def normalize_query(query):
     return normalized[:100]
 
 def get_cached(query):
+    # Не кэшируем актуальные запросы
+    if any(word in query.lower() for word in ['сегодня', 'сейчас', 'новости', 'курс', 'погода']):
+        return None
     norm_key = normalize_query(query)
     if norm_key in search_cache and (datetime.now() - search_cache[norm_key]['time']).total_seconds() < CACHE_TTL:
         logger.info("✅ Cache HIT")
@@ -264,6 +269,8 @@ def get_cached(query):
     return None
 
 def set_cache(query, data):
+    if any(word in query.lower() for word in ['сегодня', 'сейчас', 'новости', 'курс', 'погода']):
+        return  # не кэшируем
     norm_key = normalize_query(query)
     search_cache[norm_key] = {'data': data, 'time': datetime.now()}
     q_hash = hashlib.md5(norm_key.encode()).hexdigest()[:8]
@@ -285,7 +292,23 @@ def highlight_contradictions(text):
             highlighted.append(sent)
     return ' '.join(highlighted), found
 
-# ===== ГЛАВНЫЙ МЕХАНИЗМ: ИЗВЛЕЧЕНИЕ ДАННЫХ ИЗ СНИППЕТОВ =====
+# ===== ГЛАВНЫЙ МЕХАНИЗМ: ПРОВЕРКА СООТВЕТСТВИЯ ДАННЫМ =====
+def remove_unverified_claims(ans, raw_snippets):
+    """Удаляет из ответа утверждения, которые не подтверждены найденными данными."""
+    if not raw_snippets:
+        return ans
+    # Список брендов и моделей для проверки
+    known_entities = re.findall(r'(Xiaomi|H96|X96Q|Tanix|Vontar|RockTek|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Apple|Sber|Rombica|Kickpi|TOX|X88|H618|H313|S905|RK3566|4K|HDR|Dolby|Android|Google TV)', ans, re.I)
+    # Удаляем уникальные сущности, которых нет в сырых данных
+    modified = False
+    for entity in set(known_entities):
+        if entity.lower() not in raw_snippets.lower():
+            # Заменяем на предупреждение
+            ans = re.sub(r'\b' + re.escape(entity) + r'\b', f'⚠️[{entity} не подтверждено]', ans, flags=re.I)
+            modified = True
+            logger.info(f"🔍 Удалена неподтверждённая сущность: {entity}")
+    return ans
+
 def generate_answer_from_snippets(raw_snippets, user_message, max_items=10):
     """Формирует ответ из найденных ссылок – даже если модель отказалась."""
     if not raw_snippets:
@@ -350,16 +373,20 @@ def is_useful_answer(ans):
         return False
     has_links = 'http' in ans
     has_numbers = bool(re.search(r'\d+', ans))
-    has_models = bool(re.search(r'(Xiaomi|H96|X96Q|Tanix|Vontar|RockTek|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Apple|Sber|Rombica|Kickpi|TOX|X88|H618|H313|S905|RK3566)', ans, re.I))
+    has_models = bool(re.search(r'(Xiaomi|H96|X96Q|Tanix|Vontar|RockTek|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Apple|Sber|Rombica|Kickpi|TOX|X88|H618|H313|S905|RK3566|4K|HDR|Dolby|Android|Google TV)', ans, re.I))
     empty_phrases = ['я не знаю', 'нет данных', 'не нашел', 'не указаны', 'нет прямого списка', 'нет информации']
     has_empty_phrase = any(phrase in ans.lower() for phrase in empty_phrases)
     
     return (has_links or has_numbers or has_models) and not has_empty_phrase
 
 def finalize_answer(ans, current_date, raw_snippets=None, user_message=None):
-    # Если ответ бесполезен – заменяем на сгенерированный из сниппетов
+    # Если ответ бесполезен или содержит только общие фразы – заменяем
     if not is_useful_answer(ans) and raw_snippets:
         return generate_answer_from_snippets(raw_snippets, user_message)
+    
+    # Удаляем неподтверждённые сущности
+    if raw_snippets:
+        ans = remove_unverified_claims(ans, raw_snippets)
     
     # Замена запрещённых фраз
     forbidden = ['нет доступа', 'не могу выполнить поиск', 'не могу выйти в интернет', 'техническое ограничение']
@@ -497,7 +524,7 @@ async def search_duckduckgo_async(query):
     except Exception:
         return []
 
-# ---------- ГЕНЕРАЦИЯ ОТВЕТА С ПОВТОРНОЙ ПОПЫТКОЙ ----------
+# ---------- ГЕНЕРАЦИЯ ОТВЕТА (ВСЕГДА С ПОИСКОМ) ----------
 async def generate_response(uid, user_message, history, profile, retry_count=0):
     try:
         return await asyncio.wait_for(
@@ -537,6 +564,7 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         logger.info(f"📊 Результатов: {len(all_results)}")
         set_cache(user_message, all_results)
 
+    # Если вообще нет результатов – fallback на знания модели
     if not all_results:
         sp_knowledge = {
             "role": "system",
@@ -581,7 +609,7 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         link_html = f"🔗 <a href=\"{r['link']}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
         stext += f"{i}. {is_off}**{r['title']}**{year_note}{price_note}\n   {r['snippet'][:180]}\n   {link_html}\n\n"
 
-    # Первая попытка
+    # Первая попытка с жёстким промптом
     sp = {
         "role": "system",
         "content": (
@@ -672,7 +700,7 @@ async def ask_deepseek(messages, retries=2, max_tokens=None, model=MODEL_DEFAULT
             await asyncio.sleep(1)
     return None, "max_retries"
 
-# ---------- КОМАНДЫ (сокращённо) ----------
+# ---------- КОМАНДЫ ----------
 async def start(update, context):
     uid = update.effective_user.id
     if not is_allowed(uid): return
@@ -790,7 +818,7 @@ async def safe_reply(update: Update, text: str, reply_markup=None):
 def is_allowed(uid):
     return not ALLOWED_USERS_LIST or uid in ALLOWED_USERS_LIST
 
-# ---------- ОБРАБОТЧИК СООБЩЕНИЙ ----------
+# ---------- ОБРАБОТЧИК СООБЩЕНИЙ (ВСЕГДА ПОИСК) ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.effective_message or not update.effective_message.text: return
     uid = update.effective_user.id
@@ -820,39 +848,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await safe_reply(update, "❌ Не удалось сохранить факт.")
         return
 
+    # Всегда выполняем поиск для обычных сообщений
     history = load_memory(uid)
     profile = load_profile(uid)
     user_msg_obj = {"role": "user", "content": user_message, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")}
     history.append(user_msg_obj)
 
-    simple_patterns = [r'^привет', r'^как дела', r'^спасибо', r'^ты кто', r'^что умеешь', r'^напиши код', r'^напиши стих', r'^помоги']
-    needs_search = not any(re.search(pat, user_message.lower()) for pat in simple_patterns)
-
-    if not needs_search:
-        sp = {"role": "system", "content": f"{CORE_SYSTEM_RULE}\nКонтекст: {build_profile_context(profile)}"}
-        ans, err = await ask_deepseek([sp] + history, max_tokens=400)
-        if not err and ans:
-            final_ans = finalize_answer(ans, get_current_date(), raw_snippets=None, user_message=user_message)
-            history.append({"role": "assistant", "content": ans, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")})
-            await save_memory(uid, history)
-            await safe_reply(update, f"🧠 из модели\n\n{final_ans}")
-        else:
-            await safe_reply(update, "⚠️ Ошибка при ответе.")
+    answer, should_save = await generate_response(uid, user_message, history, profile)
+    if should_save == "need_retry":
+        context.user_data["pending_retry_query"] = user_message
+        keyboard = [[
+            InlineKeyboardButton("✅ Да, переформулировать", callback_data="retry_yes"),
+            InlineKeyboardButton("❌ Нет", callback_data="retry_no")
+        ]]
+        await safe_reply(update, answer, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        answer, should_save = await generate_response(uid, user_message, history, profile)
-        if should_save == "need_retry":
-            context.user_data["pending_retry_query"] = user_message
-            keyboard = [[
-                InlineKeyboardButton("✅ Да, переформулировать", callback_data="retry_yes"),
-                InlineKeyboardButton("❌ Нет", callback_data="retry_no")
-            ]]
-            await safe_reply(update, answer, reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            if should_save and isinstance(answer, str) and len(answer) > 10:
-                clean_answer = re.sub(r'<[^>]+>', '', answer)
-                history.append({"role": "assistant", "content": clean_answer, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")})
-                await save_memory(uid, history)
-            await safe_reply(update, answer)
+        if should_save and isinstance(answer, str) and len(answer) > 10:
+            clean_answer = re.sub(r'<[^>]+>', '', answer)
+            history.append({"role": "assistant", "content": clean_answer, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")})
+            await save_memory(uid, history)
+        await safe_reply(update, answer)
 
 # ---------- КНОПКИ ----------
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -940,5 +955,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (финальная версия – принудительное извлечение данных)")
+    logger.info("✅ БОТ ЗАПУЩЕН (абсолютный контроль, удаление выдумок)")
     app.run_polling()
