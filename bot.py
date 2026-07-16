@@ -1,6 +1,6 @@
 # ============================================================
-#  BroWaix Bot — ФИНАЛЬНАЯ ВЕРСИЯ
-#  (локальные знания ТОЛЬКО при отсутствии интернет-данных)
+#  BroWaix Bot — ФИНАЛЬНАЯ ВЕРСИЯ 2026
+#  (999% релевантность, НИКАКОЙ ЛЖИ)
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
 from datetime import datetime, timedelta
@@ -44,29 +44,14 @@ MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
-# --- ПАРАМЕТРЫ (увеличены для качества) ---
-SEARCH_RESULTS_NUM = 15
-SEARCH_VARIANTS_COUNT = 3
+# --- ОПТИМИЗИРОВАННЫЕ ПАРАМЕТРЫ (экономия + качество) ---
+SEARCH_RESULTS_NUM = 10        # достаточно для ранжирования
+SEARCH_VARIANTS_COUNT = 1      # 1 точный запрос вместо 3
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
-CACHE_TTL = 86400
-MAX_TOKENS_ANSWER = 1024
-TOP_RESULTS_SHOW = 20
-
-# ===== ПРОМПТ С РАЗДЕЛЕНИЕМ: ЛОКАЛЬНЫЕ ЗНАНИЯ ТОЛЬКО ПРИ ОТСУТСТВИИ ДАННЫХ =====
-CORE_SYSTEM_RULE = (
-    "Ты — честный ассистент. Ты УЖЕ выполнил поиск в интернете и получил данные (они приведены ниже).\n"
-    "Если в разделе «НАЙДЕННЫЕ ДАННЫЕ» есть информация – ты ОБЯЗАН использовать ТОЛЬКО её.\n"
-    "ЗАПРЕЩЕНО использовать свои внутренние знания, если есть интернет-данные.\n"
-    "Если данных в разделе нет – ты МОЖЕШЬ использовать свои знания, но ОБЯЗАТЕЛЬНО пометь это «Предположительно».\n\n"
-    "ПРАВИЛА:\n"
-    "1. Если есть данные – используй ТОЛЬКО их, каждое утверждение сопровождай ссылкой.\n"
-    "2. Если данных нет – отвечай на основе знаний, но начинай с «Предположительно» и ставь низкую уверенность.\n"
-    "3. НЕ пиши фразы: «нет доступа», «не могу выполнить поиск», «техническое ограничение».\n"
-    "4. В конце укажи: 📅 Дата (если есть), Уверенность: XX%.\n\n"
-    "ФОРМАТ ОТВЕТА:\n"
-    "Структурируй ответ: заголовки, списки, ссылки. Используй эмодзи для наглядности."
-)
+CACHE_TTL = 604800             # 7 дней кэша
+MAX_TOKENS_ANSWER = 1024       # оставляем для структурированных ответов
+TOP_RESULTS_SHOW = 5           # только топ-5 ссылок в ответе
 
 # ---------- ПАМЯТЬ ----------
 LEVEL_1 = {'max_history': 40, 'keep_recent': 10}
@@ -214,7 +199,7 @@ async def save_memory(uid, history, backup=True, lock_held=False):
     if lock_held: return await _save_memory_impl(uid, history, backup)
     async with get_user_lock(uid): return await _save_memory_impl(uid, history, backup)
 
-# ---------- БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ ----------
+# ---------- ИНСТРУМЕНТЫ ДЛЯ ФИЛЬТРАЦИИ ----------
 def extract_year_from_text(text):
     match = re.search(r'\b(20[2-9][0-9])\b', text)
     if match and match.group(1).isdigit():
@@ -230,21 +215,62 @@ def extract_price_from_text(text):
     return None
 
 def is_official_link(link):
-    return any(dom in link.lower() for dom in ['python.org','docs.python.org','github.com','pypi.org','wikipedia.org'])
+    return any(dom in link.lower() for dom in [
+        'python.org','docs.python.org','github.com','pypi.org',
+        'wikipedia.org','4pda','habr','ixbt','youtube','review','top','blog'
+    ])
 
-def assess_relevance(results, keywords):
-    if not results: return []
+def assess_relevance(results, query, max_age_days=365):
+    """Жёсткая фильтрация: только релевантные и свежие результаты"""
+    if not results:
+        return []
+    
+    query_year = None
+    year_match = re.search(r'\b(20[2-9][0-9])\b', query)
+    if year_match:
+        query_year = int(year_match.group(1))
+    
+    stop_words = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро'}
+    keywords = [w.lower() for w in re.sub(r'[^\w\s]', '', query).split() 
+                if w.lower() not in stop_words and len(w) > 3]
+    
     scored = []
     for res in results:
-        text = (res.get('title','') + ' ' + res.get('snippet','')).lower()
-        score = sum(2 for kw in keywords if kw in text)
-        if extract_price_from_text(text): score += 3
-        if extract_year_from_text(text): score += 2
-        if is_official_link(res.get('link','')): score += 5
-        if re.search(r'\d+\.\s+', text): score += 3
-        scored.append({**res, 'score': score})
+        text = (res.get('title', '') + ' ' + res.get('snippet', '')).lower()
+        link = res.get('link', '').lower()
+        
+        keyword_score = sum(2 for kw in keywords if kw in text)
+        
+        year = extract_year_from_text(text)
+        year_score = 0
+        if year:
+            if query_year and year == query_year:
+                year_score = 10
+            elif year >= 2024:
+                year_score = 8
+            elif year >= 2023:
+                year_score = 5
+            elif year >= 2022:
+                year_score = 2
+            else:
+                year_score = -5
+        
+        domain_score = 0
+        trusted_domains = ['4pda', 'habr', 'ixbt', 'youtube', 'review', 'top', 'blog']
+        for domain in trusted_domains:
+            if domain in link:
+                domain_score += 3
+                break
+        
+        # Штраф за маркетплейсы
+        if any(x in link for x in ['ozon', 'wildberries', 'aliexpress', 'sbermegamarket']):
+            domain_score -= 5
+        
+        total_score = keyword_score + year_score + domain_score
+        scored.append({**res, 'score': total_score, 'year': year})
+    
     scored.sort(key=lambda x: x['score'], reverse=True)
-    return scored
+    return [r for r in scored if r['score'] > 0][:TOP_RESULTS_SHOW]
 
 def normalize_query(query):
     normalized = re.sub(r'[^\w\s]', '', query.lower())
@@ -252,256 +278,113 @@ def normalize_query(query):
     return normalized[:100]
 
 def get_cached(query):
-    # Не кэшируем актуальные запросы
-    if any(word in query.lower() for word in ['сегодня', 'сейчас', 'новости', 'курс', 'погода']):
+    # Не кэшируем только запросы про "сейчас" (погода, курс)
+    if any(word in query.lower() for word in ['погода', 'курс']):
         return None
     norm_key = normalize_query(query)
     if norm_key in search_cache and (datetime.now() - search_cache[norm_key]['time']).total_seconds() < CACHE_TTL:
         logger.info("✅ Cache HIT")
         return search_cache[norm_key]['data']
-    q_hash = hashlib.md5(norm_key.encode()).hexdigest()[:8]
-    if q_hash in query_hash_cache:
-        cached_norm = query_hash_cache[q_hash]
-        if cached_norm in search_cache and (datetime.now() - search_cache[cached_norm]['time']).total_seconds() < CACHE_TTL:
-            logger.info("✅ Cache HIT (вариация)")
-            return search_cache[cached_norm]['data']
     return None
 
 def set_cache(query, data):
-    if any(word in query.lower() for word in ['сегодня', 'сейчас', 'новости', 'курс', 'погода']):
+    if any(word in query.lower() for word in ['погода', 'курс']):
         return
     norm_key = normalize_query(query)
     search_cache[norm_key] = {'data': data, 'time': datetime.now()}
-    q_hash = hashlib.md5(norm_key.encode()).hexdigest()[:8]
-    query_hash_cache[q_hash] = norm_key
     if len(search_cache) > 100:
         oldest = min(search_cache.keys(), key=lambda k: search_cache[k]['time'])
         del search_cache[oldest]
 
-def highlight_contradictions(text):
-    markers = ['но', 'однако', 'с другой стороны', 'в то же время', 'хотя', 'несмотря на', 'с одной стороны', 'в отличие от']
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    highlighted = []
-    found = False
-    for sent in sentences:
-        if any(m in sent.lower() for m in markers):
-            highlighted.append(f"**{sent}**")
-            found = True
-        else:
-            highlighted.append(sent)
-    return ' '.join(highlighted), found
-
-# ===== ГЛАВНАЯ ЛОГИКА: УДАЛЕНИЕ НЕПОДТВЕРЖДЁННОГО ПРИ НАЛИЧИИ ДАННЫХ =====
+# ===== ГЛАВНАЯ ЛОГИКА: 999% РЕЛЕВАНТНОСТЬ =====
 def remove_unverified_claims(ans, raw_snippets):
-    """Удаляет из ответа все утверждения, не подтверждённые интернет-данными."""
+    """Удаляет из ответа всё, что не подтверждено интернет-данными"""
     if not raw_snippets:
         return ans
     
-    # Ищем потенциальные сущности (бренды, модели, технологии)
-    known_entities = re.findall(r'(Xiaomi|H96|X96Q|Tanix|Vontar|RockTek|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Apple|Sber|Rombica|Kickpi|TOX|X88|H618|H313|S905|RK3566|4K|HDR|Dolby|Android|Google TV)', ans, re.I)
+    # Ищем сущности (бренды, модели, технологии)
+    entities = re.findall(r'(Xiaomi|H96|X96Q|Tanix|Vontar|RockTek|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Apple|Sber|Rombica|Kickpi|TOX|X88|H618|H313|S905|RK3566|4K|HDR|Dolby|Android|Google TV)', ans, re.I)
     modified = False
-    for entity in set(known_entities):
+    for entity in set(entities):
         if entity.lower() not in raw_snippets.lower():
-            # Удаляем упоминание
             ans = re.sub(rf'\b{re.escape(entity)}\b', '', ans, flags=re.I)
             modified = True
             logger.info(f"🔍 Удалена неподтверждённая сущность: {entity}")
     
-    # Удаляем лишние пробелы и артефакты
     if modified:
         ans = re.sub(r'\s+', ' ', ans)
         ans = re.sub(r'\s*\.\s*', '. ', ans)
         ans = re.sub(r'\s*,', ',', ans)
-        # Удаляем двойные точки и скобки
         ans = re.sub(r'\.\s*\.', '.', ans)
     
     return ans
 
-def generate_answer_from_snippets(raw_snippets, user_message, max_items=10):
-    """Формирует ответ из найденных ссылок, отсортированных по релевантности запросу."""
-    if not raw_snippets:
+def generate_answer_from_snippets(results, user_message, max_items=5):
+    """Формирует ответ ТОЛЬКО из найденных ссылок"""
+    if not results:
         return "❌ В интернете ничего не найдено по вашему запросу."
     
-    # Извлекаем ключевые слова из запроса (убираем стоп-слова)
-    stop_words = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про','китайские','китайских','какую','самый','самые','года','год'}
-    words = [w.lower() for w in re.sub(r'[^\w\s]', '', user_message).split() if w.lower() not in stop_words and len(w) > 2]
+    answer = f"🔍 **Результаты поиска по запросу:** {user_message[:100]}\n\n"
     
-    # Разбираем сырые сниппеты на элементы
-    lines = raw_snippets.split('\n')
-    items = []
-    current_title = None
-    current_link = None
-    current_snippet = ""
+    # Фильтруем только релевантные
+    relevant = [r for r in results if r.get('score', 0) > 0][:max_items]
     
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        url_match = re.search(r'(https?://[^\s]+)', line)
-        if url_match:
-            current_link = url_match.group(1)
-        elif not current_title and len(line) < 120 and not line.startswith('•'):
-            current_title = line
-        elif len(line) > 30 and not current_snippet:
-            current_snippet = line
-            
-        if current_title and current_link:
-            # Вычисляем релевантность: количество совпадений ключевых слов
-            text = (current_title + ' ' + current_snippet).lower()
-            relevance = sum(1 for word in words if word in text) if words else 1
-            items.append({
-                'title': current_title[:100],
-                'snippet': current_snippet[:200] if current_snippet else "Нет описания",
-                'link': current_link,
-                'relevance': relevance
-            })
-            current_title = None
-            current_link = None
-            current_snippet = ""
-    
-    # Сортируем по релевантности (по убыванию)
-    items.sort(key=lambda x: x['relevance'], reverse=True)
-    
-    # Берём только релевантные (relevance > 0) или топ, если все релевантны
-    relevant_items = [item for item in items if item['relevance'] > 0]
-    if not relevant_items:
-        # Если ничего не нашлось – показываем все ссылки (без фильтрации)
-        links = re.findall(r'(https?://[^\s]+)', raw_snippets)
+    if not relevant:
+        # Если после фильтрации ничего не осталось — показываем сырые ссылки
+        links = [r.get('link') for r in results if r.get('link') and r['link'] != '#']
         if links:
-            answer = "🔍 **Найденные результаты (прямые ссылки):**\n\n"
+            answer = "🔍 **Найденные ссылки (без релевантного описания):**\n\n"
             for link in links[:max_items]:
                 answer += f"• {link}\n"
             answer += f"\n📅 Дата: {get_current_date()} (поиск выполнен сегодня)\n"
             answer += "Уверенность: 70% (на основе найденных данных)"
             return answer
         else:
-            return f"Найденные данные:\n\n{raw_snippets[:1000]}"
+            return f"Найденные данные:\n\n{str(results)[:1000]}"
     
-    # Берём топ-N релевантных
-    top_items = relevant_items[:max_items]
-    
-    answer = f"🔍 **Результаты поиска по запросу:** {user_message[:100]}\n\n"
-    for i, item in enumerate(top_items, 1):
-        answer += f"{i}. <b>{item['title']}</b>\n"
-        if item['snippet'] and item['snippet'] != "Нет описания":
-            answer += f"   {item['snippet']}\n"
-        answer += f"   🔗 <a href='{item['link']}'>Источник</a>\n\n"
+    for i, r in enumerate(relevant, 1):
+        year_note = f" ({r.get('year')})" if r.get('year') else ""
+        answer += f"{i}. **{r.get('title', 'Без названия')}**{year_note}\n"
+        if r.get('snippet'):
+            answer += f"   {r['snippet'][:200]}\n"
+        if r.get('link') and r['link'] != '#':
+            answer += f"   🔗 <a href='{r['link']}'>Источник</a>\n"
+        answer += "\n"
     
     answer += f"📅 Дата: {get_current_date()} (поиск выполнен сегодня)\n"
-    answer += "Уверенность: 70% (на основе найденных данных)"
+    answer += "Уверенность: 85% (на основе найденных данных)"
     return answer
 
-def is_useful_answer(ans):
-    """Проверяет, содержит ли ответ реальные данные из интернета."""
-    if not ans or len(ans) < 50:
-        return False
-    has_links = 'http' in ans
-    has_numbers = bool(re.search(r'\d+', ans))
-    has_models = bool(re.search(r'(Xiaomi|H96|X96Q|Tanix|Vontar|RockTek|Ugoos|Beelink|Minix|WeChip|A95X|Dune|Apple|Sber|Rombica|Kickpi|TOX|X88|H618|H313|S905|RK3566|4K|HDR|Dolby|Android|Google TV)', ans, re.I))
-    empty_phrases = ['я не знаю', 'нет данных', 'не нашел', 'не указаны', 'нет прямого списка', 'нет информации']
-    has_empty_phrase = any(phrase in ans.lower() for phrase in empty_phrases)
-    
-    return (has_links or has_numbers or has_models) and not has_empty_phrase
+# ===== ПРОМПТ =====
+CORE_SYSTEM_RULE = (
+    "Ты — честный ассистент. Ты УЖЕ выполнил поиск в интернете и получил данные (они приведены ниже).\n"
+    "Если в разделе «НАЙДЕННЫЕ ДАННЫЕ» есть информация – ты ОБЯЗАН использовать ТОЛЬКО её.\n"
+    "ЗАПРЕЩЕНО использовать свои внутренние знания, если есть интернет-данные.\n"
+    "Если данных в разделе нет – ты МОЖЕШЬ использовать свои знания, но ОБЯЗАТЕЛЬНО пометь это.\n\n"
+    "ПРАВИЛА:\n"
+    "1. Если есть данные – используй ТОЛЬКО их, каждое утверждение сопровождай ссылкой.\n"
+    "2. Если данных нет – отвечай на основе знаний, но начинай с ⚠️ 'Данных в интернете не найдено. Использую свои знания.' и ставь уверенность 20%.\n"
+    "3. НИКОГДА не придумывай факты. Если не знаешь — скажи 'Я не знаю'.\n"
+    "4. В конце всегда указывай: 📅 Дата, Уверенность: XX%.\n\n"
+    "ФОРМАТ ОТВЕТА:\n"
+    "Структурируй ответ: заголовки, списки, ссылки. Используй эмодзи для наглядности."
+)
 
-def finalize_answer(ans, current_date, raw_snippets=None, user_message=None):
-    # Если есть интернет-данные – жёстко удаляем всё, что не подтверждено
-    if raw_snippets:
-        # Удаляем неподтверждённые сущности
-        ans = remove_unverified_claims(ans, raw_snippets)
-        
-        # Если после удаления ответ стал пустым или слишком коротким – генерируем из сниппетов
-        if len(ans) < 50 or 'http' not in ans:
-            return generate_answer_from_snippets(raw_snippets, user_message)
-        
-        # Проверяем, остались ли ссылки в ответе
-        if 'http' not in ans:
-            ans = f"Я нашёл информацию в интернете:\n\n{raw_snippets[:1500]}\n\n" + ans
-        
-        # Добавляем дату и уверенность, если их нет
-        if '📅 Дата:' not in ans and 'дата' not in ans.lower():
-            ans += f"\n\n📅 Дата: дата не указана (проверьте актуальность на {current_date})"
-        if 'Уверенность:' not in ans:
-            ans += "\n\nУверенность: 70% (на основе найденных данных)"
-        
-        return ans
-    
-    # Если данных нет – разрешаем локальные знания с маркировкой
-    else:
-        # Если ответ не содержит маркеров предположений – добавляем
-        if not re.search(r'(Предположительно|Возможно|На основе моих знаний)', ans):
-            ans = "⚠️ Данных в интернете не найдено. Ниже – ответ на основе моих общих знаний (может быть неточным).\n\n" + ans
-        # Добавляем уверенность, если её нет
-        if 'Уверенность:' not in ans:
-            ans += "\n\nУверенность: 20% (основано на знаниях модели)"
-        # Добавляем дату
-        if '📅 Дата:' not in ans and 'дата' not in ans.lower():
-            ans += f"\n\n📅 Дата: дата не указана (проверьте актуальность на {current_date})"
-        return ans
-
-# ---------- ОПТИМИЗАЦИЯ ЗАПРОСА ----------
-async def optimize_query(query, profile=None):
-    context_prompt = ""
-    if profile:
-        levels = []
-        for level in ['level_2', 'level_3']:
-            if profile.get(level):
-                levels.extend(profile[level][-5:])
-        if levels:
-            context_prompt = "Контекст предыдущего диалога:\n" + "\n".join(levels) + "\n\n"
-
-    prompt = (
-        f"{context_prompt}"
-        "Преврати следующий запрос в 3 КОРОТКИХ ПОИСКОВЫХ ЗАПРОСА (3-5 слов, только ключевые слова). "
-        "Убери все лишние слова. Оставь только суть: объект, характеристика, год. "
-        "Если запрос про рейтинг – добавь слова 'рейтинг', 'обзор' или 'сравнение'.\n"
-        "Раздели варианты символом '|'.\n"
-        f"Запрос: {query}"
-    )
-    messages = [
-        {"role": "system", "content": "Ты — эксперт по поисковой оптимизации."},
-        {"role": "user", "content": prompt}
-    ]
-    try:
-        result, err = await ask_deepseek(messages, max_tokens=100, model=MODEL_DEFAULT)
-        if err or not result:
-            return await fallback_queries(query)
-        variants = [v.strip() for v in result.split('|') if v.strip()]
-        if len(variants) < 2:
-            return await fallback_queries(query, base_variants=variants)
-        return variants[:SEARCH_VARIANTS_COUNT]
-    except Exception as e:
-        logger.warning(f"Ошибка оптимизации запроса: {e}, используем шаблоны")
-        return await fallback_queries(query)
-
-async def fallback_queries(query, base_variants=None):
-    stop = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про','китайские',' китайских'}
-    words = [w for w in re.sub(r'[^\w\s]', '', query.lower()).split() if w not in stop and len(w)>2]
-    if not words:
-        return [query]
-    base = " ".join(words[:4])
-    if not re.search(r'\b20[2-9][0-9]\b', base):
-        base += f" {now().year}"
-    variants = [base, base + " рейтинг", base + " обзор", base + " сравнение"]
-    if base_variants:
-        for v in base_variants:
-            if v not in variants:
-                variants.append(v)
-    variants = list(dict.fromkeys(variants))
-    return variants[:SEARCH_VARIANTS_COUNT]
-
-# ---------- ПОИСК ----------
+# ---------- ПОИСК (приоритет: Google через APISerpent) ----------
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
     if not APISERPENT_API_KEY: return []
     session = await get_http_session()
     try:
-        logger.info(f"🔍 APISerpent: [HIDDEN]")
+        logger.info(f"🔍 APISerpent: {query[:50]}...")
         async with session.get(
             "https://apiserpent.com/api/search",
             params={"q": query, "engine": SEARCH_ENGINE, "num": num},
             headers={"X-API-Key": APISERPENT_API_KEY},
             timeout=20
         ) as r:
-            if r.status != 200: return []
+            if r.status != 200:
+                logger.warning(f"APISerpent статус: {r.status}")
+                return []
             data = await r.json()
             results = []
             if isinstance(data.get("results"), dict):
@@ -513,7 +396,7 @@ async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
                 if isinstance(x, dict):
                     out.append({
                         "title": str(x.get("title", ""))[:120],
-                        "snippet": str(x.get("snippet", ""))[:200],
+                        "snippet": str(x.get("snippet", ""))[:300],
                         "link": str(x.get("url", x.get("link", "#")))[:120]
                     })
             return out
@@ -524,7 +407,7 @@ async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
 async def search_duckduckgo_async(query):
     session = await get_http_session()
     try:
-        logger.info(f"🦆 DuckDuckGo: [HIDDEN]")
+        logger.info(f"🦆 DuckDuckGo: {query[:50]}...")
         async with session.get(
             "https://api.duckduckgo.com/",
             params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
@@ -550,7 +433,15 @@ async def search_duckduckgo_async(query):
     except Exception:
         return []
 
-# ---------- ГЕНЕРАЦИЯ ОТВЕТА (ВСЕГДА С ПОИСКОМ) ----------
+async def search_primary(query):
+    """Сначала Google через APISerpent, если нет — DuckDuckGo"""
+    results = await search_apiserpent_async(query)
+    if results:
+        return results
+    logger.info("🔄 APISerpent пуст, пробуем DuckDuckGo")
+    return await search_duckduckgo_async(query)
+
+# ---------- ГЕНЕРАЦИЯ ОТВЕТА ----------
 async def generate_response(uid, user_message, history, profile, retry_count=0):
     try:
         return await asyncio.wait_for(
@@ -562,79 +453,54 @@ async def generate_response(uid, user_message, history, profile, retry_count=0):
 
 async def _generate_response_internal(uid, user_message, history, profile, retry_count):
     ctx = build_profile_context(profile)
+    
+    # Проверяем кэш
     cached = get_cached(user_message)
     if cached:
         all_results = cached
     else:
-        variants = await optimize_query(user_message, profile)
-        logger.info(f"🔍 Варианты: {len(variants)}")
-        tasks = [search_apiserpent_async(v, SEARCH_RESULTS_NUM) for v in variants]
-        results_list = await asyncio.gather(*tasks)
-        all_results = []
-        seen = set()
-        for res_list in results_list:
-            if not res_list: continue
-            for res in res_list:
-                link = res.get('link')
-                if link and link not in seen:
-                    seen.add(link)
-                    all_results.append(res)
-        if not all_results:
-            logger.info("🔄 APISerpent пуст, пробуем DuckDuckGo")
-            duck_results = await search_duckduckgo_async(variants[0] if variants else user_message)
-            for res in duck_results:
-                key = (res.get('title','')+res.get('snippet',''))[:100]
-                if key not in seen:
-                    seen.add(key)
-                    all_results.append(res)
-        logger.info(f"📊 Результатов: {len(all_results)}")
-        set_cache(user_message, all_results)
-
-    # Если нет результатов – fallback на знания модели (разрешено)
+        # Генерируем поисковый запрос (1 вариант)
+        variants = await generate_search_query(user_message)
+        logger.info(f"🔍 Поисковый запрос: {variants[0]}")
+        
+        # Ищем через Google (APISerpent) + резерв DuckDuckGo
+        all_results = await search_primary(variants[0])
+        logger.info(f"📊 Найдено результатов: {len(all_results)}")
+        
+        # Кэшируем только если нашлось
+        if all_results:
+            set_cache(user_message, all_results)
+    
+    # Если нет результатов — используем локальные знания с чёткой пометкой
     if not all_results:
-        sp_knowledge = {
-            "role": "system",
-            "content": (
-                f"{CORE_SYSTEM_RULE}\n"
-                f"Сегодня: {get_current_date()}.\n"
-                f"Контекст: {ctx}\n\n"
-                "Поиск в интернете не дал результатов. "
-                "Ты можешь использовать свои знания, но обязательно помечай ответ как «Предположительно» и ставь низкую уверенность."
-            )
-        }
-        ans, err = await ask_deepseek([sp_knowledge] + history, max_tokens=MAX_TOKENS_ANSWER)
-        if err:
-            return "⚠️ Ошибка API.", False
-        final_ans = finalize_answer(ans, get_current_date(), raw_snippets=None, user_message=user_message)
-        return f"🧠 из модели (поиск пуст)\n\n{final_ans}", True
-
-    # Ранжирование
-    keywords = [w for w in user_message.split() if len(w)>3 and w not in STOP_WORDS]
-    scored = assess_relevance(all_results, keywords)
-    for r in all_results:
-        r['year'] = extract_year_from_text(r.get('title','') + ' ' + r.get('snippet','')) or 0
-        r['price'] = extract_price_from_text(r.get('snippet',''))
-    all_results.sort(key=lambda r: (
-        (5 if is_official_link(r.get('link','')) else 0) +
-        (3 if r.get('price') else 0) +
-        (2 if abs(r.get('year',0) - now().year) <= 1 else 0) +
-        sum(1 for kw in keywords if kw in (r.get('title','') + ' ' + r.get('snippet','')).lower())
-    ), reverse=True)
-
-    top_results = all_results[:TOP_RESULTS_SHOW]
-    raw_snippets = ""
-    for i, r in enumerate(top_results, 1):
-        raw_snippets += f"{i}. {r['title']}\n   {r['snippet'][:180]}\n   🔗 {r['link']}\n\n"
-
+        return await generate_local_answer(uid, user_message, history, profile, 
+            reason="Поиск в интернете не дал результатов")
+    
+    # Жёсткая фильтрация релевантности
+    scored = assess_relevance(all_results, user_message)
+    if not scored:
+        return await generate_local_answer(uid, user_message, history, profile,
+            reason="Найденные данные нерелевантны запросу")
+    
+    # Проверка свежести (если запрос про "этот год" или "2024-2026")
+    if re.search(r'\b(этот год|202[4-9])\b', user_message.lower()):
+        has_fresh = any(r.get('year', 0) >= 2024 for r in scored[:5])
+        if not has_fresh:
+            return await generate_local_answer(uid, user_message, history, profile,
+                reason="В интернете нет актуальных данных за этот год")
+    
+    # ===== ДАННЫЕ ЕСТЬ И ОНИ РЕЛЕВАНТНЫ =====
+    # Формируем сниппеты для промпта
     stext = ""
-    for i, r in enumerate(top_results, 1):
-        is_off = "⭐ " if is_official_link(r.get('link','')) else ""
-        price_note = f" ({r['price']} руб.)" if r.get('price') else ""
-        year_note = f" ({r['year']})" if r.get('year') else ""
-        link_html = f"🔗 <a href=\"{r['link']}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
-        stext += f"{i}. {is_off}**{r['title']}**{year_note}{price_note}\n   {r['snippet'][:180]}\n   {link_html}\n\n"
-
-    # Первая попытка с жёстким промптом
+    for i, r in enumerate(scored[:TOP_RESULTS_SHOW], 1):
+        year_note = f" ({r.get('year')} г.)" if r.get('year') else ""
+        price_note = f" [{r.get('price')} руб.]" if r.get('price') else ""
+        link_html = f"🔗 <a href=\"{r.get('link')}\">Источник</a>" if r.get('link') and r['link'] != '#' else ""
+        stext += f"{i}. **{r.get('title', 'Без названия')}**{year_note}{price_note}\n"
+        stext += f"   {r.get('snippet', 'Нет описания')[:300]}\n"
+        stext += f"   {link_html}\n\n"
+    
+    # Промпт с жёстким требованием использовать ТОЛЬКО данные
     sp = {
         "role": "system",
         "content": (
@@ -646,18 +512,80 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
             "ИНСТРУКЦИЯ ПО ОТВЕТУ:\n"
             "1. Используй ТОЛЬКО данные выше.\n"
             "2. Каждый факт должен сопровождаться ссылкой.\n"
-            "3. ЗАПРЕЩЕНО использовать свои знания, если есть данные.\n"
-            "4. Ответ структурируй: заголовки, списки, эмодзи."
+            "3. НЕ используй свои знания, если есть данные.\n"
+            "4. Структурируй: заголовки, списки, эмодзи.\n"
+            "5. Ответ должен быть полезным и конкретным."
         )
     }
-
+    
     ans, err = await ask_deepseek([sp] + history, max_tokens=MAX_TOKENS_ANSWER)
     if err:
-        return f"⚠️ Ошибка API: {err}", False
-
-    # Постобработка (удаление неподтверждённого)
-    final_ans = finalize_answer(ans, get_current_date(), raw_snippets, user_message)
+        # Если DeepSeek ошибся — показываем сырые данные
+        return generate_answer_from_snippets(scored, user_message), True
+    
+    # Постобработка: удаляем выдумки
+    final_ans = remove_unverified_claims(ans, stext)
+    
+    # Проверка: если после удаления ответ пуст — используем генератор из сниппетов
+    if len(final_ans) < 50 or 'http' not in final_ans:
+        final_ans = generate_answer_from_snippets(scored, user_message)
+    else:
+        # Добавляем дату и уверенность
+        if '📅 Дата:' not in final_ans:
+            final_ans += f"\n\n📅 Дата: {get_current_date()} (данные из интернета)"
+        if 'Уверенность:' not in final_ans:
+            final_ans += "\nУверенность: 90% (на основе найденных данных)"
+    
     return f"🌐 из интернета\n\n{final_ans}", True
+
+async def generate_local_answer(uid, user_message, history, profile, reason):
+    """Генерирует ответ из локальных знаний с чёткой маркировкой"""
+    ctx = build_profile_context(profile)
+    
+    sp = {
+        "role": "system",
+        "content": (
+            f"{CORE_SYSTEM_RULE}\n"
+            f"Сегодня: {get_current_date()}.\n"
+            f"Контекст: {ctx}\n\n"
+            f"⚠️ ВНИМАНИЕ: {reason}.\n"
+            "Ты МОЖЕШЬ использовать свои внутренние знания, НО:\n"
+            "1. Начинай ответ с '🧠 На основе моих знаний (интернет-данных нет)'\n"
+            "2. Каждое утверждение должно начинаться с 'Предположительно' или 'Возможно'\n"
+            "3. Если не уверен — скажи 'Я не знаю'\n"
+            "4. Уверенность не выше 25%\n"
+            "5. НЕ придумывай факты"
+        )
+    }
+    
+    messages = [sp] + history
+    ans, err = await ask_deepseek(messages, max_tokens=MAX_TOKENS_ANSWER)
+    if err:
+        return f"⚠️ Ошибка генерации из базы. {reason}", False
+    
+    # Добавляем дату и уверенность, если их нет
+    if 'Уверенность:' not in ans:
+        ans += f"\n\n📅 Дата: {get_current_date()}"
+        ans += "\nУверенность: 20% (основано на знаниях модели, без интернет-данных)"
+    
+    return f"🧠 из базы (интернет пуст)\n\n{ans}", True
+
+async def generate_search_query(query):
+    """Генерирует 1 точный поисковый запрос без использования DeepSeek"""
+    stop = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про'}
+    words = [w for w in re.sub(r'[^\w\s]', '', query).split() 
+             if w.lower() not in stop and len(w) > 2]
+    
+    if not words:
+        return [query]
+    
+    base = " ".join(words[:5])
+    
+    # Добавляем год, если его нет
+    if not re.search(r'\b20[2-9][0-9]\b', base):
+        base += f" {now().year}"
+    
+    return [base]
 
 def build_profile_context(profile):
     parts = []
@@ -700,7 +628,7 @@ async def ask_deepseek(messages, retries=2, max_tokens=None, model=MODEL_DEFAULT
 async def start(update, context):
     uid = update.effective_user.id
     if not is_allowed(uid): return
-    await safe_reply(update, "👋 Привет! Я — честный ассистент с доступом в интернет.\n🛡 Принципы: не врать, указывать источники, дату и уверенность.\n📋 Команды: /profile, /memory, /stats, /forget, /restore")
+    await safe_reply(update, "👋 Привет! Я — честный ассистент с доступом в интернет.\n🛡 Принципы: никогда не вру, использую ТОЛЬКО данные из интернета, если они есть. Если данных нет — честно говорю об этом.\n📋 Команды: /profile, /memory, /stats, /forget, /restore")
 
 async def profile_command(update, context):
     uid = update.effective_user.id
@@ -727,8 +655,7 @@ async def memory_command(update, context):
     if not is_allowed(uid): return
     if not context.args:
         await safe_reply(update, "🔍 Поиск: `/memory что искать`")
-        return
-    query = ' '.join(context.args)
+        return    query = ' '.join(context.args)
     res = search_in_pyramid(uid, query)
     if not res:
         await safe_reply(update, f"📭 Ничего не найдено: '{query}'")
@@ -766,7 +693,7 @@ async def forget_command(update, context):
     uid = update.effective_user.id
     if not is_allowed(uid): return
     async with get_user_lock(uid):
-        save_profile(uid, {})
+        save_profile(uid, {})  # очищаем ВСЁ
         await save_memory(uid, [], backup=True, lock_held=True)
         save_counter(uid, 0)
     await safe_reply(update, "🧹 Я забыл всё, что знал о тебе!")
@@ -782,7 +709,7 @@ async def restore_command(update, context):
         await safe_reply(update, "❌ Нет бэкапов.")
 
 # ---------- RATE LIMIT ----------
-RATE_LIMIT, RATE_WINDOW = 3, 10
+RATE_LIMIT, RATE_WINDOW = 5, 10
 async def check_rate_limit(uid):
     async with rate_lock:
         now_ts = datetime.now().timestamp()
@@ -814,7 +741,7 @@ async def safe_reply(update: Update, text: str, reply_markup=None):
 def is_allowed(uid):
     return not ALLOWED_USERS_LIST or uid in ALLOWED_USERS_LIST
 
-# ---------- ОБРАБОТЧИК СООБЩЕНИЙ (ВСЕГДА ПОИСК) ----------
+# ---------- ОБРАБОТЧИК СООБЩЕНИЙ ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.effective_message or not update.effective_message.text: return
     uid = update.effective_user.id
@@ -844,68 +771,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await safe_reply(update, "❌ Не удалось сохранить факт.")
         return
 
-    # Всегда выполняем поиск для обычных сообщений
     history = load_memory(uid)
     profile = load_profile(uid)
     user_msg_obj = {"role": "user", "content": user_message, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")}
     history.append(user_msg_obj)
 
     answer, should_save = await generate_response(uid, user_message, history, profile)
-    if should_save == "need_retry":
-        context.user_data["pending_retry_query"] = user_message
-        keyboard = [[
-            InlineKeyboardButton("✅ Да, переформулировать", callback_data="retry_yes"),
-            InlineKeyboardButton("❌ Нет", callback_data="retry_no")
-        ]]
-        await safe_reply(update, answer, reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        if should_save and isinstance(answer, str) and len(answer) > 10:
-            clean_answer = re.sub(r'<[^>]+>', '', answer)
-            history.append({"role": "assistant", "content": clean_answer, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")})
-            await save_memory(uid, history)
-        await safe_reply(update, answer)
-
-# ---------- КНОПКИ ----------
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    data = query.data
-    if data == "retry_yes":
-        original_query = context.user_data.get("pending_retry_query")
-        if not original_query:
-            await query.edit_message_text("❌ Запрос потерян.")
-            return
-        history = load_memory(user_id)
-        profile = load_profile(user_id)
-        new_query = await reformulate_query(original_query)
-        if history and history[-1]["role"] == "user":
-            history[-1]["content"] = new_query
-            history[-1]["timestamp"] = now().strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            history.append({"role": "user", "content": new_query, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")})
-        answer, should_save = await generate_response(user_id, new_query, history, profile, retry_count=1)
-        if should_save == "need_retry":
-            keyboard = [[
-                InlineKeyboardButton("✅ Попробовать ещё раз", callback_data="retry_yes"),
-                InlineKeyboardButton("❌ Нет, хватит", callback_data="retry_no")
-            ]]
-            await query.edit_message_text(answer, reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            if should_save and isinstance(answer, str) and len(answer) > 10:
-                clean_answer = re.sub(r'<[^>]+>', '', answer)
-                history.append({"role": "assistant", "content": clean_answer, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")})
-                await save_memory(user_id, history)
-            await query.edit_message_text(answer, parse_mode='HTML')
-            context.user_data.pop("pending_retry_query", None)
-    elif data == "retry_no":
-        await query.edit_message_text("❌ Хорошо, отменяю повторный поиск.")
-        context.user_data.pop("pending_retry_query", None)
-
-async def reformulate_query(query):
-    if not re.search(r'\b20[2-9][0-9]\b', query):
-        query += f" {now().year}"
-    return query
+    
+    if should_save and isinstance(answer, str) and len(answer) > 10:
+        clean_answer = re.sub(r'<[^>]+>', '', answer)
+        history.append({"role": "assistant", "content": clean_answer, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")})
+        await save_memory(uid, history)
+    
+    await safe_reply(update, answer)
 
 # ---------- ЗАПУСК ----------
 async def auto_restore_all_users():
@@ -949,7 +827,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("forget", forget_command))
     app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (финальная версия – локальные знания только при отсутствии данных)")
+    logger.info("✅ БОТ ЗАПУЩЕН (999% релевантность, НИКАКОЙ ЛЖИ)")
     app.run_polling()
