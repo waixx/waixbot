@@ -318,14 +318,15 @@ def remove_unverified_claims(ans, raw_snippets):
     return ans
 
 def generate_answer_from_snippets(raw_snippets, user_message, max_items=10):
-    """Формирует ответ из релевантных найденных ссылок, отфильтровывая мусор."""
+    """Формирует ответ из найденных ссылок, отсортированных по релевантности запросу."""
     if not raw_snippets:
         return "❌ В интернете ничего не найдено по вашему запросу."
     
-    # Извлекаем ключевые слова из запроса (исключая стоп-слова)
-    stop_words = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про','китайские','китайских','какую','самый','самые'}
+    # Извлекаем ключевые слова из запроса (убираем стоп-слова)
+    stop_words = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про','китайские','китайских','какую','самый','самые','года','год'}
     words = [w.lower() for w in re.sub(r'[^\w\s]', '', user_message).split() if w.lower() not in stop_words and len(w) > 2]
     
+    # Разбираем сырые сниппеты на элементы
     lines = raw_snippets.split('\n')
     items = []
     current_title = None
@@ -345,23 +346,26 @@ def generate_answer_from_snippets(raw_snippets, user_message, max_items=10):
             current_snippet = line
             
         if current_title and current_link:
-            # Проверка релевантности: должен быть хотя бы один ключевой термин из запроса
-            text_for_check = (current_title + ' ' + current_snippet).lower()
-            is_relevant = any(word in text_for_check for word in words) if words else True
-            if is_relevant:
-                items.append({
-                    'title': current_title[:100],
-                    'snippet': current_snippet[:200] if current_snippet else "Нет описания",
-                    'link': current_link
-                })
-                if len(items) >= max_items:
-                    break
+            # Вычисляем релевантность: количество совпадений ключевых слов
+            text = (current_title + ' ' + current_snippet).lower()
+            relevance = sum(1 for word in words if word in text) if words else 1
+            items.append({
+                'title': current_title[:100],
+                'snippet': current_snippet[:200] if current_snippet else "Нет описания",
+                'link': current_link,
+                'relevance': relevance
+            })
             current_title = None
             current_link = None
             current_snippet = ""
     
-    if not items:
-        # Если не нашлось релевантных, но есть ссылки – показываем их без фильтра
+    # Сортируем по релевантности (по убыванию)
+    items.sort(key=lambda x: x['relevance'], reverse=True)
+    
+    # Берём только релевантные (relevance > 0) или топ, если все релевантны
+    relevant_items = [item for item in items if item['relevance'] > 0]
+    if not relevant_items:
+        # Если ничего не нашлось – показываем все ссылки (без фильтрации)
         links = re.findall(r'(https?://[^\s]+)', raw_snippets)
         if links:
             answer = "🔍 **Найденные результаты (прямые ссылки):**\n\n"
@@ -373,8 +377,11 @@ def generate_answer_from_snippets(raw_snippets, user_message, max_items=10):
         else:
             return f"Найденные данные:\n\n{raw_snippets[:1000]}"
     
+    # Берём топ-N релевантных
+    top_items = relevant_items[:max_items]
+    
     answer = f"🔍 **Результаты поиска по запросу:** {user_message[:100]}\n\n"
-    for i, item in enumerate(items, 1):
+    for i, item in enumerate(top_items, 1):
         answer += f"{i}. <b>{item['title']}</b>\n"
         if item['snippet'] and item['snippet'] != "Нет описания":
             answer += f"   {item['snippet']}\n"
