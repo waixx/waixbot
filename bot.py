@@ -1,5 +1,5 @@
 # ============================================================
-#  BroWaix Bot — финальная версия
+#  BroWaix Bot — финальная версия (исправлена ошибка int())
 #  (LLM-оптимизация, дата/уверенность/ссылки по умолчанию, 3 варианта)
 # ============================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
@@ -215,14 +215,21 @@ async def save_memory(uid, history, backup=True, lock_held=False):
     if lock_held: return await _save_memory_impl(uid, history, backup)
     async with get_user_lock(uid): return await _save_memory_impl(uid, history, backup)
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
+# ---------- ВСПОМОГАТЕЛЬНЫЕ (ИСПРАВЛЕННЫЕ) ----------
 def extract_year_from_text(text):
-    m = re.search(r'\b(20[2-9][0-9])\b', text)
-    return int(m.group(1)) if m else None
+    match = re.search(r'\b(20[2-9][0-9])\b', text)
+    if match:
+        year_str = match.group(1)
+        if year_str.isdigit():
+            return int(year_str)
+    return None
 
 def extract_price_from_text(text):
     match = re.search(r'([\d\s]+)\s*(?:руб|₽|р\.|рублей|RUB)', text, re.I)
-    if match: return int(re.sub(r'\s', '', match.group(1)))
+    if match:
+        price_str = re.sub(r'\s', '', match.group(1))
+        if price_str.isdigit():
+            return int(price_str)
     return None
 
 def is_official_link(link):
@@ -282,34 +289,24 @@ def highlight_contradictions(text):
             highlighted.append(sent)
     return ' '.join(highlighted), found
 
-# ---------- УЛУЧШЕННАЯ POST-ОБРАБОТКА (ДОБАВЛЯЕТ ДАТУ, УВЕРЕННОСТЬ, ССЫЛКИ) ----------
+# ---------- УЛУЧШЕННАЯ POST-ОБРАБОТКА ----------
 def finalize_answer(ans, current_date):
-    """Постобработка: добавляет дату, уверенность, ссылки по умолчанию, если их нет."""
-    # Проверка противоречий
     highlighted, has_contradiction = highlight_contradictions(ans)
     if has_contradiction:
         ans = highlighted
         ans = f"⚠️ В ответе есть возможные противоречия (выделены жирным).\n\n{ans}"
-    
-    # Если нет даты – добавляем
     if '📅 Дата:' not in ans and 'дата' not in ans.lower():
         ans += f"\n\n📅 Дата: дата не указана (проверьте актуальность на {current_date})"
-    
-    # Если нет уверенности – добавляем
     if 'Уверенность:' not in ans:
-        # Определяем, есть ли данные вообще
         if 'Я не знаю' in ans or 'не нашел' in ans:
             ans += "\n\nУверенность: 0% (данных нет)"
         else:
             ans += "\n\nУверенность: 5% (предположительно)"
-    
-    # Если нет ссылок – добавляем
     if 'http' not in ans and 'ссылки' not in ans.lower():
         ans += "\n\n🔗 Ссылки: не найдены"
-    
     return ans
 
-# ---------- ОПТИМИЗАЦИЯ ЗАПРОСА ЧЕРЕЗ LLM ----------
+# ---------- ОПТИМИЗАЦИЯ ЗАПРОСА ЧЕРЕЗ LLM (С ПАДЕНИЕМ НА ШАБЛОНЫ) ----------
 async def optimize_query(query, profile=None):
     """Генерирует 3 коротких поисковых запроса через LLM с учётом контекста."""
     context_prompt = ""
@@ -337,12 +334,36 @@ async def optimize_query(query, profile=None):
     try:
         result, err = await ask_deepseek(messages, max_tokens=100, model=MODEL_DEFAULT)
         if err or not result:
-            return [query]
+            logger.warning("LLM не вернул варианты, используем шаблоны")
+            return await fallback_queries(query)
         variants = [v.strip() for v in result.split('|') if v.strip()]
-        return variants[:3] if len(variants) >= 2 else [query]
+        if len(variants) < 2:
+            logger.warning("LLM вернул менее 2 вариантов, дополняем шаблонами")
+            return await fallback_queries(query, base_variants=variants)
+        return variants[:SEARCH_VARIANTS_COUNT]
     except Exception as e:
-        logger.warning(f"Ошибка оптимизации запроса: {e}")
+        logger.warning(f"Ошибка оптимизации запроса: {e}, используем шаблоны")
+        return await fallback_queries(query)
+
+async def fallback_queries(query, base_variants=None):
+    """Генерирует шаблонные запросы на случай сбоя LLM."""
+    # Извлекаем ключевые слова из запроса
+    stop = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про','китайские','китайских'}
+    words = [w for w in re.sub(r'[^\w\s]', '', query.lower()).split() if w not in stop and len(w)>2]
+    if not words:
         return [query]
+    base = " ".join(words[:4])
+    if not re.search(r'\b20[2-9][0-9]\b', base):
+        base += f" {now().year}"
+    variants = [base, base + " рейтинг", base + " обзор", base + " сравнение"]
+    # Если есть дополнительные варианты от LLM, добавляем их
+    if base_variants:
+        for v in base_variants:
+            if v not in variants:
+                variants.append(v)
+    # Ограничиваем количество
+    variants = list(dict.fromkeys(variants))
+    return variants[:SEARCH_VARIANTS_COUNT]
 
 # ---------- ПОИСКОВЫЕ ФУНКЦИИ ----------
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
@@ -421,7 +442,6 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
     if cached:
         all_results = cached
     else:
-        # Генерация запросов через LLM (с учётом контекста)
         variants = await optimize_query(user_message, profile)
         logger.info(f"🔍 Варианты: {len(variants)}")
         tasks = [search_apiserpent_async(v, SEARCH_RESULTS_NUM) for v in variants]
@@ -435,7 +455,6 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
                 if link and link not in seen:
                     seen.add(link)
                     all_results.append(res)
-        # Если APISerpent не дал результатов, пробуем DuckDuckGo
         if not all_results:
             logger.info("🔄 APISerpent пуст, пробуем DuckDuckGo")
             duck_results = await search_duckduckgo_async(variants[0] if variants else user_message)
@@ -448,7 +467,6 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         set_cache(user_message, all_results)
 
     if not all_results:
-        # Fallback: пробуем ответить из знаний модели
         sp_knowledge = {
             "role": "system",
             "content": (
@@ -467,7 +485,6 @@ async def _generate_response_internal(uid, user_message, history, profile, retry
         final_ans = finalize_answer(ans, get_current_date())
         return f"🧠 из модели (поиск пуст)\n\n{final_ans}", True
 
-    # Ранжирование результатов
     keywords = [w for w in user_message.split() if len(w)>3 and w not in STOP_WORDS]
     scored = assess_relevance(all_results, keywords)
     for r in all_results:
@@ -705,7 +722,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msg_obj = {"role": "user", "content": user_message, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")}
     history.append(user_msg_obj)
 
-    # Локальная классификация (без LLM)
     simple_patterns = [r'^привет', r'^как дела', r'^спасибо', r'^ты кто', r'^что умеешь', r'^напиши код', r'^напиши стих', r'^помоги']
     needs_search = not any(re.search(pat, user_message.lower()) for pat in simple_patterns)
 
@@ -821,5 +837,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (финальная версия, LLM-оптимизация, дата/уверенность/ссылки)")
+    logger.info("✅ БОТ ЗАПУЩЕН (финальная версия, без ошибок int())")
     app.run_polling()
