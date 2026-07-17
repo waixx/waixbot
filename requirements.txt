@@ -3,4 +3,4 @@ beautifulsoup4==4.12.3
 lxml==5.1.0
 python-telegram-bot==20.8
 python-dotenv==1.0.1
-playwright==1.46.0
+# playwright НЕ нужно указывать — он уже есть в образе
