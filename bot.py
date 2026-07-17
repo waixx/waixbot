@@ -1,6 +1,7 @@
 # ================================================================
-#  Universal Bot — АДАПТИРОВАН ПОД ВАШИ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-#  Читает: DEEPSEEK_API_KEY, APISERPENT_API_KEY, MODEL_DEFAULT и др.
+#  Universal Bot — ИСПРАВЛЕННАЯ ВЕРСИЯ (стабильный запуск)
+#  Адаптирован под ваши переменные: DEEPSEEK_API_KEY, APISERPENT_API_KEY и др.
+#  Исправлена ошибка event loop (убраны конфликты с run_polling)
 # ================================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib, uuid
 from datetime import datetime, timedelta
@@ -30,7 +31,6 @@ load_dotenv()
 
 # ---------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (АДАПТИРОВАНЫ) ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-# Ваши имена:
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 APISERPENT_API_KEY = os.getenv("APISERPENT_API_KEY")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or 0)
@@ -47,13 +47,13 @@ def get_current_time(): return now().strftime("%H:%M")
 # ---------- ПАРАМЕТРЫ LLM И ПОИСКА (АДАПТИРОВАНЫ) ----------
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-chat")
-MODEL_FALLBACK = "deepseek-chat"  # можно вынести в переменную, если добавите
-SEARCH_ENGINE = "google"  # можно переопределить, если добавите переменную
+MODEL_FALLBACK = "deepseek-chat"  # если хотите, можно добавить переменную
+SEARCH_ENGINE = "google"  # можно вынести в переменную
 
-# ---------- ОПТИМИЗИРОВАННЫЕ ПАРАМЕТРЫ (с поддержкой ваших переменных) ----------
+# ---------- ОПТИМИЗИРОВАННЫЕ ПАРАМЕТРЫ ----------
 SEARCH_RESULTS_NUM = int(os.getenv("SEARCH_RESULTS_NUM", "3"))
-TOP_RESULTS_SHOW = int(os.getenv("TOP_RESULTS_SHOW", "3"))  # можно добавить
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))  # если добавите
+TOP_RESULTS_SHOW = int(os.getenv("TOP_RESULTS_SHOW", "3"))
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
 MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 172800  # 2 дня
 MAX_TOKENS_ANSWER = int(os.getenv("MAX_TOKENS_ANSWER", "1024"))
@@ -67,7 +67,7 @@ LEVEL_1 = {
 LEVEL_2 = {'compress_interval': 20, 'compress_to': 30}
 CACHE_CLEANUP_INTERVAL = 3600
 
-# Валидация (теперь проверяем TELEGRAM_TOKEN и DEEPSEEK_API_KEY)
+# Валидация
 if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     logger.error("❌ TELEGRAM_TOKEN или DEEPSEEK_API_KEY не заданы")
     sys.exit(1)
@@ -625,7 +625,7 @@ async def _generate_response_internal(uid, user_message, history, profile):
     answer_cache[cache_key] = result
     return result, True
 
-# ---------- ЗАПРОС К LLM (теперь использует DEEPSEEK_API_KEY) ----------
+# ---------- ЗАПРОС К LLM ----------
 async def ask_llm(messages, retries=2, max_tokens=None, model=None):
     if model is None:
         model = MODEL_DEFAULT
@@ -926,10 +926,6 @@ async def auto_restore_all_users():
     except Exception as ex:
         logger.error(f"Ошибка auto_restore: {ex}")
 
-async def post_init_callback(application):
-    """Корутина, вызываемая после инициализации приложения"""
-    asyncio.create_task(cleanup_caches())
-
 async def main():
     global _session_lock, _rate_lock
     _session_lock = asyncio.Lock()
@@ -937,7 +933,7 @@ async def main():
 
     await auto_restore_all_users()
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init_callback).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile_command))
@@ -948,11 +944,25 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("🚀 БОТ ЗАПУЩЕН (адаптирован под ваши переменные)")
+    # Запускаем фоновую задачу без post_init
+    asyncio.create_task(cleanup_caches())
+
+    logger.info("🚀 БОТ ЗАПУЩЕН (исправленная версия)")
     try:
         await app.run_polling()
     finally:
         await cleanup_http_session()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Используем get_event_loop, чтобы избежать конфликтов с asyncio.run()
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            loop.run_until_complete(cleanup_http_session())
+        except:
+            pass
+        loop.close()
