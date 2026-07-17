@@ -1,8 +1,11 @@
 # ================================================================
-#  BroWaix Bot — ОПТИМИЗИРОВАННАЯ ВЕРСИЯ (5 сайтов, умный фильтр)
-#  - DeepSeek отсеивает рекламу до парсинга
-#  - Без агрессивного фильтра (remove_unverified_claims)
-#  - Бюджет ~$5–7/мес при 100 запросах/день
+#  BroWaix Bot — ИТОГОВАЯ СТАБИЛЬНАЯ ВЕРСИЯ
+#  - Убран агрессивный фильтр
+#  - Умный фильтр рекламы через DeepSeek
+#  - 5 сайтов для парсинга
+#  - Корректное закрытие сессии
+#  - Индикатор статуса в Telegram
+#  - Вечная память, бэкапы, честность
 # ================================================================
 
 import logging
@@ -26,7 +29,6 @@ from telegram.ext import (
 )
 from logging.handlers import RotatingFileHandler
 
-# ---------- ЛОГИРОВАНИЕ ----------
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 handler = RotatingFileHandler("bot.log", maxBytes=10*1024*1024, backupCount=3)
@@ -60,12 +62,12 @@ MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
-SEARCH_RESULTS_NUM = 10          # запрашиваем 10
-TOP_RESULTS_SHOW = 5             # парсим 5
+SEARCH_RESULTS_NUM = 10
+TOP_RESULTS_SHOW = 5
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
-CACHE_TTL = 172800               # 2 дня
-MAX_TOKENS_ANSWER = 1000         # достаточно для структуры
+CACHE_TTL = 172800
+MAX_TOKENS_ANSWER = 1000
 MAX_HTML_LEN = 3000
 CACHE_CLEANUP_INTERVAL = 3600
 
@@ -104,6 +106,11 @@ async def get_http_session():
                 timeout=aiohttp.ClientTimeout(total=60, connect=10, sock_read=45)
             )
         return _http_session
+
+async def cleanup_http_session():
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
 
 # ---------- ФАЙЛОВЫЕ ОПЕРАЦИИ ----------
 def atomic_write(filename, data, as_json=True):
@@ -317,11 +324,9 @@ def assess_relevance(results, query):
 
 # ---------- УМНЫЙ ФИЛЬТР РЕКЛАМЫ (DeepSeek) ----------
 async def filter_links_by_relevance(results, user_message):
-    """Отправляет список ссылок в DeepSeek, просит отсеять рекламу и выбрать релевантные"""
     if len(results) <= 3:
         return results[:TOP_RESULTS_SHOW]
     
-    # Формируем список для анализа
     links_text = ""
     for i, r in enumerate(results, 1):
         links_text += f"{i}. Заголовок: {r.get('title', '')}\n   Сниппет: {r.get('snippet', '')}\n   Ссылка: {r.get('link', '')}\n\n"
@@ -329,31 +334,26 @@ async def filter_links_by_relevance(results, user_message):
     prompt = {
         "role": "system",
         "content": (
-            "Ты — фильтр веб-страниц. Ты получил список результатов поиска с заголовками, сниппетами и ссылками.\n"
-            "Твоя задача — выбрать ТОЛЬКО те ссылки, которые содержат релевантную информацию по запросу пользователя.\n"
-            "Отсеивай рекламу, маркетплейсы, страницы с навязчивой рекламой, кликбейт, сайты, не относящиеся к теме.\n"
+            "Ты — фильтр веб-страниц. Выбери ТОЛЬКО те ссылки, которые содержат релевантную информацию по запросу пользователя.\n"
+            "Отсеивай рекламу, маркетплейсы, кликбейт, сайты, не относящиеся к теме.\n"
             "Верни список НОМЕРОВ (через запятую) наиболее релевантных ссылок (от 3 до 5).\n"
             "Только номера, без пояснений."
         )
     }
     user_prompt = {
         "role": "user",
-        "content": f"Запрос пользователя: {user_message}\n\nСписок ссылок:\n{links_text}"
+        "content": f"Запрос: {user_message}\n\nСписок:\n{links_text}"
     }
     
     ans, err = await ask_deepseek([prompt, user_prompt], max_tokens=50)
     if err or not ans:
-        # Если DeepSeek не ответил — возвращаем первые 5
         return results[:TOP_RESULTS_SHOW]
     
-    # Парсим номера
     numbers = re.findall(r'\b(\d+)\b', ans)
     selected_indices = [int(n) - 1 for n in numbers if 0 <= int(n) - 1 < len(results)]
     selected_indices = selected_indices[:TOP_RESULTS_SHOW]
-    
     if not selected_indices:
         return results[:TOP_RESULTS_SHOW]
-    
     return [results[i] for i in selected_indices]
 
 # ---------- УНИВЕРСАЛЬНЫЙ ЗАГРУЗЧИК ----------
@@ -426,7 +426,6 @@ async def fetch_content(url: str) -> str:
             elif 'application/xml' in content_type or 'text/xml' in content_type:
                 xml_text = await resp.text()
                 result = xml_to_text(xml_text)
-                logger.info(f"✅ XML распарсен для {url[:50]}")
             elif 'text/plain' in content_type:
                 result = await resp.text()
                 result = result[:MAX_HTML_LEN]
@@ -590,7 +589,6 @@ async def _generate_response_internal(uid, user_message, history, profile, statu
         return ("🔍 Найденные данные нерелевантны.\n"
                 "Пожалуйста, уточните запрос.", False)
 
-    # --- УМНАЯ ФИЛЬТРАЦИЯ РЕКЛАМЫ (DeepSeek) ---
     if status_msg and update:
         status_msg = await update_status(update, "🧹 Отсеиваю рекламу...", status_msg)
     scored = await filter_links_by_relevance(scored, user_message)
@@ -604,10 +602,9 @@ async def _generate_response_internal(uid, user_message, history, profile, statu
     full_texts = []
     for r in scored[:TOP_RESULTS_SHOW]:
         content = await fetch_content(r['link'])
-        if content and len(content) > 500:  # если есть контент и он достаточно длинный
+        if content and len(content) > 500:
             full_texts.append(f"--- ИСТОЧНИК: {r['link']} ---\n{content}")
         else:
-            # запасной вариант — сниппет
             full_texts.append(
                 f"--- ИСТОЧНИК (сниппет): {r['link']} ---\n"
                 f"Заголовок: {r.get('title','')}\n"
@@ -952,7 +949,7 @@ async def cleanup_caches():
                 oldest = sorted(html_cache.keys(), key=lambda k: html_cache[k]['expires'])[:50]
                 for k in oldest:
                     del html_cache[k]
-            logger.debug(f"🧹 Кэши очищены (поиск: {len(search_cache)}, ответы: {len(answer_cache)}, HTML: {len(html_cache)})")
+            logger.debug(f"🧹 Кэши очищены")
         except asyncio.CancelledError:
             logger.info("🧹 Задача cleanup_caches корректно завершена")
             break
@@ -1010,8 +1007,11 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("🚀 БОТ ЗАПУЩЕН (5 сайтов, умный фильтр, честность)")
-    app.run_polling()
+    logger.info("🚀 БОТ ЗАПУЩЕН (стабильная версия)")
+    try:
+        app.run_polling()
+    finally:
+        loop.run_until_complete(cleanup_http_session())
 
 if __name__ == "__main__":
     main()
