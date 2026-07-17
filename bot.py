@@ -1,6 +1,5 @@
 # ================================================================
-#  Universal Bot — ФИНАЛЬНАЯ СТАБИЛЬНАЯ ВЕРСИЯ
-#  Запуск через app.run_polling() без ручного управления циклом
+#  Universal Bot — СТАБИЛЬНАЯ ВЕРСИЯ (с диагностикой)
 # ================================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib, uuid
 from datetime import datetime, timedelta
@@ -42,14 +41,14 @@ def now(): return datetime.now(TZ)
 def get_current_date(): return now().strftime("%d.%m.%Y")
 def get_current_time(): return now().strftime("%H:%M")
 
-# ---------- ПАРАМЕТРЫ LLM И ПОИСКА ----------
+# ---------- ПАРАМЕТРЫ ----------
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-chat")
 MODEL_FALLBACK = "deepseek-chat"
 SEARCH_ENGINE = "google"
 
 SEARCH_RESULTS_NUM = int(os.getenv("SEARCH_RESULTS_NUM", "3"))
-TOP_RESULTS_SHOW = int(os.getenv("TOP_RESULTS_SHOW", "3"))
+TOP_RESULTS_SHOW = 3
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
 MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 172800
@@ -454,37 +453,48 @@ def generate_answer_from_snippets(results, user_message, max_items=5):
     answer += f"📅 Дата: {get_current_date()}\nУверенность: 85%"
     return answer
 
-# ---------- ПОИСК ----------
-async def search_apiserpent_async(query):
+# ---------- ПОИСК (диагностика + повторные попытки) ----------
+async def search_apiserpent_async(query, retries=2):
     if not APISERPENT_API_KEY:
+        logger.warning("APISERPENT_API_KEY не задан")
         return []
     session = await get_http_session()
-    try:
-        logger.info(f"🔍 APISerpent: {query[:50]}...")
-        params = {"q": query, "engine": SEARCH_ENGINE, "num": SEARCH_RESULTS_NUM}
-        async with session.get(
-            "https://apiserpent.com/api/search",
-            params=params,
-            headers={"X-API-Key": APISERPENT_API_KEY},
-            timeout=20
-        ) as r:
-            if r.status != 200:
-                logger.warning(f"APISerpent статус: {r.status}")
-                return []
-            data = await r.json()
-            results = []
-            organic = data.get("results", {}).get("organic", []) if isinstance(data.get("results"), dict) else data.get("organic_results", [])
-            for x in organic[:SEARCH_RESULTS_NUM]:
-                if isinstance(x, dict):
-                    results.append({
-                        "title": str(x.get("title", ""))[:120],
-                        "snippet": str(x.get("snippet", ""))[:300],
-                        "link": str(x.get("url", x.get("link", "#")))[:120]
-                    })
-            return results
-    except Exception as e:
-        logger.warning(f"APISerpent ошибка: {type(e).__name__}: {str(e)}")
-        return []
+    
+    for attempt in range(retries):
+        try:
+            logger.info(f"🔍 APISerpent попытка {attempt+1}/{retries}: {query[:50]}...")
+            params = {
+                "q": query,
+                "engine": SEARCH_ENGINE,
+                "num": SEARCH_RESULTS_NUM,
+            }
+            async with session.get(
+                "https://apiserpent.com/api/search",
+                params=params,
+                headers={"X-API-Key": APISERPENT_API_KEY},
+                timeout=45  # увеличен с 20 до 45
+            ) as r:
+                logger.info(f"APISerpent статус: {r.status}")
+                if r.status != 200:
+                    text = await r.text()
+                    logger.warning(f"APISerpent ответ (статус {r.status}): {text[:200]}")
+                    continue
+                data = await r.json()
+                results = []
+                organic = data.get("results", {}).get("organic", []) if isinstance(data.get("results"), dict) else data.get("organic_results", [])
+                for x in organic[:SEARCH_RESULTS_NUM]:
+                    if isinstance(x, dict):
+                        results.append({
+                            "title": str(x.get("title", ""))[:120],
+                            "snippet": str(x.get("snippet", ""))[:300],
+                            "link": str(x.get("url", x.get("link", "#")))[:120]
+                        })
+                return results
+        except asyncio.TimeoutError:
+            logger.error(f"APISerpent таймаут (попытка {attempt+1})")
+        except Exception as e:
+            logger.error(f"APISerpent ошибка: {type(e).__name__}: {str(e)}")
+    return []
 
 async def search_duckduckgo_async(query):
     session = await get_http_session()
@@ -493,7 +503,7 @@ async def search_duckduckgo_async(query):
         async with session.get(
             "https://api.duckduckgo.com/",
             params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
-            timeout=8
+            timeout=10
         ) as r:
             if r.status != 200:
                 return []
@@ -513,7 +523,8 @@ async def search_duckduckgo_async(query):
                         "link": topic.get('FirstURL', '#')
                     })
             return results
-    except Exception:
+    except Exception as e:
+        logger.warning(f"DuckDuckGo ошибка: {type(e).__name__}: {str(e)}")
         return []
 
 async def search_primary(query):
@@ -528,12 +539,16 @@ async def generate_response(uid, user_message, history, profile):
     try:
         return await asyncio.wait_for(
             _generate_response_internal(uid, user_message, history, profile),
-            timeout=60
+            timeout=70
         )
     except asyncio.TimeoutError:
         return "⏰ Превышено время ожидания. Попробуйте позже.", False
 
 async def _generate_response_internal(uid, user_message, history, profile):
+    # Если запрос короткий – отвечаем без поиска
+    if len(user_message.split()) < 3:
+        return "👋 Привет! Чем могу помочь? Напишите конкретный вопрос, и я найду информацию в интернете.", False
+
     cache_key = hashlib.md5(user_message.encode()).hexdigest()
     if cache_key in answer_cache:
         logger.info("✅ Cache HIT (ответ LLM)")
@@ -550,15 +565,15 @@ async def _generate_response_internal(uid, user_message, history, profile):
 
     if not all_results:
         return (
-            "❌ По вашему запросу в интернете ничего не найдено.\n"
-            "Попробуйте перефразировать запрос.",
+            "🔍 По вашему запросу в интернете ничего не найдено.\n"
+            "Попробуйте перефразировать запрос или уточнить тему.",
             False
         )
 
     scored = assess_relevance(all_results, user_message)
     if not scored:
         return (
-            "❌ Найденные данные нерелевантны вашему запросу.\n"
+            "🔍 Найденные данные нерелевантны вашему запросу.\n"
             "Пожалуйста, уточните запрос.",
             False
         )
@@ -910,24 +925,21 @@ async def auto_restore_all_users():
         logger.error(f"Ошибка auto_restore: {ex}")
 
 async def post_init(application):
-    """Вызывается после инициализации приложения"""
     global _session_lock, _rate_lock
     _session_lock = asyncio.Lock()
     _rate_lock = asyncio.Lock()
     asyncio.create_task(cleanup_caches())
 
 def main():
-    # Явно создаём и устанавливаем цикл событий
+    # Явно создаём цикл событий
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
-    # Запускаем восстановление данных в этом цикле
-    loop.run_until_complete(auto_restore_all_users())
-    
-    # Создаём приложение
+    try:
+        loop.run_until_complete(auto_restore_all_users())
+    except Exception as e:
+        logger.error(f"Ошибка восстановления: {e}")
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-    
-    # Регистрируем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("memory", memory_command))
@@ -936,10 +948,8 @@ def main():
     app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    
-    logger.info("🚀 БОТ ЗАПУЩЕН (финальная стабильная версия)")
-    
-    # Запускаем бота, передавая созданный цикл
+
+    logger.info("🚀 БОТ ЗАПУЩЕН (стабильная версия с диагностикой)")
     app.run_polling()
 
 if __name__ == "__main__":
