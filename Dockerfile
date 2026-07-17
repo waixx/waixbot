@@ -1,8 +1,8 @@
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Устанавливаем Python 3.11 из официального репозитория deadsnakes
+# Устанавливаем Python 3.11 из deadsnakes PPA
 RUN apt-get update && apt-get install -y software-properties-common \
     && add-apt-repository ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y \
@@ -45,7 +45,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Устанавливаем Playwright и браузер (без install-deps, т.к. зависимости уже установлены)
+# Устанавливаем Playwright и браузер
 RUN pip3 install playwright && \
     playwright install chromium
 
