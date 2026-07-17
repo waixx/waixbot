@@ -1,13 +1,12 @@
 # ================================================================
-#  BroWaix Bot — УНИВЕРСАЛЬНАЯ СТАБИЛЬНАЯ ВЕРСИЯ
-#  - Загружает HTML, JSON, XML, plain text
-#  - Без агрессивного фильтра
-#  - APISerpent + Serper (резерв)
-#  - 5 ссылок для надёжности
-#  - Честный промпт, без выдумок
+#  BroWaix Bot — ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ
+#  - 40 ссылок, фильтрация, топ-7 по контенту
+#  - Статус-сообщения в Telegram + таймер
+#  - Задержка 0.2 сек, обработка 429
+#  - Бюджет ~$8–10/мес при 150 запросах/день
 # ================================================================
 
-import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib, xml.etree.ElementTree as ET
+import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib, time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -34,7 +33,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 APISERPENT_API_KEY = os.getenv("APISERPENT_API_KEY")
-SERPER_API_KEY = os.getenv("SERPER_API_KEY")          # резерв
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or 0)
 ALLOWED_USERS_LIST = [int(x.strip()) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip()]
 if ADMIN_USER_ID and ADMIN_USER_ID not in ALLOWED_USERS_LIST:
@@ -43,7 +42,6 @@ if ADMIN_USER_ID and ADMIN_USER_ID not in ALLOWED_USERS_LIST:
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow") or "UTC")
 def now(): return datetime.now(TZ)
 def get_current_date(): return now().strftime("%d.%m.%Y")
-def get_current_time(): return now().strftime("%H:%M")
 
 # ---------- ПАРАМЕТРЫ ----------
 MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-v4-flash")
@@ -51,13 +49,13 @@ MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
-SEARCH_RESULTS_NUM = 10
-TOP_RESULTS_SHOW = 5                     # 5 для надёжности
+SEARCH_RESULTS_NUM = 40
+TOP_RESULTS_SHOW = 7
 MODEL_TEMPERATURE = 0.1
-MAX_RETRY_ATTEMPTS = 1
+MAX_RETRY_ATTEMPTS = 2
 CACHE_TTL = 172800
-MAX_TOKENS_ANSWER = 1000
-MAX_HTML_LEN = 3000
+MAX_TOKENS_ANSWER = 1500
+MAX_HTML_LEN = 5000
 CACHE_CLEANUP_INTERVAL = 3600
 
 LEVEL_1 = {'max_history': 20, 'keep_recent': 5}
@@ -90,8 +88,8 @@ async def get_http_session():
     async with _session_lock:
         if _http_session is None or _http_session.closed:
             _http_session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=20, limit_per_host=10),
-                timeout=aiohttp.ClientTimeout(total=60, connect=10, sock_read=45)
+                connector=aiohttp.TCPConnector(limit=50, limit_per_host=10),
+                timeout=aiohttp.ClientTimeout(total=90, connect=15, sock_read=45)
             )
         return _http_session
 
@@ -212,7 +210,7 @@ async def save_memory(uid, history, backup=True, lock_held=False):
     if lock_held: return await _save_memory_impl(uid, history, backup)
     async with get_user_lock(uid): return await _save_memory_impl(uid, history, backup)
 
-# ---------- ФИЛЬТРАЦИЯ ----------
+# ---------- ФИЛЬТРАЦИЯ КЛЮЧЕВЫМИ СЛОВАМИ ----------
 def extract_year_from_text(text):
     match = re.search(r'\b(20[2-9][0-9])\b', text)
     if match and match.group(1).isdigit():
@@ -259,9 +257,9 @@ def assess_relevance(results, query):
                 year_score = -2
         total = keyword_score + year_score + domain_score
         scored.append({**res, 'score': total, 'year': year})
-    relevant = [r for r in scored if r['score'] > 1]
+    relevant = [r for r in scored if r['score'] > 0]
     relevant.sort(key=lambda x: x['score'], reverse=True)
-    return relevant[:TOP_RESULTS_SHOW]
+    return relevant
 
 def normalize_query(query):
     normalized = re.sub(r'[^\w\s]', '', query.lower())
@@ -286,105 +284,58 @@ def set_cache(query, data):
         oldest = min(search_cache.keys(), key=lambda k: search_cache[k]['time'])
         del search_cache[oldest]
 
-# ---------- УНИВЕРСАЛЬНЫЙ ЗАГРУЗЧИК (HTML, JSON, XML) ----------
-def json_to_text(data, indent=0) -> str:
-    if isinstance(data, dict):
-        lines = []
-        for key, value in data.items():
-            if isinstance(value, (dict, list)):
-                lines.append(f"{'  '*indent}{key}:")
-                lines.append(json_to_text(value, indent + 1))
-            else:
-                lines.append(f"{'  '*indent}{key}: {value}")
-        return "\n".join(lines)
-    elif isinstance(data, list):
-        lines = []
-        for i, item in enumerate(data):
-            if isinstance(item, (dict, list)):
-                lines.append(f"{'  '*indent}[{i+1}]:")
-                lines.append(json_to_text(item, indent + 1))
-            else:
-                lines.append(f"{'  '*indent}[{i+1}]: {item}")
-        return "\n".join(lines)
-    else:
-        return str(data)
-
-def xml_to_text(xml_str: str) -> str:
-    try:
-        root = ET.fromstring(xml_str)
-        texts = []
-        for elem in root.iter():
-            if elem.text and elem.text.strip():
-                texts.append(elem.text.strip())
-        return "\n".join(texts)[:MAX_HTML_LEN]
-    except Exception as e:
-        logger.warning(f"Ошибка парсинга XML: {e}")
-        return re.sub(r'<[^>]+>', ' ', xml_str)[:MAX_HTML_LEN]
-
-async def fetch_content(url: str) -> str:
-    now_time = datetime.now()
-    if url in html_cache and html_cache[url]["expires"] > now_time:
-        logger.info(f"✅ Cache HIT для {url[:50]}...")
-        return html_cache[url]["text"]
-
+# ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА С ЗАЩИТОЙ ----------
+async def fetch_multiple_pages(links, max_pages=40, top_k=7) -> list:
+    if not links:
+        return []
+    
     session = await get_http_session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/json,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": "https://www.google.com/",
     }
+    
+    async def fetch_one(url, semaphore):
+        async with semaphore:
+            # Задержка для смягчения нагрузки
+            await asyncio.sleep(0.2)
+            try:
+                async with session.get(url, headers=headers, timeout=30) as resp:
+                    if resp.status == 429:
+                        logger.warning(f"429 Too Many Requests для {url}, ждём 5 сек")
+                        await asyncio.sleep(5)
+                        async with session.get(url, headers=headers, timeout=30) as retry:
+                            if retry.status != 200:
+                                return None
+                            html = await retry.text()
+                    elif resp.status != 200:
+                        return None
+                    else:
+                        html = await resp.text()
+                    # Быстрая проверка на наличие текста
+                    text = re.sub(r'<[^>]+>', ' ', html)
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    if len(text) < 500 or not re.search(r'[а-яА-Я]', text):
+                        return None
+                    return {"url": url, "text": text[:MAX_HTML_LEN]}
+            except Exception as e:
+                logger.warning(f"Ошибка загрузки {url}: {e}")
+                return None
 
-    try:
-        async with session.get(url, headers=headers, timeout=20) as resp:
-            if resp.status != 200:
-                logger.warning(f"Не удалось загрузить {url}, статус {resp.status}")
-                return ""
+    semaphore = asyncio.Semaphore(10)  # максимум 10 параллельных запросов
+    tasks = [fetch_one(url, semaphore) for url in links[:max_pages]]
+    results = await asyncio.gather(*tasks)
+    
+    valid = [r for r in results if r is not None]
+    valid.sort(key=lambda x: len(x["text"]), reverse=True)
+    top = valid[:top_k]
+    
+    logger.info(f"📊 Загружено {len(links)} ссылок, отобрано {len(top)} с контентом")
+    return top
 
-            content_type = resp.headers.get('content-type', '').lower()
-            logger.info(f"📄 Тип контента для {url[:50]}: {content_type}")
-
-            result = ""
-
-            if 'text/html' in content_type:
-                html = await resp.text()
-                result = html[:MAX_HTML_LEN]
-            elif 'application/json' in content_type:
-                data = await resp.json()
-                result = json_to_text(data)
-                logger.info(f"✅ JSON распарсен для {url[:50]}, {len(result)} символов")
-            elif 'application/xml' in content_type or 'text/xml' in content_type:
-                xml_text = await resp.text()
-                result = xml_to_text(xml_text)
-                logger.info(f"✅ XML распарсен для {url[:50]}")
-            elif 'text/plain' in content_type:
-                result = await resp.text()
-                result = result[:MAX_HTML_LEN]
-            else:
-                text = await resp.text()
-                if len(text) > 100:
-                    result = text[:MAX_HTML_LEN]
-                    logger.info(f"⚠️ Неизвестный тип, но есть текст для {url[:50]}")
-                else:
-                    logger.warning(f"⚠️ Неизвестный формат {content_type} для {url}")
-                    return ""
-
-            if result:
-                html_cache[url] = {
-                    "text": result,
-                    "expires": now_time + timedelta(seconds=CACHE_TTL)
-                }
-                if len(html_cache) > 200:
-                    oldest = min(html_cache.keys(), key=lambda k: html_cache[k]["expires"])
-                    del html_cache[oldest]
-                return result
-
-    except Exception as e:
-        logger.warning(f"Ошибка загрузки {url}: {e}")
-
-    return ""
-
-# ---------- ПОИСК (APISerpent + Serper) ----------
+# ---------- ПОИСК ----------
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
     if not APISERPENT_API_KEY:
         return []
@@ -454,21 +405,36 @@ async def search_primary(query):
     logger.info("🔄 APISerpent пуст, пробуем Serper")
     return await search_serper_async(query)
 
+# ---------- ОТПРАВКА СТАТУСА И ТАЙМЕРА ----------
+async def send_status(update: Update, text: str, start_time: float, status_msg=None):
+    elapsed = int(time.time() - start_time)
+    full_text = f"{text} ⏱ {elapsed} сек"
+    if status_msg is None:
+        return await update.effective_message.reply_text(full_text)
+    else:
+        try:
+            await status_msg.edit_text(full_text)
+        except Exception:
+            pass
+        return status_msg
+
 # ---------- ГЕНЕРАЦИЯ ОТВЕТА ----------
-async def generate_response(uid, user_message, history, profile):
+async def generate_response(uid, user_message, history, profile, status_msg, update, start_time):
     try:
         return await asyncio.wait_for(
-            _generate_response_internal(uid, user_message, history, profile),
-            timeout=60
+            _generate_response_internal(uid, user_message, history, profile, status_msg, update, start_time),
+            timeout=90
         )
     except asyncio.TimeoutError:
         return "⏰ Превышено время ожидания. Попробуйте позже.", False
 
-async def _generate_response_internal(uid, user_message, history, profile):
+async def _generate_response_internal(uid, user_message, history, profile, status_msg, update, start_time):
     ctx = build_profile_context(profile)
 
     if len(user_message.split()) < 3:
         return "👋 Привет! Напишите конкретный вопрос, я поищу информацию в интернете.", False
+
+    status_msg = await send_status(update, "🔍 Ищу в интернете...", start_time, status_msg)
 
     cached = get_cached(user_message)
     if cached:
@@ -487,52 +453,66 @@ async def _generate_response_internal(uid, user_message, history, profile):
 
     scored = assess_relevance(all_results, user_message)
     if not scored:
-        return ("🔍 Найденные данные нерелевантны.\n"
-                "Пожалуйста, уточните запрос.", False)
+        all_links = [r['link'] for r in all_results[:40]]
+    else:
+        all_links = [r['link'] for r in scored[:40]]
 
-    full_texts = []
-    for r in scored[:TOP_RESULTS_SHOW]:
-        content = await fetch_content(r['link'])
-        if content and len(content) > 500:
-            full_texts.append(f"--- ИСТОЧНИК: {r['link']} ---\n{content}")
-        else:
-            full_texts.append(
+    status_msg = await send_status(update, f"📥 Загружаю {len(all_links)} страниц...", start_time, status_msg)
+
+    top_pages = await fetch_multiple_pages(all_links, max_pages=40, top_k=7)
+
+    if top_pages:
+        full_texts = [f"--- ИСТОЧНИК: {p['url']} ---\n{p['text']}" for p in top_pages]
+        status_msg = await send_status(update, f"🧠 Анализирую {len(top_pages)} страниц через DeepSeek...", start_time, status_msg)
+    else:
+        logger.info("⚠️ Не найдено страниц с контентом, используем сниппеты")
+        if scored:
+            full_texts = [
                 f"--- ИСТОЧНИК (сниппет): {r['link']} ---\n"
                 f"Заголовок: {r.get('title','')}\n"
                 f"Описание: {r.get('snippet','')}"
-            )
+                for r in scored[:TOP_RESULTS_SHOW]
+            ]
+        else:
+            full_texts = [
+                f"--- ИСТОЧНИК (сниппет): {r['link']} ---\n"
+                f"Заголовок: {r.get('title','')}\n"
+                f"Описание: {r.get('snippet','')}"
+                for r in all_results[:TOP_RESULTS_SHOW]
+            ]
+        status_msg = await send_status(update, "🧠 Анализирую сниппеты через DeepSeek...", start_time, status_msg)
 
     stext = "\n\n".join(full_texts) if full_texts else "Нет данных"
 
     sp = {
         "role": "system",
         "content": (
-            "Ты — честный ассистент. Ты получил содержимое страниц из интернета (HTML, JSON, XML или текст).\n"
-            "Твоя задача — извлечь из этих данных ТОЛЬКО фактологическую информацию, которая относится к запросу пользователя.\n"
+            "Ты — честный ассистент. Ты получил содержимое веб-страниц (HTML или сниппеты).\n"
+            "Твоя задача — извлечь из этих данных ТОЛЬКО фактологическую информацию.\n"
             "Правила:\n"
-            "1. Игнорируй теги, скрипты, стили, рекламу, меню, навигацию, футеры, хедеры.\n"
-            "2. Сосредоточься на фактах, цифрах, моделях, ценах, характеристиках, датах, именах, выводах.\n"
-            "3. Если в данных нет прямого ответа на запрос, напиши: 'В предоставленных данных не обнаружено прямого ответа на ваш запрос. Вот что удалось найти:' и извлеки максимально возможное.\n"
-            "4. Структурируй ответ: краткий вывод, затем блоки с заголовками, списками, таблицами, эмодзи.\n"
-            "5. Каждый факт сопровождай ссылкой на источник (URL указан в разделе ИСТОЧНИК).\n"
-            "6. НЕ придумывай, НЕ додумывай — только то, что есть в данных.\n"
+            "1. Если HTML — игнорируй теги, скрипты, стили, рекламу.\n"
+            "2. Если сниппет — используй как есть.\n"
+            "3. Сосредоточься на фактах, цифрах, моделях, ценах, характеристиках.\n"
+            "4. Если нет прямого ответа — напиши: 'В предоставленных данных не обнаружено прямого ответа. Вот что удалось найти:'\n"
+            "5. Структурируй ответ: краткий вывод, затем блоки с заголовками, списки, таблицы, эмодзи.\n"
+            "6. Каждый факт сопровождай ссылкой на источник.\n"
+            "7. НЕ придумывай, НЕ додумывай — только то, что есть в данных.\n"
             f"Запрос пользователя: {user_message}\n"
             f"Сегодня: {get_current_date()}\n"
             f"Контекст: {ctx}\n\n"
             f"ДАННЫЕ:\n{stext}\n\n"
-            "В конце ответа укажи: 📅 Дата, Уверенность: XX%."
+            "В конце укажи: 📅 Дата, Уверенность: XX%."
         )
     }
 
     ans, err = await ask_deepseek([sp] + history, max_tokens=MAX_TOKENS_ANSWER)
     if err or ans is None:
         logger.warning(f"DeepSeek не ответил: {err}")
-        return generate_answer_from_snippets(scored, user_message), True
+        return generate_answer_from_snippets(scored or all_results, user_message), True
 
-    # --- БЕЗ АГРЕССИВНОГО ФИЛЬТРА ---
     final_ans = ans
     if len(final_ans) < 50 or 'http' not in final_ans:
-        final_ans = generate_answer_from_snippets(scored, user_message)
+        final_ans = generate_answer_from_snippets(scored or all_results, user_message)
     else:
         if '📅 Дата:' not in final_ans:
             final_ans += f"\n\n📅 Дата: {get_current_date()}"
@@ -790,7 +770,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_msg_obj = {"role": "user", "content": user_message, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")}
         history.append(user_msg_obj)
 
-        answer, should_save = await generate_response(uid, user_message, history, profile)
+        start_time = time.time()
+        status_msg = await send_status(update, "🔍 Запускаю поиск...", start_time, None)
+
+        answer, should_save = await generate_response(uid, user_message, history, profile, status_msg, update, start_time)
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
         if should_save and isinstance(answer, str) and len(answer) > 10:
             clean_answer = re.sub(r'<[^>]+>', '', answer)
@@ -881,7 +869,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("🚀 БОТ ЗАПУЩЕН (универсальный, без агрессивного фильтра)")
+    logger.info("🚀 БОТ ЗАПУЩЕН (40 ссылок, статус, таймер, защита)")
     try:
         app.run_polling()
     finally:
