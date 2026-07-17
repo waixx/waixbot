@@ -288,26 +288,65 @@ async def fetch_and_clean(url: str) -> str:
         return html_cache[url]["text"]
     
     session = await get_http_session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    
+    # Первый набор заголовков (десктопный Chrome)
+    headers_desktop = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.google.com/",  # имитация перехода из поиска
     }
-    try:
-        async with session.get(url, headers=headers, timeout=15) as resp:
-            if resp.status == 200:
-                html = await resp.text()
-                clean_text = clean_html_to_text(html)
-                if clean_text:
-                    html_cache[url] = {
-                        "text": clean_text,
-                        "expires": now_time + timedelta(seconds=CACHE_TTL)
-                    }
-                    if len(html_cache) > 200:
-                        oldest = min(html_cache.keys(), key=lambda k: html_cache[k]["expires"])
-                        del html_cache[oldest]
-                    return clean_text
-            logger.warning(f"Не удалось загрузить {url}, статус {resp.status}")
-    except Exception as e:
-        logger.warning(f"Ошибка загрузки {url}: {e}")
+    # Мобильный User-Agent (запасной)
+    headers_mobile = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.google.com/",
+    }
+    
+    headers_list = [headers_desktop, headers_mobile]
+    
+    for attempt, headers in enumerate(headers_list, start=1):
+        try:
+            async with session.get(url, headers=headers, timeout=15) as resp:
+                logger.info(f"🔍 Загрузка {url} — статус {resp.status} (попытка {attempt})")
+                if resp.status == 200:
+                    html = await resp.text()
+                    clean_text = clean_html_to_text(html)
+                    if clean_text:
+                        html_cache[url] = {
+                            "text": clean_text,
+                            "expires": now_time + timedelta(seconds=CACHE_TTL)
+                        }
+                        if len(html_cache) > 200:
+                            oldest = min(html_cache.keys(), key=lambda k: html_cache[k]["expires"])
+                            del html_cache[oldest]
+                        return clean_text
+                    else:
+                        logger.warning(f"Очистка HTML не дала текста для {url}")
+                elif resp.status == 403:
+                    # Пробуем следующий заголовок
+                    logger.warning(f"403 Forbidden для {url}, пробуем другой User-Agent")
+                    continue
+                else:
+                    logger.warning(f"Не удалось загрузить {url}, статус {resp.status}")
+                    # Пробуем прочитать тело ответа для диагностики
+                    try:
+                        body = await resp.text()
+                        logger.warning(f"Тело ответа: {body[:200]}")
+                    except:
+                        pass
+                    break  # не повторяем для других кодов, кроме 403
+        except Exception as e:
+            logger.warning(f"Ошибка загрузки {url}: {type(e).__name__}: {str(e)}")
+            break
+    
     return ""
 
 # ---------- ИНСТРУМЕНТЫ УНИВЕРСАЛЬНОГО АНАЛИЗА ----------
