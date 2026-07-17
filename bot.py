@@ -1,7 +1,7 @@
 # ================================================================
-#  BroWaix Bot — ИТОГОВАЯ ВЕРСИЯ (DeepSeek сам очищает HTML)
-#  Принципы: честность, вечная память, глубокий анализ страниц
-#  Бюджет: ~$3–5/мес (DeepSeek + APISerpent)
+#  BroWaix Bot — ФИНАЛЬНАЯ ВЕРСИЯ (APISerpent + Serper)
+#  Исправлены: цикл asyncio, таймауты, удалены неработающие резервы
+#  Serper используется ТОЛЬКО при отказе APISerpent
 # ================================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib
 from datetime import datetime, timedelta
@@ -26,10 +26,11 @@ logger.addHandler(console)
 
 load_dotenv()
 
-# ---------- ПЕРЕМЕННЫЕ (ваши имена) ----------
+# ---------- ПЕРЕМЕННЫЕ ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 APISERPENT_API_KEY = os.getenv("APISERPENT_API_KEY")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")          # Резерв
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or 0)
 ALLOWED_USERS_LIST = [int(x.strip()) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip()]
 if ADMIN_USER_ID and ADMIN_USER_ID not in ALLOWED_USERS_LIST:
@@ -40,13 +41,13 @@ def now(): return datetime.now(TZ)
 def get_current_date(): return now().strftime("%d.%m.%Y")
 def get_current_time(): return now().strftime("%H:%M")
 
-# ---------- ПАРАМЕТРЫ (экономия) ----------
+# ---------- ПАРАМЕТРЫ ----------
 MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-v4-flash")
 MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
-SEARCH_RESULTS_NUM = 10          # запрашиваем 10, берём топ-3
+SEARCH_RESULTS_NUM = 10
 TOP_RESULTS_SHOW = 3
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
@@ -58,7 +59,8 @@ LEVEL_1 = {'max_history': 20, 'keep_recent': 5}
 LEVEL_2 = {'compress_interval': 20, 'compress_to': 30}
 
 if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
-    logger.error("Токены не заданы"); sys.exit(1)
+    logger.error("❌ TELEGRAM_TOKEN или DEEPSEEK_API_KEY не заданы")
+    sys.exit(1)
 
 DATA_DIR, BACKUP_DIR = "data", "data/backups"
 os.makedirs(DATA_DIR, exist_ok=True); os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -84,11 +86,11 @@ async def get_http_session():
         if _http_session is None or _http_session.closed:
             _http_session = aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(limit=20, limit_per_host=10),
-                timeout=aiohttp.ClientTimeout(total=45, connect=10, sock_read=30)
+                timeout=aiohttp.ClientTimeout(total=60, connect=10, sock_read=45)
             )
         return _http_session
 
-# ---------- ФАЙЛОВЫЕ ОПЕРАЦИИ (атомарные) ----------
+# ---------- ФАЙЛОВЫЕ ОПЕРАЦИИ ----------
 def atomic_write(filename, data, as_json=True):
     tmp = filename + ".tmp"
     try:
@@ -356,9 +358,10 @@ def generate_answer_from_snippets(results, user_message):
     answer += f"📅 Дата: {get_current_date()}\nУверенность: 85%"
     return answer
 
-# ---------- ПОИСК ----------
+# ---------- ПОИСК (APISerpent + Serper как резерв) ----------
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
-    if not APISERPENT_API_KEY: return []
+    if not APISERPENT_API_KEY:
+        return []
     session = await get_http_session()
     try:
         logger.info(f"🔍 APISerpent: {query[:50]}...")
@@ -367,7 +370,7 @@ async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
             "https://apiserpent.com/api/search",
             params=params,
             headers={"X-API-Key": APISERPENT_API_KEY},
-            timeout=20
+            timeout=45
         ) as r:
             if r.status != 200:
                 logger.warning(f"APISerpent статус: {r.status}")
@@ -383,45 +386,50 @@ async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
                         "link": str(x.get("url", x.get("link", "#")))[:120]
                     })
             return results
+    except asyncio.TimeoutError:
+        logger.error("APISerpent таймаут (45 сек)")
+        return []
     except Exception as e:
         logger.warning(f"APISerpent ошибка: {type(e).__name__}: {str(e)}")
         return []
 
-async def search_duckduckgo_async(query):
+async def search_serper_async(query):
+    """Резервный поиск — Serper (бесплатно 2500 запросов/мес)"""
+    if not SERPER_API_KEY:
+        logger.warning("SERPER_API_KEY не задан")
+        return []
     session = await get_http_session()
     try:
-        logger.info(f"🦆 DuckDuckGo: {query[:50]}...")
-        async with session.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
-            timeout=8
+        logger.info(f"🔍 Serper: {query[:50]}...")
+        async with session.post(
+            "https://google.serper.dev/search",
+            json={"q": query, "num": SEARCH_RESULTS_NUM},
+            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+            timeout=15
         ) as r:
-            if r.status != 200: return []
+            if r.status != 200:
+                logger.warning(f"Serper статус: {r.status}")
+                return []
             data = await r.json()
             results = []
-            if data.get('AbstractText'):
+            for item in data.get("organic", [])[:SEARCH_RESULTS_NUM]:
                 results.append({
-                    "title": "DuckDuckGo",
-                    "snippet": data['AbstractText'][:500],
-                    "link": data.get('AbstractURL', '#')
+                    "title": item.get("title", "")[:120],
+                    "snippet": item.get("snippet", "")[:300],
+                    "link": item.get("link", "#")[:120]
                 })
-            for topic in data.get('RelatedTopics', []):
-                if 'Text' in topic:
-                    results.append({
-                        "title": "DuckDuckGo",
-                        "snippet": topic['Text'][:300],
-                        "link": topic.get('FirstURL', '#')
-                    })
             return results
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Serper ошибка: {type(e).__name__}: {str(e)}")
         return []
 
 async def search_primary(query):
+    """Поиск: сначала APISerpent, при отказе — Serper"""
     results = await search_apiserpent_async(query)
     if results:
         return results
-    logger.info("🔄 APISerpent пуст, пробуем DuckDuckGo")
-    return await search_duckduckgo_async(query)
+    logger.info("🔄 APISerpent пуст, пробуем Serper")
+    return await search_serper_async(query)
 
 # ---------- ГЕНЕРАЦИЯ ОТВЕТА ----------
 async def generate_response(uid, user_message, history, profile):
@@ -473,7 +481,6 @@ async def _generate_response_internal(uid, user_message, history, profile):
 
     stext = "\n\n".join(full_texts) if full_texts else "Нет контента"
 
-    # Универсальный промпт — DeepSeek сам отделяет мусор
     sp = {
         "role": "system",
         "content": (
@@ -791,5 +798,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    logger.info("✅ БОТ ЗАПУЩЕН (универсальный, DeepSeek чистит сам)")
+    logger.info("✅ БОТ ЗАПУЩЕН (APISerpent + Serper, таймаут 45с)")
     app.run_polling()
