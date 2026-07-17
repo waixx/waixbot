@@ -1,7 +1,6 @@
 # ================================================================
-#  Universal Bot — ИСПРАВЛЕННАЯ ВЕРСИЯ (стабильный запуск)
-#  Адаптирован под ваши переменные: DEEPSEEK_API_KEY, APISERPENT_API_KEY и др.
-#  Исправлена ошибка event loop (убраны конфликты с run_polling)
+#  Universal Bot — ФИНАЛЬНАЯ СТАБИЛЬНАЯ ВЕРСИЯ
+#  Запуск через app.run_polling() без ручного управления циклом
 # ================================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib, uuid
 from datetime import datetime, timedelta
@@ -29,7 +28,7 @@ logger.addHandler(console)
 
 load_dotenv()
 
-# ---------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (АДАПТИРОВАНЫ) ----------
+# ---------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 APISERPENT_API_KEY = os.getenv("APISERPENT_API_KEY")
@@ -38,28 +37,25 @@ ALLOWED_USERS_LIST = [int(x.strip()) for x in os.getenv("ALLOWED_USERS", "").spl
 if ADMIN_USER_ID and ADMIN_USER_ID not in ALLOWED_USERS_LIST:
     ALLOWED_USERS_LIST.append(ADMIN_USER_ID)
 
-# Часовой пояс (можно переопределить, если есть TIMEZONE)
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 def now(): return datetime.now(TZ)
 def get_current_date(): return now().strftime("%d.%m.%Y")
 def get_current_time(): return now().strftime("%H:%M")
 
-# ---------- ПАРАМЕТРЫ LLM И ПОИСКА (АДАПТИРОВАНЫ) ----------
+# ---------- ПАРАМЕТРЫ LLM И ПОИСКА ----------
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-chat")
-MODEL_FALLBACK = "deepseek-chat"  # если хотите, можно добавить переменную
-SEARCH_ENGINE = "google"  # можно вынести в переменную
+MODEL_FALLBACK = "deepseek-chat"
+SEARCH_ENGINE = "google"
 
-# ---------- ОПТИМИЗИРОВАННЫЕ ПАРАМЕТРЫ ----------
 SEARCH_RESULTS_NUM = int(os.getenv("SEARCH_RESULTS_NUM", "3"))
 TOP_RESULTS_SHOW = int(os.getenv("TOP_RESULTS_SHOW", "3"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
 MAX_RETRY_ATTEMPTS = 1
-CACHE_TTL = 172800  # 2 дня
+CACHE_TTL = 172800
 MAX_TOKENS_ANSWER = int(os.getenv("MAX_TOKENS_ANSWER", "1024"))
 MAX_HTML_LEN = 5000
 
-# Поддержка ваших переменных для истории
 LEVEL_1 = {
     'max_history': int(os.getenv("MAX_HISTORY", "20")),
     'keep_recent': int(os.getenv("KEEP_RECENT", "5"))
@@ -67,7 +63,6 @@ LEVEL_1 = {
 LEVEL_2 = {'compress_interval': 20, 'compress_to': 30}
 CACHE_CLEANUP_INTERVAL = 3600
 
-# Валидация
 if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     logger.error("❌ TELEGRAM_TOKEN или DEEPSEEK_API_KEY не заданы")
     sys.exit(1)
@@ -88,13 +83,15 @@ _rate_lock = None
 request_count = {}
 search_cache = {}
 answer_cache = {}
-html_cache = {}  # {url: {"text": str, "expires": datetime}}
+html_cache = {}
 
 def get_user_lock(uid):
     return user_locks.setdefault(uid, asyncio.Lock())
 
 async def get_http_session():
     global _http_session, _session_lock
+    if _session_lock is None:
+        _session_lock = asyncio.Lock()
     async with _session_lock:
         if _http_session is None or _http_session.closed:
             _http_session = aiohttp.ClientSession(
@@ -108,7 +105,7 @@ async def cleanup_http_session():
     if _http_session and not _http_session.closed:
         await _http_session.close()
 
-# ---------- ФАЙЛОВЫЕ ОПЕРАЦИИ (АТОМАРНЫЕ) ----------
+# ---------- ФАЙЛОВЫЕ ОПЕРАЦИИ ----------
 def atomic_write(filename, data, as_json=True):
     tmp = filename + ".tmp"
     try:
@@ -267,7 +264,7 @@ async def save_memory(uid, history, backup=True, lock_held=False):
     async with get_user_lock(uid):
         return await _save_memory_impl(uid, history, backup)
 
-# ---------- ЛОКАЛЬНАЯ ОЧИСТКА HTML (с lxml) ----------
+# ---------- ЛОКАЛЬНАЯ ОЧИСТКА HTML ----------
 def clean_html_to_text(html: str, max_len: int = MAX_HTML_LEN) -> str:
     if not html:
         return ""
@@ -305,7 +302,6 @@ async def fetch_and_clean(url: str) -> str:
                         "text": clean_text,
                         "expires": now_time + timedelta(seconds=CACHE_TTL)
                     }
-                    # Ограничение размера кэша
                     if len(html_cache) > 200:
                         oldest = min(html_cache.keys(), key=lambda k: html_cache[k]["expires"])
                         del html_cache[oldest]
@@ -378,16 +374,12 @@ def assess_relevance(results, query):
         
         keyword_score = sum(3 for kw in keywords if kw in text_lower)
         
-        # Динамический анализ URL (Универсальный)
         domain_score = 0
         for kw in keywords:
             if len(kw) > 3 and kw in link:
-                domain_score += 4  # Тематическое совпадение
-                
+                domain_score += 4
         if any(zone in link for zone in ['.gov', '.edu', '.org', 'wikipedia.org']):
             domain_score += 5
-            
-        # Штрафуем маркетплейсы и мусорные магазины
         spam_domains = ['ozon', 'wildberries', 'aliexpress', 'avito', 'amazon', 'ebay', 'taobao', 'sbermegamarket', 'prom.ua', 'olx']
         if any(spam in link for spam in spam_domains):
             domain_score -= 8
@@ -415,15 +407,11 @@ def assess_relevance(results, query):
     return relevant[:TOP_RESULTS_SHOW]
 
 def remove_unverified_claims(ans, raw_text):
-    """
-    Универсальный динамический фильтр галлюцинаций.
-    """
     if not raw_text or not ans:
         return ans
     entities = re.findall(r'\b([A-ZА-Я][a-zA-Zа-яА-Я0-9\-]+|\d+[-+°]*[CС]?)\b', ans)
     modified = False
     ignore_set = {'В','На','По','За','Из','Для','Этот','Эта','Эти','Только','Как','Что','Где','Когда'}
-    
     for entity in set(entities):
         if entity in ignore_set or len(entity) < 2:
             continue
@@ -431,7 +419,6 @@ def remove_unverified_claims(ans, raw_text):
             ans = re.sub(rf'\b{re.escape(entity)}\b', '', ans)
             modified = True
             logger.info(f"🔍 Универсальный фильтр удалил неподтверждённый факт: {entity}")
-            
     if modified:
         ans = re.sub(r'\s+', ' ', ans)
         ans = re.sub(r'\s*\.\s*', '. ', ans)
@@ -467,18 +454,14 @@ def generate_answer_from_snippets(results, user_message, max_items=5):
     answer += f"📅 Дата: {get_current_date()}\nУверенность: 85%"
     return answer
 
-# ---------- ПОИСК (APISerpent + DuckDuckGo) ----------
+# ---------- ПОИСК ----------
 async def search_apiserpent_async(query):
     if not APISERPENT_API_KEY:
         return []
     session = await get_http_session()
     try:
         logger.info(f"🔍 APISerpent: {query[:50]}...")
-        params = {
-            "q": query,
-            "engine": SEARCH_ENGINE,
-            "num": SEARCH_RESULTS_NUM,
-        }
+        params = {"q": query, "engine": SEARCH_ENGINE, "num": SEARCH_RESULTS_NUM}
         async with session.get(
             "https://apiserpent.com/api/search",
             params=params,
@@ -666,6 +649,8 @@ async def ask_llm(messages, retries=2, max_tokens=None, model=None):
 RATE_LIMIT, RATE_WINDOW = 5, 10
 async def check_rate_limit(uid):
     global _rate_lock
+    if _rate_lock is None:
+        _rate_lock = asyncio.Lock()
     async with _rate_lock:
         now_ts = datetime.now().timestamp()
         request_count[uid] = [t for t in request_count.get(uid, []) if now_ts - t < RATE_WINDOW]
@@ -883,8 +868,6 @@ async def cleanup_caches():
                 to_delete = sorted(answer_cache.keys())[:250]
                 for k in to_delete:
                     del answer_cache[k]
-            
-            # Очистка HTML кэша
             expired_html = [k for k, v in html_cache.items() if v['expires'] <= now_time]
             for k in expired_html:
                 del html_cache[k]
@@ -902,7 +885,7 @@ async def cleanup_caches():
 async def error_handler(update, context):
     logger.error(f"Ошибка: {context.error}")
 
-# ---------- ИНИЦИАЛИЗАЦИЯ И ЗАПУСК ----------
+# ---------- ЗАПУСК ----------
 async def auto_restore_all_users():
     logger.info("🔄 Проверка данных при старте...")
     try:
@@ -926,15 +909,23 @@ async def auto_restore_all_users():
     except Exception as ex:
         logger.error(f"Ошибка auto_restore: {ex}")
 
-async def main():
+async def post_init(application):
+    """Вызывается после инициализации приложения"""
+    # Инициализируем блокировки
     global _session_lock, _rate_lock
     _session_lock = asyncio.Lock()
     _rate_lock = asyncio.Lock()
+    # Запускаем фоновую задачу
+    asyncio.create_task(cleanup_caches())
 
-    await auto_restore_all_users()
+def main():
+    # Одноразовое восстановление данных (синхронно)
+    asyncio.run(auto_restore_all_users())
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    # Создаём приложение
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
+    # Регистрируем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("memory", memory_command))
@@ -944,25 +935,10 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    # Запускаем фоновую задачу без post_init
-    asyncio.create_task(cleanup_caches())
+    logger.info("🚀 БОТ ЗАПУЩЕН (финальная стабильная версия)")
 
-    logger.info("🚀 БОТ ЗАПУЩЕН (исправленная версия)")
-    try:
-        await app.run_polling()
-    finally:
-        await cleanup_http_session()
+    # Запускаем бота (синхронно, без ручного цикла)
+    app.run_polling()
 
 if __name__ == "__main__":
-    # Используем get_event_loop, чтобы избежать конфликтов с asyncio.run()
-    loop = asyncio.get_event_loop()
-    try:
-        loop.run_until_complete(main())
-    except KeyboardInterrupt:
-        pass
-    finally:
-        try:
-            loop.run_until_complete(cleanup_http_session())
-        except:
-            pass
-        loop.close()
+    main()
