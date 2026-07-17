@@ -1,6 +1,6 @@
 # ================================================================
-#  Universal Bot — ЭТАЛОННАЯ ВЕРСИЯ С ДОПОЛНИТЕЛЬНОЙ ЗАЩИТОЙ КЭША
-#  Добавлено: ограничение размера html_cache в fetch_and_clean
+#  Universal Bot — АДАПТИРОВАН ПОД ВАШИ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+#  Читает: DEEPSEEK_API_KEY, APISERPENT_API_KEY, MODEL_DEFAULT и др.
 # ================================================================
 import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib, uuid
 from datetime import datetime, timedelta
@@ -28,40 +28,48 @@ logger.addHandler(console)
 
 load_dotenv()
 
-# ---------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------
+# ---------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (АДАПТИРОВАНЫ) ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-SEARCH_API_KEY = os.getenv("SEARCH_API_KEY")
+# Ваши имена:
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+APISERPENT_API_KEY = os.getenv("APISERPENT_API_KEY")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or 0)
 ALLOWED_USERS_LIST = [int(x.strip()) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip()]
 if ADMIN_USER_ID and ADMIN_USER_ID not in ALLOWED_USERS_LIST:
     ALLOWED_USERS_LIST.append(ADMIN_USER_ID)
 
-TZ = ZoneInfo(os.getenv("TIMEZONE", "UTC") or "UTC")
+# Часовой пояс (можно переопределить, если есть TIMEZONE)
+TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 def now(): return datetime.now(TZ)
 def get_current_date(): return now().strftime("%d.%m.%Y")
 def get_current_time(): return now().strftime("%H:%M")
 
-# ---------- ПАРАМЕТРЫ LLM И ПОИСКА ----------
-LLM_API_BASE = os.getenv("LLM_API_BASE", "https://api.deepseek.com/v1")
-LLM_MODEL_DEFAULT = os.getenv("LLM_MODEL_DEFAULT", "deepseek-chat")
-LLM_MODEL_FALLBACK = os.getenv("LLM_MODEL_FALLBACK", "deepseek-chat")
-SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
+# ---------- ПАРАМЕТРЫ LLM И ПОИСКА (АДАПТИРОВАНЫ) ----------
+DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
+MODEL_DEFAULT = os.getenv("MODEL_DEFAULT", "deepseek-chat")
+MODEL_FALLBACK = "deepseek-chat"  # можно вынести в переменную, если добавите
+SEARCH_ENGINE = "google"  # можно переопределить, если добавите переменную
 
-# ---------- ОПТИМИЗИРОВАННЫЕ ПАРАМЕТРЫ ----------
-SEARCH_RESULTS_NUM = 3
-TOP_RESULTS_SHOW = 3
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+# ---------- ОПТИМИЗИРОВАННЫЕ ПАРАМЕТРЫ (с поддержкой ваших переменных) ----------
+SEARCH_RESULTS_NUM = int(os.getenv("SEARCH_RESULTS_NUM", "3"))
+TOP_RESULTS_SHOW = int(os.getenv("TOP_RESULTS_SHOW", "3"))  # можно добавить
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))  # если добавите
 MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 172800  # 2 дня
 MAX_TOKENS_ANSWER = int(os.getenv("MAX_TOKENS_ANSWER", "1024"))
 MAX_HTML_LEN = 5000
-LEVEL_1 = {'max_history': 20, 'keep_recent': 5}
+
+# Поддержка ваших переменных для истории
+LEVEL_1 = {
+    'max_history': int(os.getenv("MAX_HISTORY", "20")),
+    'keep_recent': int(os.getenv("KEEP_RECENT", "5"))
+}
 LEVEL_2 = {'compress_interval': 20, 'compress_to': 30}
 CACHE_CLEANUP_INTERVAL = 3600
 
-if not TELEGRAM_TOKEN or not LLM_API_KEY:
-    logger.error("❌ TELEGRAM_TOKEN или LLM_API_KEY не заданы")
+# Валидация (теперь проверяем TELEGRAM_TOKEN и DEEPSEEK_API_KEY)
+if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
+    logger.error("❌ TELEGRAM_TOKEN или DEEPSEEK_API_KEY не заданы")
     sys.exit(1)
 
 DATA_DIR, BACKUP_DIR = "data", "data/backups"
@@ -297,7 +305,7 @@ async def fetch_and_clean(url: str) -> str:
                         "text": clean_text,
                         "expires": now_time + timedelta(seconds=CACHE_TTL)
                     }
-                    # --- ДОБАВЛЕНО: ограничение размера кэша ---
+                    # Ограничение размера кэша
                     if len(html_cache) > 200:
                         oldest = min(html_cache.keys(), key=lambda k: html_cache[k]["expires"])
                         del html_cache[oldest]
@@ -461,7 +469,7 @@ def generate_answer_from_snippets(results, user_message, max_items=5):
 
 # ---------- ПОИСК (APISerpent + DuckDuckGo) ----------
 async def search_apiserpent_async(query):
-    if not SEARCH_API_KEY:
+    if not APISERPENT_API_KEY:
         return []
     session = await get_http_session()
     try:
@@ -474,7 +482,7 @@ async def search_apiserpent_async(query):
         async with session.get(
             "https://apiserpent.com/api/search",
             params=params,
-            headers={"X-API-Key": SEARCH_API_KEY},
+            headers={"X-API-Key": APISERPENT_API_KEY},
             timeout=20
         ) as r:
             if r.status != 200:
@@ -617,10 +625,10 @@ async def _generate_response_internal(uid, user_message, history, profile):
     answer_cache[cache_key] = result
     return result, True
 
-# ---------- ЗАПРОС К LLM ----------
+# ---------- ЗАПРОС К LLM (теперь использует DEEPSEEK_API_KEY) ----------
 async def ask_llm(messages, retries=2, max_tokens=None, model=None):
     if model is None:
-        model = LLM_MODEL_DEFAULT
+        model = MODEL_DEFAULT
     session = await get_http_session()
     for attempt in range(retries):
         try:
@@ -631,8 +639,8 @@ async def ask_llm(messages, retries=2, max_tokens=None, model=None):
                 "max_tokens": max_tokens
             }
             async with session.post(
-                f"{LLM_API_BASE}/chat/completions",
-                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                f"{DEEPSEEK_API_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
                 json=payload,
                 timeout=30
             ) as resp:
@@ -644,9 +652,9 @@ async def ask_llm(messages, retries=2, max_tokens=None, model=None):
                 if resp.status == 429:
                     await asyncio.sleep(2)
                     continue
-                if resp.status in (400, 404) and model != LLM_MODEL_FALLBACK:
-                    logger.warning(f"Модель {model} недоступна, пробуем {LLM_MODEL_FALLBACK}")
-                    model = LLM_MODEL_FALLBACK
+                if resp.status in (400, 404) and model != MODEL_FALLBACK:
+                    logger.warning(f"Модель {model} недоступна, пробуем {MODEL_FALLBACK}")
+                    model = MODEL_FALLBACK
                     continue
                 return None, f"http_{resp.status}"
         except Exception as ex:
@@ -940,7 +948,7 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("🚀 БОТ ЗАПУЩЕН (универсальная стабильная версия)")
+    logger.info("🚀 БОТ ЗАПУЩЕН (адаптирован под ваши переменные)")
     try:
         await app.run_polling()
     finally:
