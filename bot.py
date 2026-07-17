@@ -1,24 +1,13 @@
 # ================================================================
-#  BroWaix Bot — ИТОГОВАЯ СТАБИЛЬНАЯ ВЕРСИЯ
-#  - Убран агрессивный фильтр
-#  - Умный фильтр рекламы через DeepSeek
-#  - 5 сайтов для парсинга
-#  - Корректное закрытие сессии
-#  - Индикатор статуса в Telegram
-#  - Вечная память, бэкапы, честность
+#  BroWaix Bot — УНИВЕРСАЛЬНАЯ СТАБИЛЬНАЯ ВЕРСИЯ
+#  - Загружает HTML, JSON, XML, plain text
+#  - Без агрессивного фильтра
+#  - APISerpent + Serper (резерв)
+#  - 5 ссылок для надёжности
+#  - Честный промпт, без выдумок
 # ================================================================
 
-import logging
-import os
-import json
-import sys
-import re
-import asyncio
-import aiohttp
-import shutil
-import weakref
-import hashlib
-import xml.etree.ElementTree as ET
+import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib, xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -41,11 +30,11 @@ logger.addHandler(console)
 
 load_dotenv()
 
-# ---------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------
+# ---------- ПЕРЕМЕННЫЕ ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 APISERPENT_API_KEY = os.getenv("APISERPENT_API_KEY")
-SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")          # резерв
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or 0)
 ALLOWED_USERS_LIST = [int(x.strip()) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip()]
 if ADMIN_USER_ID and ADMIN_USER_ID not in ALLOWED_USERS_LIST:
@@ -63,7 +52,7 @@ DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1"
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
 SEARCH_RESULTS_NUM = 10
-TOP_RESULTS_SHOW = 5
+TOP_RESULTS_SHOW = 5                     # 5 для надёжности
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 172800
@@ -79,8 +68,7 @@ if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     sys.exit(1)
 
 DATA_DIR, BACKUP_DIR = "data", "data/backups"
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(BACKUP_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True); os.makedirs(BACKUP_DIR, exist_ok=True)
 
 def memory_path(uid): return os.path.join(DATA_DIR, f"memory_{uid}.json")
 def profile_path(uid): return os.path.join(DATA_DIR, f"profile_{uid}.json")
@@ -112,23 +100,18 @@ async def cleanup_http_session():
     if _http_session and not _http_session.closed:
         await _http_session.close()
 
-# ---------- ФАЙЛОВЫЕ ОПЕРАЦИИ ----------
+# ---------- ФАЙЛЫ ----------
 def atomic_write(filename, data, as_json=True):
     tmp = filename + ".tmp"
     try:
         with open(tmp, 'w', encoding='utf-8') as f:
-            if as_json:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            else:
-                f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
+            if as_json: json.dump(data, f, ensure_ascii=False, indent=2)
+            else: f.write(data)
+            f.flush(); os.fsync(f.fileno())
         shutil.move(tmp, filename)
         return True
     except Exception:
-        if os.path.exists(tmp):
-            try: os.remove(tmp)
-            except: pass
+        if os.path.exists(tmp): os.remove(tmp)
         return False
 
 def atomic_read(filename, default=None, as_json=True):
@@ -138,38 +121,24 @@ def atomic_read(filename, default=None, as_json=True):
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return default
 
-def load_profile(uid):
-    return atomic_read(profile_path(uid), default={})
-
+def load_profile(uid): return atomic_read(profile_path(uid), default={})
 def save_profile(uid, profile, backup=True):
     profile["updated"] = now().strftime("%d.%m.%Y %H:%M:%S")
-    if not atomic_write(profile_path(uid), profile):
-        return False
-    if backup:
-        create_backup(uid, "profile")
+    if not atomic_write(profile_path(uid), profile): return False
+    if backup: create_backup(uid, "profile")
     return True
-
-def load_counter(uid):
-    return atomic_read(counter_path(uid), default={"count": 0}).get("count", 0)
-
-def save_counter(uid, count):
-    atomic_write(counter_path(uid), {"count": count})
-
-def load_memory_raw(uid):
-    return atomic_read(memory_path(uid), default=[])
+def load_counter(uid): return atomic_read(counter_path(uid), default={"count":0}).get("count",0)
+def save_counter(uid, count): atomic_write(counter_path(uid), {"count":count})
+def load_memory_raw(uid): return atomic_read(memory_path(uid), default=[])
 
 def create_backup(uid, data_type):
     try:
         ts = now().strftime("%Y%m%d_%H%M%S")
-        fname = os.path.join(BACKUP_DIR, f"{data_type}_{uid}_{ts}.json")
-        if data_type == "profile":
-            atomic_write(fname, load_profile(uid))
-        elif data_type == "memory":
-            atomic_write(fname, load_memory_raw(uid))
+        fname = f"{BACKUP_DIR}/{data_type}_{uid}_{ts}.json"
+        if data_type == "profile": atomic_write(fname, load_profile(uid))
+        elif data_type == "memory": atomic_write(fname, load_memory_raw(uid))
         backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith(f"{data_type}_{uid}_")])
-        for old in backups[:-5]:
-            try: os.remove(os.path.join(BACKUP_DIR, old))
-            except: pass
+        for old in backups[:-5]: os.remove(os.path.join(BACKUP_DIR, old))
         return True
     except Exception:
         return False
@@ -178,121 +147,93 @@ async def restore_backup(uid, data_type):
     async with get_user_lock(uid):
         try:
             backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith(f"{data_type}_{uid}_")])
-            if not backups:
-                return False
+            if not backups: return False
             with open(os.path.join(BACKUP_DIR, backups[-1]), 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            if data_type == "profile":
-                save_profile(uid, data, backup=False)
-            elif data_type == "memory":
-                await save_memory(uid, data, backup=False, lock_held=True)
+            if data_type == "profile": save_profile(uid, data, backup=False)
+            elif data_type == "memory": await save_memory(uid, data, backup=False, lock_held=True)
             return True
         except Exception:
             return False
 
-# ---------- СЖАТИЕ ИСТОРИИ ----------
+# ---------- СЖАТИЕ ----------
 STOP_WORDS = {'это','так','вот','ну','просто','очень','что','как','где','когда','для','без','по'}
-
 def extract_key_points(text, max_len=40):
-    if not text or len(text) <= max_len:
-        return str(text)[:max_len]
+    if len(text) <= max_len: return text
     imp = [w for w in text.split() if w.lower() not in STOP_WORDS and len(w) > 2]
-    result = ' '.join(imp[:8])[:max_len]
-    return result + "..." if len(result) == max_len else result
+    return ' '.join(imp[:8])[:max_len] + "..."
 
 def compress_history(history):
-    if not isinstance(history, list):
-        return []
-    if len(history) <= LEVEL_1['max_history']:
-        return history
+    if len(history) <= LEVEL_1['max_history']: return history
     recent = history[-LEVEL_1['keep_recent']:]
     old = history[:-LEVEL_1['keep_recent']]
     summary = []
     for m in old[-8:]:
-        if not isinstance(m, dict):
-            continue
-        r, c = m.get("role", ""), m.get("content", "")
-        if r == "user":
-            summary.append(f"Q: {extract_key_points(c, 50)}")
-        elif r == "assistant":
-            summary.append(f"A: {extract_key_points(c, 50)}")
+        r, c = m.get("role",""), m.get("content","")
+        if r == "user": summary.append(f"Q: {extract_key_points(c,50)}")
+        elif r == "assistant": summary.append(f"A: {extract_key_points(c,50)}")
     if summary:
-        return [{"role": "system", "content": "📚 История:\n" + "\n".join(summary[-5:])}] + recent
+        return [{"role":"system","content":"📚 История:\n" + "\n".join(summary[-5:])}] + recent
     return recent
 
-def load_memory(uid):
-    return compress_history(load_memory_raw(uid))
+def load_memory(uid): return compress_history(load_memory_raw(uid))
 
 def _update_level(uid, messages, key, cfg, extractor, ext_len, ts_fmt):
     try:
-        profile = load_profile(uid)
-        profile.setdefault(key, [])
+        profile = load_profile(uid); profile.setdefault(key, [])
         ts = now().strftime(ts_fmt)
         for m in messages[-cfg['compress_interval']:]:
-            if not isinstance(m, dict):
-                continue
-            r, c = m.get("role", ""), m.get("content", "")
-            if r == "user":
-                profile[key].append(f"[{ts}] Q: {extractor(c, ext_len)}")
-            elif r == "assistant":
-                profile[key].append(f"[{ts}] A: {extractor(c, ext_len)}")
+            r, c = m.get("role",""), m.get("content","")
+            if r == "user": profile[key].append(f"[{ts}] Q: {extractor(c, ext_len)}")
+            elif r == "assistant": profile[key].append(f"[{ts}] A: {extractor(c, ext_len)}")
         if len(profile[key]) > cfg['compress_to']:
             profile[key] = profile[key][-cfg['compress_to']:]
         save_profile(uid, profile, backup=False)
     except Exception as ex:
-        logger.error(f"Ошибка _update_level: {ex}")
+        logger.error(f"Ошибка сжатия: {ex}")
 
 async def _save_memory_impl(uid, history, backup):
     try:
-        if not isinstance(history, list):
-            return False
         if len(history) > LEVEL_1['max_history']:
             old = history[:-LEVEL_1['keep_recent']]
             if old:
                 _update_level(uid, old, "level_2", LEVEL_2, extract_key_points, 40, "%d.%m")
         if not atomic_write(memory_path(uid), compress_history(history)):
             return False
-        if backup:
-            create_backup(uid, "memory")
+        if backup: create_backup(uid, "memory")
         cnt = load_counter(uid) + 1
         save_counter(uid, cnt)
         return True
     except Exception as ex:
-        logger.error(f"Ошибка _save_memory_impl: {ex}")
+        logger.error(f"Ошибка сохранения памяти: {ex}")
         return False
 
 async def save_memory(uid, history, backup=True, lock_held=False):
-    if lock_held:
-        return await _save_memory_impl(uid, history, backup)
-    async with get_user_lock(uid):
-        return await _save_memory_impl(uid, history, backup)
+    if lock_held: return await _save_memory_impl(uid, history, backup)
+    async with get_user_lock(uid): return await _save_memory_impl(uid, history, backup)
 
-# ---------- ФИЛЬТРАЦИЯ КЛЮЧЕВЫМИ СЛОВАМИ ----------
+# ---------- ФИЛЬТРАЦИЯ ----------
 def extract_year_from_text(text):
-    if not isinstance(text, str):
-        return None
     match = re.search(r'\b(20[2-9][0-9])\b', text)
-    return int(match.group(1)) if match else None
+    if match and match.group(1).isdigit():
+        return int(match.group(1))
+    return None
 
 def assess_relevance(results, query):
-    if not results or not isinstance(results, list):
-        return []
+    if not results: return []
     query_year = None
     year_match = re.search(r'\b(20[2-9][0-9])\b', query)
     if year_match:
         query_year = int(year_match.group(1))
-    requires_year = any(word in query.lower() for word in ['новинк','последн','свеж','актуальн','этот год','сейчас','сегодня'])
+    requires_year = any(w in query.lower() for w in ['новинк','последн','свеж','актуальн','этот год','сейчас','сегодня'])
     stop_words = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','где'}
-    keywords = [w.lower() for w in re.sub(r'[^\w\s]', '', query).split()
+    keywords = [w.lower() for w in re.sub(r'[^\w\s]', '', query).split() 
                 if w.lower() not in stop_words and len(w) > 3]
     scored = []
     for res in results:
-        if not isinstance(res, dict):
-            continue
-        text = (res.get('title', '') or '') + ' ' + (res.get('snippet', '') or '')
-        text_lower = text.lower()
+        text = (res.get('title', '') + ' ' + res.get('snippet', '')).lower()
         link = res.get('link', '').lower()
-        keyword_score = sum(3 for kw in keywords if kw in text_lower)
+        keyword_score = sum(3 for kw in keywords if kw in text)
         domain_score = 0
         for kw in keywords:
             if len(kw) > 3 and kw in link:
@@ -320,43 +261,32 @@ def assess_relevance(results, query):
         scored.append({**res, 'score': total, 'year': year})
     relevant = [r for r in scored if r['score'] > 1]
     relevant.sort(key=lambda x: x['score'], reverse=True)
-    return relevant
+    return relevant[:TOP_RESULTS_SHOW]
 
-# ---------- УМНЫЙ ФИЛЬТР РЕКЛАМЫ (DeepSeek) ----------
-async def filter_links_by_relevance(results, user_message):
-    if len(results) <= 3:
-        return results[:TOP_RESULTS_SHOW]
-    
-    links_text = ""
-    for i, r in enumerate(results, 1):
-        links_text += f"{i}. Заголовок: {r.get('title', '')}\n   Сниппет: {r.get('snippet', '')}\n   Ссылка: {r.get('link', '')}\n\n"
-    
-    prompt = {
-        "role": "system",
-        "content": (
-            "Ты — фильтр веб-страниц. Выбери ТОЛЬКО те ссылки, которые содержат релевантную информацию по запросу пользователя.\n"
-            "Отсеивай рекламу, маркетплейсы, кликбейт, сайты, не относящиеся к теме.\n"
-            "Верни список НОМЕРОВ (через запятую) наиболее релевантных ссылок (от 3 до 5).\n"
-            "Только номера, без пояснений."
-        )
-    }
-    user_prompt = {
-        "role": "user",
-        "content": f"Запрос: {user_message}\n\nСписок:\n{links_text}"
-    }
-    
-    ans, err = await ask_deepseek([prompt, user_prompt], max_tokens=50)
-    if err or not ans:
-        return results[:TOP_RESULTS_SHOW]
-    
-    numbers = re.findall(r'\b(\d+)\b', ans)
-    selected_indices = [int(n) - 1 for n in numbers if 0 <= int(n) - 1 < len(results)]
-    selected_indices = selected_indices[:TOP_RESULTS_SHOW]
-    if not selected_indices:
-        return results[:TOP_RESULTS_SHOW]
-    return [results[i] for i in selected_indices]
+def normalize_query(query):
+    normalized = re.sub(r'[^\w\s]', '', query.lower())
+    normalized = ' '.join([w for w in normalized.split() if w not in STOP_WORDS and len(w)>2])
+    return normalized[:100]
 
-# ---------- УНИВЕРСАЛЬНЫЙ ЗАГРУЗЧИК ----------
+def get_cached(query):
+    if any(w in query.lower() for w in ['погода','курс']):
+        return None
+    norm_key = normalize_query(query)
+    if norm_key in search_cache and (datetime.now() - search_cache[norm_key]['time']).total_seconds() < CACHE_TTL:
+        logger.info("✅ Cache HIT (поиск)")
+        return search_cache[norm_key]['data']
+    return None
+
+def set_cache(query, data):
+    if any(w in query.lower() for w in ['погода','курс']):
+        return
+    norm_key = normalize_query(query)
+    search_cache[norm_key] = {'data': data, 'time': datetime.now()}
+    if len(search_cache) > 100:
+        oldest = min(search_cache.keys(), key=lambda k: search_cache[k]['time'])
+        del search_cache[oldest]
+
+# ---------- УНИВЕРСАЛЬНЫЙ ЗАГРУЗЧИК (HTML, JSON, XML) ----------
 def json_to_text(data, indent=0) -> str:
     if isinstance(data, dict):
         lines = []
@@ -426,6 +356,7 @@ async def fetch_content(url: str) -> str:
             elif 'application/xml' in content_type or 'text/xml' in content_type:
                 xml_text = await resp.text()
                 result = xml_to_text(xml_text)
+                logger.info(f"✅ XML распарсен для {url[:50]}")
             elif 'text/plain' in content_type:
                 result = await resp.text()
                 result = result[:MAX_HTML_LEN]
@@ -453,34 +384,7 @@ async def fetch_content(url: str) -> str:
 
     return ""
 
-# ---------- ГЕНЕРАЦИЯ ОТВЕТА ИЗ СНИППЕТОВ ----------
-def generate_answer_from_snippets(results, user_message):
-    if not results:
-        return "❌ В интернете ничего не найдено."
-    relevant = [r for r in results if r.get('score',0) > 0][:TOP_RESULTS_SHOW]
-    if not relevant:
-        links = [r.get('link') for r in results if r.get('link') and r['link']!='#']
-        if links:
-            answer = "🔍 **Найденные ссылки:**\n\n"
-            for link in links[:TOP_RESULTS_SHOW]:
-                answer += f"• {link}\n"
-            answer += f"\n📅 Дата: {get_current_date()}\nУверенность: 70%"
-            return answer
-        else:
-            return "❌ Не удалось получить результаты."
-    answer = f"🔍 Результаты поиска\n\n"
-    for i, r in enumerate(relevant, 1):
-        year_note = f" ({r.get('year')})" if r.get('year') else ""
-        answer += f"{i}. **{r.get('title','Без названия')}**{year_note}\n"
-        snippet = r.get('snippet','Нет описания')[:200]
-        answer += f"   {snippet}\n"
-        if r.get('link') and r['link']!='#':
-            answer += f"   🔗 <a href='{r['link']}'>Источник</a>\n"
-        answer += "\n"
-    answer += f"📅 Дата: {get_current_date()}\nУверенность: 85%"
-    return answer
-
-# ---------- ПОИСК ----------
+# ---------- ПОИСК (APISerpent + Serper) ----------
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
     if not APISERPENT_API_KEY:
         return []
@@ -551,23 +455,20 @@ async def search_primary(query):
     return await search_serper_async(query)
 
 # ---------- ГЕНЕРАЦИЯ ОТВЕТА ----------
-async def generate_response(uid, user_message, history, profile, status_msg=None, update=None):
+async def generate_response(uid, user_message, history, profile):
     try:
         return await asyncio.wait_for(
-            _generate_response_internal(uid, user_message, history, profile, status_msg, update),
+            _generate_response_internal(uid, user_message, history, profile),
             timeout=60
         )
     except asyncio.TimeoutError:
         return "⏰ Превышено время ожидания. Попробуйте позже.", False
 
-async def _generate_response_internal(uid, user_message, history, profile, status_msg=None, update=None):
+async def _generate_response_internal(uid, user_message, history, profile):
     ctx = build_profile_context(profile)
 
     if len(user_message.split()) < 3:
         return "👋 Привет! Напишите конкретный вопрос, я поищу информацию в интернете.", False
-
-    if status_msg and update:
-        status_msg = await update_status(update, "🔍 Ищу в интернете...", status_msg)
 
     cached = get_cached(user_message)
     if cached:
@@ -589,16 +490,6 @@ async def _generate_response_internal(uid, user_message, history, profile, statu
         return ("🔍 Найденные данные нерелевантны.\n"
                 "Пожалуйста, уточните запрос.", False)
 
-    if status_msg and update:
-        status_msg = await update_status(update, "🧹 Отсеиваю рекламу...", status_msg)
-    scored = await filter_links_by_relevance(scored, user_message)
-    if not scored:
-        return ("🔍 После фильтрации не осталось релевантных ссылок.\n"
-                "Попробуйте перефразировать запрос.", False)
-
-    if status_msg and update:
-        status_msg = await update_status(update, "⬇️ Загружаю страницы...", status_msg)
-
     full_texts = []
     for r in scored[:TOP_RESULTS_SHOW]:
         content = await fetch_content(r['link'])
@@ -612,9 +503,6 @@ async def _generate_response_internal(uid, user_message, history, profile, statu
             )
 
     stext = "\n\n".join(full_texts) if full_texts else "Нет данных"
-
-    if status_msg and update:
-        status_msg = await update_status(update, "🧠 Анализирую данные через DeepSeek...", status_msg)
 
     sp = {
         "role": "system",
@@ -641,7 +529,7 @@ async def _generate_response_internal(uid, user_message, history, profile, statu
         logger.warning(f"DeepSeek не ответил: {err}")
         return generate_answer_from_snippets(scored, user_message), True
 
-    # БЕЗ АГРЕССИВНОГО ФИЛЬТРА
+    # --- БЕЗ АГРЕССИВНОГО ФИЛЬТРА ---
     final_ans = ans
     if len(final_ans) < 50 or 'http' not in final_ans:
         final_ans = generate_answer_from_snippets(scored, user_message)
@@ -653,40 +541,33 @@ async def _generate_response_internal(uid, user_message, history, profile, statu
 
     return f"🌐 из интернета\n\n{final_ans}", True
 
+def generate_answer_from_snippets(results, user_message):
+    if not results:
+        return "❌ В интернете ничего не найдено."
+    relevant = [r for r in results if r.get('score',0) > 0][:TOP_RESULTS_SHOW]
+    if not relevant:
+        links = [r.get('link') for r in results if r.get('link') and r['link']!='#']
+        if links:
+            answer = "🔍 **Найденные ссылки:**\n\n"
+            for link in links[:TOP_RESULTS_SHOW]:
+                answer += f"• {link}\n"
+            answer += f"\n📅 Дата: {get_current_date()}\nУверенность: 70%"
+            return answer
+        else:
+            return "❌ Не удалось получить результаты."
+    answer = f"🔍 Результаты поиска\n\n"
+    for i, r in enumerate(relevant, 1):
+        year_note = f" ({r.get('year')})" if r.get('year') else ""
+        answer += f"{i}. **{r.get('title','Без названия')}**{year_note}\n"
+        snippet = r.get('snippet','Нет описания')[:200]
+        answer += f"   {snippet}\n"
+        if r.get('link') and r['link']!='#':
+            answer += f"   🔗 <a href='{r['link']}'>Источник</a>\n"
+        answer += "\n"
+    answer += f"📅 Дата: {get_current_date()}\nУверенность: 85%"
+    return answer
+
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
-async def update_status(update: Update, text: str, status_msg=None):
-    if status_msg is None:
-        return await update.effective_message.reply_text(text)
-    else:
-        try:
-            await status_msg.edit_text(text)
-        except Exception:
-            pass
-        return status_msg
-
-async def generate_local_answer(uid, user_message, history, profile, reason):
-    ctx = build_profile_context(profile)
-    sp = {
-        "role": "system",
-        "content": (
-            "Ты — честный ассистент. Интернет-данных по запросу нет.\n"
-            f"Сегодня: {get_current_date()}. Контекст: {ctx}\n"
-            f"⚠️ Причина: {reason}.\n"
-            "Ты МОЖЕШЬ использовать свои внутренние знания, НО:\n"
-            "1. Начинай с '🧠 На основе моих знаний (интернет-данных нет)'\n"
-            "2. Каждое утверждение начинай с 'Предположительно' или 'Возможно'\n"
-            "3. Уверенность не выше 25%\n"
-            "4. НЕ придумывай факты"
-        )
-    }
-    messages = [sp] + history
-    ans, err = await ask_deepseek(messages, max_tokens=MAX_TOKENS_ANSWER)
-    if err or ans is None:
-        return f"⚠️ Ошибка генерации. {reason}", False
-    if 'Уверенность:' not in ans:
-        ans += f"\n\n📅 Дата: {get_current_date()}\nУверенность: 20%"
-    return f"🧠 из базы (интернет пуст)\n\n{ans}", True
-
 async def generate_search_query(query):
     stop = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','без','для','по','про'}
     words = [w for w in re.sub(r'[^\w\s]', '', query).split()
@@ -871,7 +752,7 @@ async def safe_reply(update: Update, text: str, reply_markup=None):
 def is_allowed(uid):
     return not ALLOWED_USERS_LIST or uid in ALLOWED_USERS_LIST
 
-# ---------- ОБРАБОТЧИК СООБЩЕНИЙ ----------
+# ---------- ОБРАБОТЧИК ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.effective_user or not update.effective_message or not update.effective_message.text:
@@ -909,14 +790,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_msg_obj = {"role": "user", "content": user_message, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")}
         history.append(user_msg_obj)
 
-        status_msg = await update_status(update, "🔍 Ищу в интернете...", None)
-
-        answer, should_save = await generate_response(uid, user_message, history, profile, status_msg, update)
-
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
+        answer, should_save = await generate_response(uid, user_message, history, profile)
 
         if should_save and isinstance(answer, str) and len(answer) > 10:
             clean_answer = re.sub(r'<[^>]+>', '', answer)
@@ -1007,7 +881,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("🚀 БОТ ЗАПУЩЕН (стабильная версия)")
+    logger.info("🚀 БОТ ЗАПУЩЕН (универсальный, без агрессивного фильтра)")
     try:
         app.run_polling()
     finally:
