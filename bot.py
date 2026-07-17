@@ -911,20 +911,22 @@ async def auto_restore_all_users():
 
 async def post_init(application):
     """Вызывается после инициализации приложения"""
-    # Инициализируем блокировки
     global _session_lock, _rate_lock
     _session_lock = asyncio.Lock()
     _rate_lock = asyncio.Lock()
-    # Запускаем фоновую задачу
     asyncio.create_task(cleanup_caches())
 
 def main():
-    # Одноразовое восстановление данных (синхронно)
-    asyncio.run(auto_restore_all_users())
-
+    # Явно создаём и устанавливаем цикл событий
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Запускаем восстановление данных в этом цикле
+    loop.run_until_complete(auto_restore_all_users())
+    
     # Создаём приложение
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-
+    
     # Регистрируем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile_command))
@@ -934,10 +936,10 @@ def main():
     app.add_handler(CommandHandler("restore", restore_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-
+    
     logger.info("🚀 БОТ ЗАПУЩЕН (финальная стабильная версия)")
-
-    # Запускаем бота (синхронно, без ручного цикла)
+    
+    # Запускаем бота, передавая созданный цикл
     app.run_polling()
 
 if __name__ == "__main__":
