@@ -1,14 +1,26 @@
 # ================================================================
-#  BroWaix Bot — ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ
+#  BroWaix Bot — ФИНАЛЬНАЯ ВЕРСИЯ (Nixpacks + Playwright)
+#  - Сборка через nixpacks.toml (без Dockerfile)
+#  - Chromium устанавливается через Nix-пакеты
 #  - 40 ссылок, фильтрация, топ-7 по контенту
-#  - Статус-сообщения в Telegram + таймер
-#  - Задержка 0.2 сек, обработка 429
-#  - Бюджет ~$8–10/мес при 150 запросах/день
+#  - Статус-сообщения + таймер в Telegram
+#  - Вечная память, бэкапы, честность
 # ================================================================
 
-import logging, os, json, sys, re, asyncio, aiohttp, shutil, weakref, hashlib, time
+import logging
+import os
+import json
+import sys
+import re
+import asyncio
+import aiohttp
+import shutil
+import weakref
+import hashlib
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -49,7 +61,7 @@ MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
-SEARCH_RESULTS_NUM = 40
+SEARCH_RESULTS_NUM = int(os.getenv("SEARCH_RESULTS_NUM", "40"))
 TOP_RESULTS_SHOW = 7
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 2
@@ -66,7 +78,8 @@ if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
     sys.exit(1)
 
 DATA_DIR, BACKUP_DIR = "data", "data/backups"
-os.makedirs(DATA_DIR, exist_ok=True); os.makedirs(BACKUP_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(BACKUP_DIR, exist_ok=True)
 
 def memory_path(uid): return os.path.join(DATA_DIR, f"memory_{uid}.json")
 def profile_path(uid): return os.path.join(DATA_DIR, f"profile_{uid}.json")
@@ -103,13 +116,18 @@ def atomic_write(filename, data, as_json=True):
     tmp = filename + ".tmp"
     try:
         with open(tmp, 'w', encoding='utf-8') as f:
-            if as_json: json.dump(data, f, ensure_ascii=False, indent=2)
-            else: f.write(data)
-            f.flush(); os.fsync(f.fileno())
+            if as_json:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            else:
+                f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
         shutil.move(tmp, filename)
         return True
     except Exception:
-        if os.path.exists(tmp): os.remove(tmp)
+        if os.path.exists(tmp):
+            try: os.remove(tmp)
+            except: pass
         return False
 
 def atomic_read(filename, default=None, as_json=True):
@@ -119,24 +137,38 @@ def atomic_read(filename, default=None, as_json=True):
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return default
 
-def load_profile(uid): return atomic_read(profile_path(uid), default={})
+def load_profile(uid):
+    return atomic_read(profile_path(uid), default={})
+
 def save_profile(uid, profile, backup=True):
     profile["updated"] = now().strftime("%d.%m.%Y %H:%M:%S")
-    if not atomic_write(profile_path(uid), profile): return False
-    if backup: create_backup(uid, "profile")
+    if not atomic_write(profile_path(uid), profile):
+        return False
+    if backup:
+        create_backup(uid, "profile")
     return True
-def load_counter(uid): return atomic_read(counter_path(uid), default={"count":0}).get("count",0)
-def save_counter(uid, count): atomic_write(counter_path(uid), {"count":count})
-def load_memory_raw(uid): return atomic_read(memory_path(uid), default=[])
+
+def load_counter(uid):
+    return atomic_read(counter_path(uid), default={"count": 0}).get("count", 0)
+
+def save_counter(uid, count):
+    atomic_write(counter_path(uid), {"count": count})
+
+def load_memory_raw(uid):
+    return atomic_read(memory_path(uid), default=[])
 
 def create_backup(uid, data_type):
     try:
         ts = now().strftime("%Y%m%d_%H%M%S")
-        fname = f"{BACKUP_DIR}/{data_type}_{uid}_{ts}.json"
-        if data_type == "profile": atomic_write(fname, load_profile(uid))
-        elif data_type == "memory": atomic_write(fname, load_memory_raw(uid))
+        fname = os.path.join(BACKUP_DIR, f"{data_type}_{uid}_{ts}.json")
+        if data_type == "profile":
+            atomic_write(fname, load_profile(uid))
+        elif data_type == "memory":
+            atomic_write(fname, load_memory_raw(uid))
         backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith(f"{data_type}_{uid}_")])
-        for old in backups[:-5]: os.remove(os.path.join(BACKUP_DIR, old))
+        for old in backups[:-5]:
+            try: os.remove(os.path.join(BACKUP_DIR, old))
+            except: pass
         return True
     except Exception:
         return False
@@ -145,11 +177,14 @@ async def restore_backup(uid, data_type):
     async with get_user_lock(uid):
         try:
             backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith(f"{data_type}_{uid}_")])
-            if not backups: return False
+            if not backups:
+                return False
             with open(os.path.join(BACKUP_DIR, backups[-1]), 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            if data_type == "profile": save_profile(uid, data, backup=False)
-            elif data_type == "memory": await save_memory(uid, data, backup=False, lock_held=True)
+            if data_type == "profile":
+                save_profile(uid, data, backup=False)
+            elif data_type == "memory":
+                await save_memory(uid, data, backup=False, lock_held=True)
             return True
         except Exception:
             return False
@@ -157,81 +192,105 @@ async def restore_backup(uid, data_type):
 # ---------- СЖАТИЕ ----------
 STOP_WORDS = {'это','так','вот','ну','просто','очень','что','как','где','когда','для','без','по'}
 def extract_key_points(text, max_len=40):
-    if len(text) <= max_len: return text
+    if not text or len(text) <= max_len:
+        return str(text)[:max_len]
     imp = [w for w in text.split() if w.lower() not in STOP_WORDS and len(w) > 2]
-    return ' '.join(imp[:8])[:max_len] + "..."
+    result = ' '.join(imp[:8])[:max_len]
+    return result + "..." if len(result) == max_len else result
 
 def compress_history(history):
-    if len(history) <= LEVEL_1['max_history']: return history
+    if not isinstance(history, list):
+        return []
+    if len(history) <= LEVEL_1['max_history']:
+        return history
     recent = history[-LEVEL_1['keep_recent']:]
     old = history[:-LEVEL_1['keep_recent']]
     summary = []
     for m in old[-8:]:
-        r, c = m.get("role",""), m.get("content","")
-        if r == "user": summary.append(f"Q: {extract_key_points(c,50)}")
-        elif r == "assistant": summary.append(f"A: {extract_key_points(c,50)}")
+        if not isinstance(m, dict):
+            continue
+        r, c = m.get("role", ""), m.get("content", "")
+        if r == "user":
+            summary.append(f"Q: {extract_key_points(c, 50)}")
+        elif r == "assistant":
+            summary.append(f"A: {extract_key_points(c, 50)}")
     if summary:
-        return [{"role":"system","content":"📚 История:\n" + "\n".join(summary[-5:])}] + recent
+        return [{"role": "system", "content": "📚 История:\n" + "\n".join(summary[-5:])}] + recent
     return recent
 
-def load_memory(uid): return compress_history(load_memory_raw(uid))
+def load_memory(uid):
+    return compress_history(load_memory_raw(uid))
 
 def _update_level(uid, messages, key, cfg, extractor, ext_len, ts_fmt):
     try:
-        profile = load_profile(uid); profile.setdefault(key, [])
+        profile = load_profile(uid)
+        profile.setdefault(key, [])
         ts = now().strftime(ts_fmt)
         for m in messages[-cfg['compress_interval']:]:
-            r, c = m.get("role",""), m.get("content","")
-            if r == "user": profile[key].append(f"[{ts}] Q: {extractor(c, ext_len)}")
-            elif r == "assistant": profile[key].append(f"[{ts}] A: {extractor(c, ext_len)}")
+            if not isinstance(m, dict):
+                continue
+            r, c = m.get("role", ""), m.get("content", "")
+            if r == "user":
+                profile[key].append(f"[{ts}] Q: {extractor(c, ext_len)}")
+            elif r == "assistant":
+                profile[key].append(f"[{ts}] A: {extractor(c, ext_len)}")
         if len(profile[key]) > cfg['compress_to']:
             profile[key] = profile[key][-cfg['compress_to']:]
         save_profile(uid, profile, backup=False)
     except Exception as ex:
-        logger.error(f"Ошибка сжатия: {ex}")
+        logger.error(f"Ошибка _update_level: {ex}")
 
 async def _save_memory_impl(uid, history, backup):
     try:
+        if not isinstance(history, list):
+            return False
         if len(history) > LEVEL_1['max_history']:
             old = history[:-LEVEL_1['keep_recent']]
             if old:
                 _update_level(uid, old, "level_2", LEVEL_2, extract_key_points, 40, "%d.%m")
         if not atomic_write(memory_path(uid), compress_history(history)):
             return False
-        if backup: create_backup(uid, "memory")
+        if backup:
+            create_backup(uid, "memory")
         cnt = load_counter(uid) + 1
         save_counter(uid, cnt)
         return True
     except Exception as ex:
-        logger.error(f"Ошибка сохранения памяти: {ex}")
+        logger.error(f"Ошибка _save_memory_impl: {ex}")
         return False
 
 async def save_memory(uid, history, backup=True, lock_held=False):
-    if lock_held: return await _save_memory_impl(uid, history, backup)
-    async with get_user_lock(uid): return await _save_memory_impl(uid, history, backup)
+    if lock_held:
+        return await _save_memory_impl(uid, history, backup)
+    async with get_user_lock(uid):
+        return await _save_memory_impl(uid, history, backup)
 
 # ---------- ФИЛЬТРАЦИЯ КЛЮЧЕВЫМИ СЛОВАМИ ----------
 def extract_year_from_text(text):
+    if not isinstance(text, str):
+        return None
     match = re.search(r'\b(20[2-9][0-9])\b', text)
-    if match and match.group(1).isdigit():
-        return int(match.group(1))
-    return None
+    return int(match.group(1)) if match else None
 
 def assess_relevance(results, query):
-    if not results: return []
+    if not results or not isinstance(results, list):
+        return []
     query_year = None
     year_match = re.search(r'\b(20[2-9][0-9])\b', query)
     if year_match:
         query_year = int(year_match.group(1))
-    requires_year = any(w in query.lower() for w in ['новинк','последн','свеж','актуальн','этот год','сейчас','сегодня'])
+    requires_year = any(word in query.lower() for word in ['новинк','последн','свеж','актуальн','этот год','сейчас','сегодня'])
     stop_words = {'найди','пожалуйста','помоги','мне','лучшие','скажи','расскажи','покажи','найти','бро','что','как','где'}
-    keywords = [w.lower() for w in re.sub(r'[^\w\s]', '', query).split() 
+    keywords = [w.lower() for w in re.sub(r'[^\w\s]', '', query).split()
                 if w.lower() not in stop_words and len(w) > 3]
     scored = []
     for res in results:
-        text = (res.get('title', '') + ' ' + res.get('snippet', '')).lower()
+        if not isinstance(res, dict):
+            continue
+        text = (res.get('title', '') or '') + ' ' + (res.get('snippet', '') or '')
+        text_lower = text.lower()
         link = res.get('link', '').lower()
-        keyword_score = sum(3 for kw in keywords if kw in text)
+        keyword_score = sum(3 for kw in keywords if kw in text_lower)
         domain_score = 0
         for kw in keywords:
             if len(kw) > 3 and kw in link:
@@ -262,6 +321,8 @@ def assess_relevance(results, query):
     return relevant
 
 def normalize_query(query):
+    if not isinstance(query, str):
+        return ""
     normalized = re.sub(r'[^\w\s]', '', query.lower())
     normalized = ' '.join([w for w in normalized.split() if w not in STOP_WORDS and len(w)>2])
     return normalized[:100]
@@ -284,54 +345,107 @@ def set_cache(query, data):
         oldest = min(search_cache.keys(), key=lambda k: search_cache[k]['time'])
         del search_cache[oldest]
 
-# ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА С ЗАЩИТОЙ ----------
+# ---------- УНИВЕРСАЛЬНАЯ ЗАГРУЗКА (Playwright + резерв) ----------
+async def fetch_content(url: str) -> str:
+    """
+    Загружает содержимое страницы: сначала через Playwright (рендерит SPA),
+    если не удалось — через прямой HTTP-запрос.
+    """
+    now_time = datetime.now()
+    if url in html_cache and html_cache[url]["expires"] > now_time:
+        logger.info(f"✅ Cache HIT для {url[:50]}...")
+        return html_cache[url]["text"]
+
+    result = ""
+
+    # --- 1. Playwright (рендеринг SPA) ---
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--disable-blink-features=AutomationControlled']
+            )
+            page = await browser.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            try:
+                await page.wait_for_selector("body", timeout=5000)
+            except:
+                pass
+            html = await page.content()
+            await browser.close()
+
+            text = re.sub(r'<[^>]+>', ' ', html)
+            text = re.sub(r'\s+', ' ', text).strip()
+            if len(text) > 500:
+                result = text[:MAX_HTML_LEN]
+                logger.info(f"✅ Playwright спарсил {url[:50]}, {len(result)} символов")
+            else:
+                logger.warning(f"⚠️ Playwright не дал контента для {url[:50]}")
+    except Exception as e:
+        logger.warning(f"Playwright ошибка для {url}: {e}")
+
+    # --- 2. Резерв: прямой HTTP-запрос ---
+    if not result:
+        logger.info(f"🔄 Пробуем прямой HTTP для {url[:50]}")
+        session = await get_http_session()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+            "Referer": "https://www.google.com/",
+        }
+        try:
+            async with session.get(url, headers=headers, timeout=20) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    text = re.sub(r'<[^>]+>', ' ', html)
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    if len(text) > 500:
+                        result = text[:MAX_HTML_LEN]
+                        logger.info(f"✅ Прямой HTML для {url[:50]}, {len(result)} символов")
+        except Exception as e:
+            logger.warning(f"Прямой HTTP не удался для {url}: {e}")
+
+    # Кэшируем результат, если получен
+    if result:
+        html_cache[url] = {
+            "text": result,
+            "expires": now_time + timedelta(seconds=CACHE_TTL)
+        }
+        if len(html_cache) > 200:
+            oldest = min(html_cache.keys(), key=lambda k: html_cache[k]["expires"])
+            del html_cache[oldest]
+        return result
+
+    logger.warning(f"❌ Не удалось получить контент для {url}")
+    return ""
+
+# ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ----------
 async def fetch_multiple_pages(links, max_pages=40, top_k=7) -> list:
     if not links:
         return []
-    
-    session = await get_http_session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": "https://www.google.com/",
-    }
-    
+
     async def fetch_one(url, semaphore):
         async with semaphore:
-            # Задержка для смягчения нагрузки
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.3)
             try:
-                async with session.get(url, headers=headers, timeout=30) as resp:
-                    if resp.status == 429:
-                        logger.warning(f"429 Too Many Requests для {url}, ждём 5 сек")
-                        await asyncio.sleep(5)
-                        async with session.get(url, headers=headers, timeout=30) as retry:
-                            if retry.status != 200:
-                                return None
-                            html = await retry.text()
-                    elif resp.status != 200:
-                        return None
-                    else:
-                        html = await resp.text()
-                    # Быстрая проверка на наличие текста
-                    text = re.sub(r'<[^>]+>', ' ', html)
-                    text = re.sub(r'\s+', ' ', text).strip()
-                    if len(text) < 500 or not re.search(r'[а-яА-Я]', text):
-                        return None
-                    return {"url": url, "text": text[:MAX_HTML_LEN]}
+                content = await fetch_content(url)
+                if content:
+                    return {"url": url, "text": content}
+                return None
             except Exception as e:
                 logger.warning(f"Ошибка загрузки {url}: {e}")
                 return None
 
-    semaphore = asyncio.Semaphore(10)  # максимум 10 параллельных запросов
+    semaphore = asyncio.Semaphore(5)
     tasks = [fetch_one(url, semaphore) for url in links[:max_pages]]
     results = await asyncio.gather(*tasks)
-    
+
     valid = [r for r in results if r is not None]
     valid.sort(key=lambda x: len(x["text"]), reverse=True)
     top = valid[:top_k]
-    
+
     logger.info(f"📊 Загружено {len(links)} ссылок, отобрано {len(top)} с контентом")
     return top
 
@@ -405,7 +519,7 @@ async def search_primary(query):
     logger.info("🔄 APISerpent пуст, пробуем Serper")
     return await search_serper_async(query)
 
-# ---------- ОТПРАВКА СТАТУСА И ТАЙМЕРА ----------
+# ---------- СТАТУС-СООБЩЕНИЯ ----------
 async def send_status(update: Update, text: str, start_time: float, status_msg=None):
     elapsed = int(time.time() - start_time)
     full_text = f"{text} ⏱ {elapsed} сек"
@@ -480,7 +594,7 @@ async def _generate_response_internal(uid, user_message, history, profile, statu
                 f"Описание: {r.get('snippet','')}"
                 for r in all_results[:TOP_RESULTS_SHOW]
             ]
-        status_msg = await send_status(update, "🧠 Анализирую сниппеты через DeepSeek...", start_time, status_msg)
+        status_msg = await send_status(update, "🧠 Анализирую сниппеты...", start_time, status_msg)
 
     stext = "\n\n".join(full_texts) if full_texts else "Нет данных"
 
@@ -869,7 +983,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("🚀 БОТ ЗАПУЩЕН (40 ссылок, статус, таймер, защита)")
+    logger.info("🚀 БОТ ЗАПУЩЕН (Nixpacks + Playwright)")
     try:
         app.run_polling()
     finally:
