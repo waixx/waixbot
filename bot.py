@@ -1,10 +1,8 @@
 # ================================================================
-#  BroWaix Bot — ФИНАЛЬНАЯ СТАБИЛЬНАЯ ВЕРСИЯ
-#  - Универсальный загрузчик (HTML, JSON, XML, text)
-#  - При пустом контенте — принудительно сниппеты
-#  - Индикатор статуса в Telegram
-#  - Вечная память, бэкапы, честность
-#  - CACHE_CLEANUP_INTERVAL = 3600 — уже в коде
+#  BroWaix Bot — ОПТИМИЗИРОВАННАЯ ВЕРСИЯ (5 сайтов, умный фильтр)
+#  - DeepSeek отсеивает рекламу до парсинга
+#  - Без агрессивного фильтра (remove_unverified_claims)
+#  - Бюджет ~$5–7/мес при 100 запросах/день
 # ================================================================
 
 import logging
@@ -62,14 +60,14 @@ MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "deepseek-v4-pro")
 DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
 SEARCH_ENGINE = os.getenv("SEARCH_ENGINE", "google")
 
-SEARCH_RESULTS_NUM = 10
-TOP_RESULTS_SHOW = 3
+SEARCH_RESULTS_NUM = 10          # запрашиваем 10
+TOP_RESULTS_SHOW = 5             # парсим 5
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 172800               # 2 дня
-MAX_TOKENS_ANSWER = 1000
+MAX_TOKENS_ANSWER = 1000         # достаточно для структуры
 MAX_HTML_LEN = 3000
-CACHE_CLEANUP_INTERVAL = 3600    # <-- ОНА ЗДЕСЬ
+CACHE_CLEANUP_INTERVAL = 3600
 
 LEVEL_1 = {'max_history': 20, 'keep_recent': 5}
 LEVEL_2 = {'compress_interval': 20, 'compress_to': 30}
@@ -262,7 +260,7 @@ async def save_memory(uid, history, backup=True, lock_held=False):
     async with get_user_lock(uid):
         return await _save_memory_impl(uid, history, backup)
 
-# ---------- ФИЛЬТРАЦИЯ РЕЗУЛЬТАТОВ ----------
+# ---------- ФИЛЬТРАЦИЯ КЛЮЧЕВЫМИ СЛОВАМИ ----------
 def extract_year_from_text(text):
     if not isinstance(text, str):
         return None
@@ -315,40 +313,51 @@ def assess_relevance(results, query):
         scored.append({**res, 'score': total, 'year': year})
     relevant = [r for r in scored if r['score'] > 1]
     relevant.sort(key=lambda x: x['score'], reverse=True)
-    return relevant[:TOP_RESULTS_SHOW]
+    return relevant
 
-def normalize_query(query):
-    if not isinstance(query, str):
-        return ""
-    normalized = re.sub(r'[^\w\s]', '', query.lower())
-    normalized = ' '.join([w for w in normalized.split() if w not in STOP_WORDS and len(w)>2])
-    return normalized[:100]
+# ---------- УМНЫЙ ФИЛЬТР РЕКЛАМЫ (DeepSeek) ----------
+async def filter_links_by_relevance(results, user_message):
+    """Отправляет список ссылок в DeepSeek, просит отсеять рекламу и выбрать релевантные"""
+    if len(results) <= 3:
+        return results[:TOP_RESULTS_SHOW]
+    
+    # Формируем список для анализа
+    links_text = ""
+    for i, r in enumerate(results, 1):
+        links_text += f"{i}. Заголовок: {r.get('title', '')}\n   Сниппет: {r.get('snippet', '')}\n   Ссылка: {r.get('link', '')}\n\n"
+    
+    prompt = {
+        "role": "system",
+        "content": (
+            "Ты — фильтр веб-страниц. Ты получил список результатов поиска с заголовками, сниппетами и ссылками.\n"
+            "Твоя задача — выбрать ТОЛЬКО те ссылки, которые содержат релевантную информацию по запросу пользователя.\n"
+            "Отсеивай рекламу, маркетплейсы, страницы с навязчивой рекламой, кликбейт, сайты, не относящиеся к теме.\n"
+            "Верни список НОМЕРОВ (через запятую) наиболее релевантных ссылок (от 3 до 5).\n"
+            "Только номера, без пояснений."
+        )
+    }
+    user_prompt = {
+        "role": "user",
+        "content": f"Запрос пользователя: {user_message}\n\nСписок ссылок:\n{links_text}"
+    }
+    
+    ans, err = await ask_deepseek([prompt, user_prompt], max_tokens=50)
+    if err or not ans:
+        # Если DeepSeek не ответил — возвращаем первые 5
+        return results[:TOP_RESULTS_SHOW]
+    
+    # Парсим номера
+    numbers = re.findall(r'\b(\d+)\b', ans)
+    selected_indices = [int(n) - 1 for n in numbers if 0 <= int(n) - 1 < len(results)]
+    selected_indices = selected_indices[:TOP_RESULTS_SHOW]
+    
+    if not selected_indices:
+        return results[:TOP_RESULTS_SHOW]
+    
+    return [results[i] for i in selected_indices]
 
-def get_cached(query):
-    norm_key = normalize_query(query)
-    if not norm_key:
-        return None
-    if norm_key in search_cache:
-        age = (datetime.now() - search_cache[norm_key]['time']).total_seconds()
-        if age < CACHE_TTL:
-            logger.info("✅ Cache HIT (поиск)")
-            return search_cache[norm_key]['data']
-        else:
-            del search_cache[norm_key]
-    return None
-
-def set_cache(query, data):
-    norm_key = normalize_query(query)
-    if not norm_key:
-        return
-    search_cache[norm_key] = {'data': data, 'time': datetime.now()}
-    if len(search_cache) > 200:
-        oldest = min(search_cache.keys(), key=lambda k: search_cache[k]['time'])
-        del search_cache[oldest]
-
-# ---------- УНИВЕРСАЛЬНЫЙ ЗАГРУЗЧИК (HTML, JSON, XML, text) ----------
+# ---------- УНИВЕРСАЛЬНЫЙ ЗАГРУЗЧИК ----------
 def json_to_text(data, indent=0) -> str:
-    """Рекурсивно превращает JSON в читаемый текст"""
     if isinstance(data, dict):
         lines = []
         for key, value in data.items():
@@ -371,7 +380,6 @@ def json_to_text(data, indent=0) -> str:
         return str(data)
 
 def xml_to_text(xml_str: str) -> str:
-    """Извлекает текст из XML"""
     try:
         root = ET.fromstring(xml_str)
         texts = []
@@ -384,10 +392,6 @@ def xml_to_text(xml_str: str) -> str:
         return re.sub(r'<[^>]+>', ' ', xml_str)[:MAX_HTML_LEN]
 
 async def fetch_content(url: str) -> str:
-    """
-    Загружает содержимое по URL, определяет формат и возвращает читаемый текст.
-    Поддерживает: HTML, JSON, XML, plain text.
-    """
     now_time = datetime.now()
     if url in html_cache and html_cache[url]["expires"] > now_time:
         logger.info(f"✅ Cache HIT для {url[:50]}...")
@@ -415,21 +419,17 @@ async def fetch_content(url: str) -> str:
             if 'text/html' in content_type:
                 html = await resp.text()
                 result = html[:MAX_HTML_LEN]
-
             elif 'application/json' in content_type:
                 data = await resp.json()
                 result = json_to_text(data)
                 logger.info(f"✅ JSON распарсен для {url[:50]}, {len(result)} символов")
-
             elif 'application/xml' in content_type or 'text/xml' in content_type:
                 xml_text = await resp.text()
                 result = xml_to_text(xml_text)
                 logger.info(f"✅ XML распарсен для {url[:50]}")
-
             elif 'text/plain' in content_type:
                 result = await resp.text()
                 result = result[:MAX_HTML_LEN]
-
             else:
                 text = await resp.text()
                 if len(text) > 100:
@@ -454,27 +454,7 @@ async def fetch_content(url: str) -> str:
 
     return ""
 
-# ---------- УДАЛЕНИЕ НЕПОДТВЕРЖДЁННЫХ СУЩНОСТЕЙ ----------
-def remove_unverified_claims(ans, raw_context):
-    if not raw_context or not ans:
-        return ans
-    entities = re.findall(r'\b([A-ZА-Я][a-zA-Zа-яА-Я0-9\-]+|\d+[-+°]*[CС]?)\b', ans)
-    modified = False
-    ignore = {'В','На','По','За','Из','Для','Этот','Эта','Эти','Только','Как','Что','Где','Когда'}
-    for entity in set(entities):
-        if entity in ignore or len(entity) < 2:
-            continue
-        if entity.lower() not in raw_context.lower():
-            ans = re.sub(rf'\b{re.escape(entity)}\b', '', ans, flags=re.I)
-            modified = True
-            logger.info(f"🔍 Удалена неподтверждённая сущность: {entity}")
-    if modified:
-        ans = re.sub(r'\s+', ' ', ans)
-        ans = re.sub(r'\s*\.\s*', '. ', ans)
-        ans = re.sub(r'\s*,', ',', ans)
-        ans = re.sub(r'\.\s*\.', '.', ans)
-    return ans
-
+# ---------- ГЕНЕРАЦИЯ ОТВЕТА ИЗ СНИППЕТОВ ----------
 def generate_answer_from_snippets(results, user_message):
     if not results:
         return "❌ В интернете ничего не найдено."
@@ -610,15 +590,24 @@ async def _generate_response_internal(uid, user_message, history, profile, statu
         return ("🔍 Найденные данные нерелевантны.\n"
                 "Пожалуйста, уточните запрос.", False)
 
+    # --- УМНАЯ ФИЛЬТРАЦИЯ РЕКЛАМЫ (DeepSeek) ---
+    if status_msg and update:
+        status_msg = await update_status(update, "🧹 Отсеиваю рекламу...", status_msg)
+    scored = await filter_links_by_relevance(scored, user_message)
+    if not scored:
+        return ("🔍 После фильтрации не осталось релевантных ссылок.\n"
+                "Попробуйте перефразировать запрос.", False)
+
     if status_msg and update:
         status_msg = await update_status(update, "⬇️ Загружаю страницы...", status_msg)
 
     full_texts = []
     for r in scored[:TOP_RESULTS_SHOW]:
         content = await fetch_content(r['link'])
-        if content:
+        if content and len(content) > 500:  # если есть контент и он достаточно длинный
             full_texts.append(f"--- ИСТОЧНИК: {r['link']} ---\n{content}")
         else:
+            # запасной вариант — сниппет
             full_texts.append(
                 f"--- ИСТОЧНИК (сниппет): {r['link']} ---\n"
                 f"Заголовок: {r.get('title','')}\n"
@@ -655,7 +644,8 @@ async def _generate_response_internal(uid, user_message, history, profile, statu
         logger.warning(f"DeepSeek не ответил: {err}")
         return generate_answer_from_snippets(scored, user_message), True
 
-    final_ans = remove_unverified_claims(ans, stext)
+    # БЕЗ АГРЕССИВНОГО ФИЛЬТРА
+    final_ans = ans
     if len(final_ans) < 50 or 'http' not in final_ans:
         final_ans = generate_answer_from_snippets(scored, user_message)
     else:
@@ -666,8 +656,8 @@ async def _generate_response_internal(uid, user_message, history, profile, statu
 
     return f"🌐 из интернета\n\n{final_ans}", True
 
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
 async def update_status(update: Update, text: str, status_msg=None):
-    """Отправляет или обновляет статусное сообщение"""
     if status_msg is None:
         return await update.effective_message.reply_text(text)
     else:
@@ -926,7 +916,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         answer, should_save = await generate_response(uid, user_message, history, profile, status_msg, update)
 
-        # Удаляем статусное сообщение
         try:
             await status_msg.delete()
         except Exception:
@@ -973,7 +962,7 @@ async def cleanup_caches():
 async def error_handler(update, context):
     logger.error(f"Ошибка: {context.error}")
 
-# ---------- ВОССТАНОВЛЕНИЕ ПРИ СТАРТЕ ----------
+# ---------- ВОССТАНОВЛЕНИЕ ----------
 async def auto_restore_all_users():
     logger.info("🔄 Проверка данных при старте...")
     try:
@@ -1021,7 +1010,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("🚀 БОТ ЗАПУЩЕН (финальная стабильная версия)")
+    logger.info("🚀 БОТ ЗАПУЩЕН (5 сайтов, умный фильтр, честность)")
     app.run_polling()
 
 if __name__ == "__main__":
