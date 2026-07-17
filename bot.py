@@ -1,11 +1,10 @@
 # ================================================================
-#  BroWaix Bot — УНИВЕРСАЛЬНЫЙ ПАРСИНГ С PLAYWRIGHT
-#  - Playwright рендерит любые сайты (SPA + статика)
+#  BroWaix Bot — ФИНАЛЬНАЯ ВЕРСИЯ (Playwright устанавливается из кода)
+#  - Playwright устанавливается автоматически при первом запуске
 #  - 40 ссылок, фильтрация, топ-7 по контенту
 #  - Статус-сообщения + таймер в Telegram
-#  - Защита от блокировок, повторные попытки
 #  - Вечная память, бэкапы, честность
-#  - Бюджет ~$10–12/мес при 150 запросах/день
+#  - Никаких Dockerfile — только код
 # ================================================================
 
 import logging
@@ -19,6 +18,7 @@ import shutil
 import weakref
 import hashlib
 import time
+import subprocess
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
@@ -29,7 +29,6 @@ from telegram.ext import (
     ContextTypes, filters
 )
 from logging.handlers import RotatingFileHandler
-from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -112,6 +111,22 @@ async def cleanup_http_session():
     global _http_session
     if _http_session and not _http_session.closed:
         await _http_session.close()
+
+# ---------- АВТОУСТАНОВКА PLAYWRIGHT ----------
+def ensure_playwright_installed():
+    """Устанавливает Playwright и браузер Chromium при первом запуске"""
+    try:
+        import playwright
+        logger.info("✅ Playwright уже установлен")
+    except ImportError:
+        logger.info("📦 Playwright не найден, устанавливаю...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
+            subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+            logger.info("✅ Playwright и Chromium успешно установлены")
+        except Exception as e:
+            logger.error(f"❌ Ошибка установки Playwright: {e}")
+            logger.warning("⚠️ Бот продолжит работу без Playwright (SPA-сайты могут не читаться)")
 
 # ---------- ФАЙЛЫ ----------
 def atomic_write(filename, data, as_json=True):
@@ -351,7 +366,7 @@ def set_cache(query, data):
 async def fetch_content(url: str) -> str:
     """
     Загружает содержимое страницы: сначала через Playwright (рендерит SPA),
-    если не удалось — через прямой HTTP-запрос (для статических сайтов).
+    если не удалось — через прямой HTTP-запрос.
     """
     now_time = datetime.now()
     if url in html_cache and html_cache[url]["expires"] > now_time:
@@ -362,12 +377,11 @@ async def fetch_content(url: str) -> str:
 
     # --- 1. Playwright (рендеринг SPA) ---
     try:
+        from playwright.async_api import async_playwright
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=['--disable-blink-features=AutomationControlled'])
             page = await browser.new_page()
-            # Устанавливаем таймаут на загрузку
             await page.goto(url, wait_until="networkidle", timeout=30000)
-            # Ждём появления тела страницы
             try:
                 await page.wait_for_selector("body", timeout=5000)
             except:
@@ -375,7 +389,6 @@ async def fetch_content(url: str) -> str:
             html = await page.content()
             await browser.close()
 
-            # Извлекаем текст
             text = re.sub(r'<[^>]+>', ' ', html)
             text = re.sub(r'\s+', ' ', text).strip()
             if len(text) > 500:
@@ -422,35 +435,24 @@ async def fetch_content(url: str) -> str:
     logger.warning(f"❌ Не удалось получить контент для {url}")
     return ""
 
-# ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА С ОГРАНИЧЕНИЯМИ ----------
+# ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ----------
 async def fetch_multiple_pages(links, max_pages=40, top_k=7) -> list:
     if not links:
         return []
 
-    session = await get_http_session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        "Referer": "https://www.google.com/",
-    }
-
     async def fetch_one(url, semaphore):
         async with semaphore:
-            # Задержка для смягчения нагрузки
             await asyncio.sleep(0.3)
             try:
-                # Пробуем универсальный загрузчик (Playwright)
                 content = await fetch_content(url)
                 if content:
                     return {"url": url, "text": content}
-                # Если не удалось — возвращаем None
                 return None
             except Exception as e:
                 logger.warning(f"Ошибка загрузки {url}: {e}")
                 return None
 
-    semaphore = asyncio.Semaphore(5)  # Ограничиваем количество параллельных сессий Playwright
+    semaphore = asyncio.Semaphore(5)
     tasks = [fetch_one(url, semaphore) for url in links[:max_pages]]
     results = await asyncio.gather(*tasks)
 
@@ -978,6 +980,9 @@ async def post_init(application):
     asyncio.create_task(cleanup_caches())
 
 def main():
+    # Автоустановка Playwright при первом запуске
+    ensure_playwright_installed()
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -995,7 +1000,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("🚀 БОТ ЗАПУЩЕН (Playwright — универсальный парсинг)")
+    logger.info("🚀 БОТ ЗАПУЩЕН (Playwright устанавливается из кода)")
     try:
         app.run_polling()
     finally:
