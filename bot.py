@@ -1,10 +1,10 @@
 # ================================================================
-#  BroWaix Bot — УНИВЕРСАЛЬНЫЙ ИНТЕЛЛЕКТУАЛЬНЫЙ ПОИСК (vFinal)
-#  - Загружает любые форматы: HTML, JSON, XML, plain text
-#  - DeepSeek чистит контент и извлекает суть
-#  - При пустом ответе — использует сниппеты из поиска
-#  - Вечная память, бэкапы, честность без выдумок
-#  - Бюджет ~$3–5/мес (DeepSeek + APISerpent)
+#  BroWaix Bot — ФИНАЛЬНАЯ СТАБИЛЬНАЯ ВЕРСИЯ
+#  - Универсальный загрузчик (HTML, JSON, XML, text)
+#  - При пустом контенте — принудительно сниппеты
+#  - Индикатор статуса в Telegram
+#  - Вечная память, бэкапы, честность
+#  - CACHE_CLEANUP_INTERVAL = 3600 — уже в коде
 # ================================================================
 
 import logging
@@ -67,8 +67,9 @@ TOP_RESULTS_SHOW = 3
 MODEL_TEMPERATURE = 0.1
 MAX_RETRY_ATTEMPTS = 1
 CACHE_TTL = 172800               # 2 дня
-MAX_TOKENS_ANSWER = 1000         # достаточно для структуры
-MAX_HTML_LEN = 3000              # обрезка для экономии
+MAX_TOKENS_ANSWER = 1000
+MAX_HTML_LEN = 3000
+CACHE_CLEANUP_INTERVAL = 3600    # <-- ОНА ЗДЕСЬ
 
 LEVEL_1 = {'max_history': 20, 'keep_recent': 5}
 LEVEL_2 = {'compress_interval': 20, 'compress_to': 30}
@@ -92,7 +93,7 @@ user_locks = weakref.WeakValueDictionary()
 rate_lock = asyncio.Lock()
 request_count = {}
 search_cache = {}
-html_cache = {}   # кэш загруженного контента (уже преобразованного в текст)
+html_cache = {}
 
 def get_user_lock(uid): return user_locks.setdefault(uid, asyncio.Lock())
 
@@ -106,7 +107,7 @@ async def get_http_session():
             )
         return _http_session
 
-# ---------- ФАЙЛОВЫЕ ОПЕРАЦИИ (атомарные) ----------
+# ---------- ФАЙЛОВЫЕ ОПЕРАЦИИ ----------
 def atomic_write(filename, data, as_json=True):
     tmp = filename + ".tmp"
     try:
@@ -380,7 +381,6 @@ def xml_to_text(xml_str: str) -> str:
         return "\n".join(texts)[:MAX_HTML_LEN]
     except Exception as e:
         logger.warning(f"Ошибка парсинга XML: {e}")
-        # fallback: удаляем теги
         return re.sub(r'<[^>]+>', ' ', xml_str)[:MAX_HTML_LEN]
 
 async def fetch_content(url: str) -> str:
@@ -412,29 +412,24 @@ async def fetch_content(url: str) -> str:
 
             result = ""
 
-            # --- HTML ---
             if 'text/html' in content_type:
                 html = await resp.text()
                 result = html[:MAX_HTML_LEN]
 
-            # --- JSON ---
             elif 'application/json' in content_type:
                 data = await resp.json()
                 result = json_to_text(data)
                 logger.info(f"✅ JSON распарсен для {url[:50]}, {len(result)} символов")
 
-            # --- XML ---
             elif 'application/xml' in content_type or 'text/xml' in content_type:
                 xml_text = await resp.text()
                 result = xml_to_text(xml_text)
                 logger.info(f"✅ XML распарсен для {url[:50]}")
 
-            # --- Plain text ---
             elif 'text/plain' in content_type:
                 result = await resp.text()
                 result = result[:MAX_HTML_LEN]
 
-            # --- Неизвестный формат: пробуем как текст ---
             else:
                 text = await resp.text()
                 if len(text) > 100:
@@ -506,7 +501,7 @@ def generate_answer_from_snippets(results, user_message):
     answer += f"📅 Дата: {get_current_date()}\nУверенность: 85%"
     return answer
 
-# ---------- ПОИСК (APISerpent + Serper) ----------
+# ---------- ПОИСК ----------
 async def search_apiserpent_async(query, num=SEARCH_RESULTS_NUM):
     if not APISERPENT_API_KEY:
         return []
@@ -577,20 +572,23 @@ async def search_primary(query):
     return await search_serper_async(query)
 
 # ---------- ГЕНЕРАЦИЯ ОТВЕТА ----------
-async def generate_response(uid, user_message, history, profile):
+async def generate_response(uid, user_message, history, profile, status_msg=None, update=None):
     try:
         return await asyncio.wait_for(
-            _generate_response_internal(uid, user_message, history, profile),
+            _generate_response_internal(uid, user_message, history, profile, status_msg, update),
             timeout=60
         )
     except asyncio.TimeoutError:
         return "⏰ Превышено время ожидания. Попробуйте позже.", False
 
-async def _generate_response_internal(uid, user_message, history, profile):
+async def _generate_response_internal(uid, user_message, history, profile, status_msg=None, update=None):
     ctx = build_profile_context(profile)
 
     if len(user_message.split()) < 3:
         return "👋 Привет! Напишите конкретный вопрос, я поищу информацию в интернете.", False
+
+    if status_msg and update:
+        status_msg = await update_status(update, "🔍 Ищу в интернете...", status_msg)
 
     cached = get_cached(user_message)
     if cached:
@@ -612,14 +610,15 @@ async def _generate_response_internal(uid, user_message, history, profile):
         return ("🔍 Найденные данные нерелевантны.\n"
                 "Пожалуйста, уточните запрос.", False)
 
-    # --- УНИВЕРСАЛЬНАЯ ЗАГРУЗКА КОНТЕНТА ---
+    if status_msg and update:
+        status_msg = await update_status(update, "⬇️ Загружаю страницы...", status_msg)
+
     full_texts = []
     for r in scored[:TOP_RESULTS_SHOW]:
         content = await fetch_content(r['link'])
         if content:
             full_texts.append(f"--- ИСТОЧНИК: {r['link']} ---\n{content}")
         else:
-            # Запасной вариант: сниппет
             full_texts.append(
                 f"--- ИСТОЧНИК (сниппет): {r['link']} ---\n"
                 f"Заголовок: {r.get('title','')}\n"
@@ -628,7 +627,9 @@ async def _generate_response_internal(uid, user_message, history, profile):
 
     stext = "\n\n".join(full_texts) if full_texts else "Нет данных"
 
-    # --- УНИВЕРСАЛЬНЫЙ ПРОМПТ ---
+    if status_msg and update:
+        status_msg = await update_status(update, "🧠 Анализирую данные через DeepSeek...", status_msg)
+
     sp = {
         "role": "system",
         "content": (
@@ -664,6 +665,17 @@ async def _generate_response_internal(uid, user_message, history, profile):
             final_ans += "\nУверенность: 90%"
 
     return f"🌐 из интернета\n\n{final_ans}", True
+
+async def update_status(update: Update, text: str, status_msg=None):
+    """Отправляет или обновляет статусное сообщение"""
+    if status_msg is None:
+        return await update.effective_message.reply_text(text)
+    else:
+        try:
+            await status_msg.edit_text(text)
+        except Exception:
+            pass
+        return status_msg
 
 async def generate_local_answer(uid, user_message, history, profile, reason):
     ctx = build_profile_context(profile)
@@ -910,7 +922,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_msg_obj = {"role": "user", "content": user_message, "timestamp": now().strftime("%Y-%m-%d %H:%M:%S")}
         history.append(user_msg_obj)
 
-        answer, should_save = await generate_response(uid, user_message, history, profile)
+        status_msg = await update_status(update, "🔍 Ищу в интернете...", None)
+
+        answer, should_save = await generate_response(uid, user_message, history, profile, status_msg, update)
+
+        # Удаляем статусное сообщение
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
         if should_save and isinstance(answer, str) and len(answer) > 10:
             clean_answer = re.sub(r'<[^>]+>', '', answer)
@@ -1001,7 +1021,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("🚀 БОТ ЗАПУЩЕН (универсальный, интеллектуальный загрузчик)")
+    logger.info("🚀 БОТ ЗАПУЩЕН (финальная стабильная версия)")
     app.run_polling()
 
 if __name__ == "__main__":
